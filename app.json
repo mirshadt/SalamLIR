@@ -1,0 +1,39 @@
+{
+  "expo": {
+    "name": "NetAtlas IPAM",
+    "slug": "netatlas-ipam",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#07111f"
+    },
+    "assetBundlePatterns": [
+      "**/*"
+    ],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.netatlas.ipam"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#07111f"
+      },
+      "package": "com.netatlas.ipam"
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "extra": {
+      "product": "IP address management",
+      "city": "Riyadh"
+    },
+    "plugins": [
+      "expo-asset"
+    ]
+  }
+}

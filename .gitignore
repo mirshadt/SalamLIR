@@ -1,0 +1,11 @@
+node_modules/
+backend/.venv/
+backend/*.db
+backend/*.db-*
+.expo/
+dist/
+dist-*/
+build/
+*.log
+android/
+ios/

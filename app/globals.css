@@ -1,0 +1,51 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: 216 58% 7%;
+  --foreground: 214 35% 92%;
+  --card: 215 45% 11%;
+  --card-foreground: 214 35% 92%;
+  --popover: 215 45% 10%;
+  --popover-foreground: 214 35% 92%;
+  --primary: 170 77% 33%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 215 36% 17%;
+  --secondary-foreground: 214 35% 92%;
+  --muted: 216 31% 15%;
+  --muted-foreground: 214 20% 67%;
+  --accent: 209 71% 41%;
+  --accent-foreground: 0 0% 100%;
+  --destructive: 3 72% 48%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 214 38% 22%;
+  --input: 214 38% 22%;
+  --ring: 170 77% 33%;
+  --radius: 0.5rem;
+}
+
+* {
+  border-color: hsl(var(--border));
+}
+
+html {
+  min-height: 100%;
+  background: hsl(var(--background));
+}
+
+body {
+  min-height: 100%;
+  background: hsl(var(--background));
+  color: hsl(var(--foreground));
+}
+
+button,
+input,
+textarea {
+  font: inherit;
+}
+
+.recharts-cartesian-axis-tick-value {
+  fill: hsl(var(--muted-foreground));
+}

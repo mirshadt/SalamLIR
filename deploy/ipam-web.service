@@ -1,0 +1,17 @@
+[Unit]
+Description=NetAtlas IPAM Next.js frontend
+After=network.target ipam-api.service
+
+[Service]
+Type=simple
+User=ipam
+Group=ipam
+WorkingDirectory=/opt/netatlas-ipam
+Environment=NODE_ENV=production
+Environment=PORT=8082
+ExecStart=/usr/bin/npm run start
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
