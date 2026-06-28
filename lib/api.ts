@@ -298,7 +298,7 @@ export type RipeAllocatedPoolBulkResult = {
 };
 
 export type RipeReportResponse = {
-  pool: RipeAllocatedPool;
+  pool: RipeAllocatedPool | null;
   report_type: string;
   date_from: string;
   date_to: string;
@@ -340,6 +340,97 @@ export type RipePushResponse = {
   response_body: string;
 };
 
+export type CstConfig = {
+  id: string;
+  enabled: boolean;
+  service_provider_id: string;
+  auto_execute: boolean;
+  scheduled_sync_enabled: boolean;
+  schedule_time: string;
+  schedule_timezone: string;
+  last_scheduled_run_date: string;
+  last_scheduled_run_at: string;
+  batch_size_limit: number;
+  hourly_request_limit: number;
+  updated_at: string;
+};
+
+export type CstConfigPayload = Partial<Pick<CstConfig, "enabled" | "service_provider_id" | "auto_execute" | "scheduled_sync_enabled" | "schedule_time" | "schedule_timezone" | "batch_size_limit" | "hourly_request_limit">>;
+
+export type CstSyncSummary = {
+  enabled: boolean;
+  auto_execute: boolean;
+  scheduled_sync_enabled: boolean;
+  schedule_time: string;
+  schedule_timezone: string;
+  last_scheduled_run_date: string;
+  last_scheduled_run_at: string;
+  total_jobs: number;
+  pending_jobs: number;
+  running_jobs: number;
+  success_jobs: number;
+  failed_jobs: number;
+  blocked_jobs: number;
+  total_transactions: number;
+  last_batch_at: string;
+};
+
+export type CstSyncBatch = {
+  id: string;
+  workflow_type: string;
+  status: string;
+  total_jobs: number;
+  completed_jobs: number;
+  failed_jobs: number;
+  blocked_jobs: number;
+  created_at: string;
+  completed_at: string;
+};
+
+export type CstSyncJob = {
+  id: string;
+  batch_id: string;
+  resource_uuid: string;
+  transaction_id: string;
+  operation: string;
+  sequence_no: number;
+  depends_on_job_id: string;
+  cidr: string;
+  service_provider_id: string;
+  payload_json: string;
+  response_json: string;
+  status: string;
+  attempt_count: number;
+  last_error: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type CstSchedulerRun = {
+  id: string;
+  target_date: string;
+  scheduled_for: string;
+  status: string;
+  batch_id: string;
+  total_jobs: number;
+  message: string;
+  triggered_by: string;
+  started_at: string;
+  completed_at: string;
+};
+
+export type CstTransactionLedger = {
+  transaction_id: string;
+  cidr: string;
+  resource_uuid: string;
+  service_provider_id: string;
+  first_used_at: string;
+  last_status: string;
+  retired_at: string;
+  retired_reason: string;
+  batch_id: string;
+  correlation_id: string;
+};
 export type BulkOutputRow = {
   inputRowNumber: number;
   processingStatus: "SUCCESS" | "FAILED" | "PARTIAL_SUCCESS";
@@ -589,7 +680,66 @@ export async function getRipeAllocatedPools() {
   return data;
 }
 
-export async function getRipeReportPools() {
-  const { data } = await api.get<RipeAllocatedPool[]>("/ripe/reports/pools");
+export async function getCstConfig() {
+  const { data } = await api.get<CstConfig>("/cst/config");
   return data;
 }
+
+export async function updateCstConfig(payload: CstConfigPayload) {
+  const { data } = await api.put<CstConfig>("/cst/config", payload);
+  return data;
+}
+
+export async function getCstSummary() {
+  const { data } = await api.get<CstSyncSummary>("/cst/summary");
+  return data;
+}
+
+export async function getCstBatches() {
+  const { data } = await api.get<CstSyncBatch[]>("/cst/batches");
+  return data;
+}
+
+export async function getCstSchedulerRuns() {
+  const { data } = await api.get<CstSchedulerRun[]>("/cst/scheduler-runs");
+  return data;
+}
+
+export async function runCstDayMinusOneSync(targetDate = "") {
+  const { data } = await api.post<CstSchedulerRun>("/cst/schedule/run-day-minus-one", null, { params: targetDate ? { target_date: targetDate } : undefined });
+  return data;
+}
+
+export async function getCstJobs() {
+  const { data } = await api.get<CstSyncJob[]>("/cst/jobs");
+  return data;
+}
+
+export async function getCstTransactions() {
+  const { data } = await api.get<CstTransactionLedger[]>("/cst/transactions");
+  return data;
+}
+
+export async function bootstrapCurrentCstResources() {
+  const { data } = await api.post<CstSyncJob[]>("/cst/bootstrap-current");
+  return data;
+}
+
+export async function reconcileCstResources() {
+  const { data } = await api.post<CstSyncJob[]>("/cst/reconcile");
+  return data;
+}
+
+export async function retryCstJob(jobId: string) {
+  const { data } = await api.post<CstSyncJob>(`/cst/jobs/${jobId}/retry`);
+  return data;
+}
+
+export async function retryFailedCstBatch(batchId: string) {
+  const { data } = await api.post<CstSyncJob[]>(`/cst/batches/${batchId}/retry-failed`);
+  return data;
+}
+
+
+
+

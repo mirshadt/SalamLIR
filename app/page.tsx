@@ -37,17 +37,29 @@ import {
   AssignmentPayload,
   AssignmentStatus,
   AuditEvent,
+  bootstrapCurrentCstResources,
   BulkBatch,
   BulkResult,
   Conflict,
+  CstConfig,
+  CstSyncBatch,
+  CstSyncJob,
+  CstSyncSummary,
+  CstSchedulerRun,
+  CstTransactionLedger,
   getAssignments,
   getAuditEvents,
   getBulkBatches,
   getConflicts,
+  getCstBatches,
+  getCstConfig,
+  getCstJobs,
+  getCstSchedulerRuns,
+  getCstSummary,
+  getCstTransactions,
   getPools,
   getRipeAllocatedPools,
   getRipeConfig,
-  getRipeReportPools,
   getUsers,
   login,
   PartitionDirection,
@@ -60,6 +72,11 @@ import {
   RipeDiscoveryResponse,
   RipePushResponse,
   RipeReportResponse,
+  retryCstJob,
+  retryFailedCstBatch,
+  runCstDayMinusOneSync,
+  updateCstConfig,
+  reconcileCstResources,
   User
 } from "@/lib/api";
 import { calculateContinuousFreeRanges, contains, ipToNumber, numberToIp, parseCidr, rangeToCidrs, toRange, type Range } from "@/lib/ipam";
@@ -331,7 +348,6 @@ const accessTechnologyOptions = [
   { value: "4", label: "FWA" }
 ];
 const accessTechnologyLabels = Object.fromEntries(accessTechnologyOptions.map((option) => [option.value, option.label]));
-const ripeReportTypes = ["RIPE Assignment Report", "RIPE Maintainer IP Report"];
 const pendingBssBusinessDefaults: Partial<AssignmentPayload> = {
   service_id: "BSS-PENDING-SERVICE",
   service_instance_id: "BSS-PENDING-SERVICE",
@@ -667,10 +683,13 @@ function RegistryWorkspace({ onLogout }: { onLogout: () => void }) {
   const [bulkAssignmentCsv, setBulkAssignmentCsv] = useState("cidr,size,status,assignmentDate,customerName,serviceId,serviceDescription\n5.42.224.0/24,256,3,2026-06-03,Example Enterprise,SVC-10001,Enterprise L3 service");
   const [ripeConfigForm, setRipeConfigForm] = useState<RipeConfigPayload>({ base_url: "https://rest.db.ripe.net", auth_type: "Basic Authentication", username: "", password: "", connection_timeout: 10, read_timeout: 30, default_maintainer: "ITC-NOC-MNT" });
   const [ripePoolCsv, setRipePoolCsv] = useState("pool_name,cidr,allocation_type,source,created_date\nRIPE Allocation 5.42.224.0,5.42.224.0/19,RIPE Allocated Pool,RIPE Database,2026-06-01");
-  const [ripeReportForm, setRipeReportForm] = useState({ poolId: "", dateFrom: "", dateTo: "", reportType: "RIPE Assignment Report" });
+  const [ripeReportForm, setRipeReportForm] = useState({ dateFrom: "", dateTo: "", reportType: "RIPE Assignment Report" });
   const [ripeReportResult, setRipeReportResult] = useState<RipeReportResponse | null>(null);
   const [ripeDiscoveryResult, setRipeDiscoveryResult] = useState<RipeDiscoveryResponse | null>(null);
   const [ripeDiscoveryStatus, setRipeDiscoveryStatus] = useState<"idle" | "running" | "complete">("idle");
+  const [ripeDiscoveryActionKey, setRipeDiscoveryActionKey] = useState("");
+  const [ripePushResourceId, setRipePushResourceId] = useState("");
+  const [ripeReportStatus, setRipeReportStatus] = useState<"idle" | "running" | "complete">("idle");
   const [bulkPoolFileName, setBulkPoolFileName] = useState("");
   const [bulkAssignmentFileName, setBulkAssignmentFileName] = useState("");
   const [newUser, setNewUser] = useState({ username: "", password: "", role: "operator" as User["role"] });
@@ -686,7 +705,17 @@ function RegistryWorkspace({ onLogout }: { onLogout: () => void }) {
   const usersQuery = useQuery({ queryKey: ["users"], queryFn: getUsers, ...liveQueryOptions });
   const ripeConfigQuery = useQuery({ queryKey: ["ripe-config"], queryFn: getRipeConfig, ...liveQueryOptions });
   const ripeAllocatedPoolsQuery = useQuery({ queryKey: ["ripe-allocated-pools"], queryFn: getRipeAllocatedPools, ...liveQueryOptions });
-  const ripeReportPoolsQuery = useQuery({ queryKey: ["ripe-report-pools"], queryFn: getRipeReportPools, ...liveQueryOptions });
+  const cstConfigQuery = useQuery({ queryKey: ["cst-config"], queryFn: getCstConfig, ...liveQueryOptions });
+  const cstSummaryQuery = useQuery({ queryKey: ["cst-summary"], queryFn: getCstSummary, ...liveQueryOptions });
+  const cstBatchesQuery = useQuery({ queryKey: ["cst-batches"], queryFn: getCstBatches, ...liveQueryOptions });
+  const cstSchedulerRunsQuery = useQuery({ queryKey: ["cst-scheduler-runs"], queryFn: getCstSchedulerRuns, ...liveQueryOptions });
+  const cstJobsQuery = useQuery({
+    queryKey: ["cst-jobs"],
+    queryFn: getCstJobs,
+    refetchInterval: (query) => query.state.data?.some((job) => ["PENDING", "RUNNING"].includes(job.status)) ? 3000 : false,
+    ...liveQueryOptions
+  });
+  const cstTransactionsQuery = useQuery({ queryKey: ["cst-transactions"], queryFn: getCstTransactions, ...liveQueryOptions });
   const bulkBatchesQuery = useQuery({
     queryKey: ["bulk-batches"],
     queryFn: getBulkBatches,
@@ -701,7 +730,12 @@ function RegistryWorkspace({ onLogout }: { onLogout: () => void }) {
   const users = usersQuery.data ?? [];
   const ripeConfig = ripeConfigQuery.data ?? null;
   const ripeAllocatedPools = ripeAllocatedPoolsQuery.data ?? [];
-  const ripeReportPools = ripeReportPoolsQuery.data ?? [];
+  const cstConfig = cstConfigQuery.data ?? null;
+  const cstSummary = cstSummaryQuery.data ?? null;
+  const cstBatches = cstBatchesQuery.data ?? [];
+  const cstJobs = cstJobsQuery.data ?? [];
+  const cstSchedulerRuns = cstSchedulerRunsQuery.data ?? [];
+  const cstTransactions = cstTransactionsQuery.data ?? [];
   const bulkBatches = bulkBatchesQuery.data ?? [];
 
   useEffect(() => {
@@ -760,7 +794,12 @@ function RegistryWorkspace({ onLogout }: { onLogout: () => void }) {
     void queryClient.invalidateQueries({ queryKey: ["bulk-batches"] });
     void queryClient.invalidateQueries({ queryKey: ["ripe-config"] });
     void queryClient.invalidateQueries({ queryKey: ["ripe-allocated-pools"] });
-    void queryClient.invalidateQueries({ queryKey: ["ripe-report-pools"] });
+    void queryClient.invalidateQueries({ queryKey: ["cst-config"] });
+    void queryClient.invalidateQueries({ queryKey: ["cst-summary"] });
+    void queryClient.invalidateQueries({ queryKey: ["cst-batches"] });
+    void queryClient.invalidateQueries({ queryKey: ["cst-jobs"] });
+    void queryClient.invalidateQueries({ queryKey: ["cst-scheduler-runs"] });
+    void queryClient.invalidateQueries({ queryKey: ["cst-transactions"] });
     void poolsQuery.refetch();
     void assignmentsQuery.refetch();
     void conflictsQuery.refetch();
@@ -769,7 +808,12 @@ function RegistryWorkspace({ onLogout }: { onLogout: () => void }) {
     void bulkBatchesQuery.refetch();
     void ripeConfigQuery.refetch();
     void ripeAllocatedPoolsQuery.refetch();
-    void ripeReportPoolsQuery.refetch();
+    void cstConfigQuery.refetch();
+    void cstSummaryQuery.refetch();
+    void cstBatchesQuery.refetch();
+    void cstJobsQuery.refetch();
+    void cstSchedulerRunsQuery.refetch();
+    void cstTransactionsQuery.refetch();
   };
 
   useEffect(() => {
@@ -894,6 +938,8 @@ function RegistryWorkspace({ onLogout }: { onLogout: () => void }) {
                 onRefresh={refresh}
                 ripeDiscoveryResult={ripeDiscoveryResult}
                 ripeDiscoveryStatus={ripeDiscoveryStatus}
+                ripeDiscoveryActionKey={ripeDiscoveryActionKey}
+                ripePushResourceId={ripePushResourceId}
                 onDiscoverRipePools={() => {
                   setRipeDiscoveryStatus("running");
                   run(async () => {
@@ -907,34 +953,56 @@ function RegistryWorkspace({ onLogout }: { onLogout: () => void }) {
                     }
                   });
                 }}
-                onSyncRipePool={(pool) => run(async () => {
-                  await api.post("/ripe/discovery/root-pools/sync", pool);
-                  const { data } = await api.get<RipeDiscoveryResponse>("/ripe/discovery/root-pools");
-                  setRipeDiscoveryResult(data);
-                  void queryClient.invalidateQueries({ queryKey: ["ripe-report-pools"] });
-                  refresh();
-                })}
-                onSyncCstLir={(pool) => run(async () => {
-                  await api.post("/ripe/discovery/root-pools/cst-sync", pool);
-                  const { data } = await api.get<RipeDiscoveryResponse>("/ripe/discovery/root-pools");
-                  setRipeDiscoveryResult(data);
-                  refresh();
-                })}
-                onPushToRipe={(resource) => run(async () => {
-                  if (!resource.source || !("customer_name" in resource.source)) {
-                    window.alert("Only persisted assignment rows can be pushed to RIPE.");
-                    return;
-                  }
-                  const { data } = await api.post<RipePushResponse>(`/ripe/assignments/${resource.source.id}/push`);
-                  const removing = resource.operationType === "RETIRE" || resource.ripeSyncStatus === "DECOMMISSION_PENDING";
-                  setNotice({
-                    title: data.success
-                      ? removing ? "RIPE Removal Succeeded" : "RIPE Push Succeeded"
-                      : removing ? "RIPE Removal Failed" : "RIPE Push Failed",
-                    detail: ripePushNoticeDetail(data)
+                onSyncRipePool={(pool) => {
+                  const actionKey = `local:${ripeDiscoveryPoolKey(pool)}`;
+                  setRipeDiscoveryActionKey(actionKey);
+                  run(async () => {
+                    try {
+                      await api.post("/ripe/discovery/root-pools/sync", pool);
+                      const { data } = await api.get<RipeDiscoveryResponse>("/ripe/discovery/root-pools");
+                      setRipeDiscoveryResult(data);
+                      refresh();
+                    } finally {
+                      setRipeDiscoveryActionKey("");
+                    }
                   });
-                  refresh();
-                })}
+                }}
+                onSyncCstLir={(pool) => {
+                  const actionKey = `cst:${ripeDiscoveryPoolKey(pool)}`;
+                  setRipeDiscoveryActionKey(actionKey);
+                  run(async () => {
+                    try {
+                      await api.post("/ripe/discovery/root-pools/cst-sync", pool);
+                      const { data } = await api.get<RipeDiscoveryResponse>("/ripe/discovery/root-pools");
+                      setRipeDiscoveryResult(data);
+                      refresh();
+                    } finally {
+                      setRipeDiscoveryActionKey("");
+                    }
+                  });
+                }}
+                onPushToRipe={(resource) => {
+                  setRipePushResourceId(resource.id);
+                  run(async () => {
+                    try {
+                      if (!resource.source || !("customer_name" in resource.source)) {
+                        window.alert("Only persisted assignment rows can be pushed to RIPE.");
+                        return;
+                      }
+                      const { data } = await api.post<RipePushResponse>(`/ripe/assignments/${resource.source.id}/push`);
+                      const removing = resource.operationType === "RETIRE" || resource.ripeSyncStatus === "DECOMMISSION_PENDING";
+                      setNotice({
+                        title: data.success
+                          ? removing ? "RIPE Removal Succeeded" : "RIPE Push Succeeded"
+                          : removing ? "RIPE Removal Failed" : "RIPE Push Failed",
+                        detail: ripePushNoticeDetail(data)
+                      });
+                      refresh();
+                    } finally {
+                      setRipePushResourceId("");
+                    }
+                  });
+                }}
               />
             ) : null}
             {view === "summary" ? (
@@ -967,7 +1035,7 @@ function RegistryWorkspace({ onLogout }: { onLogout: () => void }) {
                     title: resource.administrativeStatus === "RESERVED" ? "Remove reservation" : "Release assignment",
                     detail: resource.administrativeStatus === "RESERVED"
                       ? `Move ${resource.cidr} back to AVAILABLE?`
-                      : `Move ${resource.cidr} to RIPE removal pending? The subnet can be deleted after the RIPE unassignment is completed.`,
+                      : ["SUCCESS", "SYNCHRONIZED", "DECOMMISSION_PENDING"].includes(resource.ripeSyncStatus) ? `Move ${resource.cidr} to RIPE removal pending? The subnet can be deleted after the RIPE unassignment is completed.` : `Retire ${resource.cidr} locally? This assignment was not synced to RIPE, so no RIPE removal is required.`,
                     destructive: true,
                     action: () => run(async () => {
                       if (resource.administrativeStatus === "RESERVED") {
@@ -1113,7 +1181,7 @@ function RegistryWorkspace({ onLogout }: { onLogout: () => void }) {
                 })}
                 onRelease={(assignment) => setConfirm({
                   title: "Release assignment",
-                  detail: `Move ${assignment.cidr} to RIPE removal pending? The subnet can be deleted after the RIPE unassignment is completed.`,
+                  detail: ["SUCCESS", "SYNCHRONIZED", "DECOMMISSION_PENDING"].includes(String(assignment.ripe_sync_status || "").toUpperCase()) ? `Move ${assignment.cidr} to RIPE removal pending? The subnet can be deleted after the RIPE unassignment is completed.` : `Retire ${assignment.cidr} locally? This assignment was not synced to RIPE, so no RIPE removal is required.`,
                   destructive: true,
                   action: () => run(async () => { await api.patch(`/assignments/${assignment.id}/status`, { status: "Retiring" }); })
                 })}
@@ -1193,19 +1261,32 @@ function RegistryWorkspace({ onLogout }: { onLogout: () => void }) {
                 resources={resources}
                 auditEvents={auditEvents}
                 conflicts={conflicts}
-                ripeReportPools={ripeReportPools}
                 ripeReportForm={ripeReportForm}
                 ripeReportResult={ripeReportResult}
+                ripeReportStatus={ripeReportStatus}
                 onRipeReportForm={setRipeReportForm}
-                onRunRipeReport={() => run(async () => {
-                  const { data } = await api.post<RipeReportResponse>("/ripe/reports/query", {
-                    pool_id: ripeReportForm.poolId,
-                    date_from: ripeReportForm.dateFrom,
-                    date_to: ripeReportForm.dateTo,
-                    report_type: ripeReportForm.reportType
+                onClearRipeReport={() => {
+                  setRipeReportResult(null);
+                  setRipeReportStatus("idle");
+                }}
+                onRunRipeReport={() => {
+                  setRipeReportResult(null);
+                  setRipeReportStatus("running");
+                  run(async () => {
+                    try {
+                      const { data } = await api.post<RipeReportResponse>("/ripe/reports/query", {
+                        date_from: ripeReportForm.dateFrom,
+                        date_to: ripeReportForm.dateTo,
+                        report_type: ripeReportForm.reportType
+                      });
+                      setRipeReportResult(data);
+                      setRipeReportStatus("complete");
+                    } catch (error) {
+                      setRipeReportStatus("idle");
+                      throw error;
+                    }
                   });
-                  setRipeReportResult(data);
-                })}
+                }}
               />
             ) : null}
             {view === "administration" ? (
@@ -1217,6 +1298,13 @@ function RegistryWorkspace({ onLogout }: { onLogout: () => void }) {
                 ripeConfigForm={ripeConfigForm}
                 ripePoolCsv={ripePoolCsv}
                 ripeAllocatedPools={ripeAllocatedPools}
+                cstConfig={cstConfig}
+                cstSummary={cstSummary}
+                cstBatches={cstBatches}
+                cstJobs={cstJobs}
+                cstSchedulerRuns={cstSchedulerRuns}
+                cstTransactions={cstTransactions}
+                cstBusy={cstConfigQuery.isFetching || cstSummaryQuery.isFetching || cstBatchesQuery.isFetching || cstJobsQuery.isFetching || cstSchedulerRunsQuery.isFetching || cstTransactionsQuery.isFetching}
                 onNewUser={setNewUser}
                 onPasswordReset={setPasswordReset}
                 onRipeConfigForm={setRipeConfigForm}
@@ -1229,6 +1317,37 @@ function RegistryWorkspace({ onLogout }: { onLogout: () => void }) {
                   const { data } = await api.post("/ripe/allocated-pools/bulk", { csv_text: ripePoolCsv, file_name: "ripe-allocated-pools.csv" });
                   setNotice({ title: "RIPE Allocated Pools Imported", detail: `${data.imported} imported, ${data.blocked} blocked.${data.errors?.length ? `\n${data.errors.slice(0, 8).join("\n")}` : ""}` });
                 })}
+                onRefreshCst={() => {
+                  void cstConfigQuery.refetch();
+                  void cstSummaryQuery.refetch();
+                  void cstBatchesQuery.refetch();
+                  void cstJobsQuery.refetch();
+                  void cstSchedulerRunsQuery.refetch();
+                  void cstTransactionsQuery.refetch();
+                }}
+                onBootstrapCst={() => run(async () => {
+                  const jobs = await bootstrapCurrentCstResources();
+                  setNotice({ title: "CST Migration Jobs Created", detail: `${jobs.length} local CST transaction job(s) stored. No external CST API call was made.` });
+                })}
+                onReconcileCst={() => run(async () => {
+                  const jobs = await reconcileCstResources();
+                  setNotice({ title: "CST Reconciliation Queued", detail: `${jobs.length} local GET job(s) stored for reconciliation. No external CST API call was made.` });
+                })}
+                onRunCstDayMinusOne={() => run(async () => {
+                  const result = await runCstDayMinusOneSync();
+                  setNotice({ title: "CST Day-1 Sync", detail: `${result.message}\nBatch: ${result.batch_id}` });
+                })}
+                onRetryCstJob={(job) => run(async () => {
+                  await retryCstJob(job.id);
+                  setNotice({ title: "CST Job Retried", detail: `${job.id} was reprocessed in local temporary storage.` });
+                })}
+                onRetryCstBatch={(batch) => run(async () => {
+                  const jobs = await retryFailedCstBatch(batch.id);
+                  setNotice({ title: "CST Batch Retry", detail: `${jobs.length} pending/failed job(s) reprocessed in local temporary storage.` });
+                })}
+                onToggleCstEnabled={(enabled) => run(async () => { await updateCstConfig({ enabled }); })}
+                onToggleCstAutoExecute={(auto_execute) => run(async () => { await updateCstConfig({ auto_execute }); })}
+                onToggleCstSchedule={(scheduled_sync_enabled) => run(async () => { await updateCstConfig({ scheduled_sync_enabled }); })}
               />
             ) : null}
           </section>
@@ -1354,6 +1473,8 @@ function ResourceRegistry(props: {
   poolForm: { cidr: string; name: string; region: string; description: string };
   ripeDiscoveryResult: RipeDiscoveryResponse | null;
   ripeDiscoveryStatus: "idle" | "running" | "complete";
+  ripeDiscoveryActionKey: string;
+  ripePushResourceId: string;
   onExpanded: (value: Record<string, boolean>) => void;
   onGlobalSearch: (value: string) => void;
   onPoolForm: (value: { cidr: string; name: string; region: string; description: string }) => void;
@@ -1389,11 +1510,12 @@ function ResourceRegistry(props: {
       <RipePoolsDiscovery
         result={props.ripeDiscoveryResult}
         status={props.ripeDiscoveryStatus}
+        actionKey={props.ripeDiscoveryActionKey}
         onDiscover={props.onDiscoverRipePools}
         onSync={props.onSyncRipePool}
         onSyncCstLir={props.onSyncCstLir}
       />
-      <RipeSyncWorklist resources={props.resources} onOpen={props.onOpen} onPushToRipe={props.onPushToRipe} onRefresh={props.onRefresh} />
+      <RipeSyncWorklist resources={props.resources} activeResourceId={props.ripePushResourceId} onOpen={props.onOpen} onPushToRipe={props.onPushToRipe} onRefresh={props.onRefresh} />
       <SubnetNavigator resources={visible} query={props.globalSearch} onQuery={props.onGlobalSearch} onOpen={props.onOpen} />
     </div>
   );
@@ -1402,20 +1524,32 @@ function ResourceRegistry(props: {
 function RipePoolsDiscovery({
   result,
   status,
+  actionKey,
   onDiscover,
   onSync,
   onSyncCstLir
 }: {
   result: RipeDiscoveryResponse | null;
   status: "idle" | "running" | "complete";
+  actionKey: string;
   onDiscover: () => void;
   onSync: (pool: RipeDiscoveredRootPool) => void;
   onSyncCstLir: (pool: RipeDiscoveredRootPool) => void;
 }) {
   const rows = result?.rows ?? [];
+  const [visibleDiscoveryRows, setVisibleDiscoveryRows] = useState(REPORT_BATCH_SIZE);
+  const renderedRows = rows.slice(0, visibleDiscoveryRows);
   const synced = rows.filter((row) => row.local_sync_status === "LIR Synced").length;
   const unsynced = rows.length - synced;
   const running = status === "running";
+  useEffect(() => {
+    setVisibleDiscoveryRows(REPORT_BATCH_SIZE);
+  }, [rows.length]);
+  const loadMoreDiscoveryRows = (event: UIEvent<HTMLDivElement>) => {
+    if (shouldLoadNextReportBatch(event, visibleDiscoveryRows, rows.length)) {
+      setVisibleDiscoveryRows((current) => Math.min(current + REPORT_BATCH_SIZE, rows.length));
+    }
+  };
   return (
     <Card>
       <CardHeader>
@@ -1435,7 +1569,7 @@ function RipePoolsDiscovery({
                 </span>
               ) : null}
             </div>
-            <CardDescription>Discover root inetnum allocations from RIPE using the configured mnt-lower maintainer lookup used by RIPE reports, then sync selected pools into Salam LIR/IPAM.</CardDescription>
+            <CardDescription>Discover RIPE root inetnum pools by merging mnt-by and mnt-lower maintainer lookups, de-duplicating, and keeping only largest non-contained ranges.</CardDescription>
           </div>
           <div className="flex flex-wrap gap-2">
             <Badge variant="default">{rows.length} discovered</Badge>
@@ -1458,7 +1592,8 @@ function RipePoolsDiscovery({
       </CardHeader>
       <CardContent className="grid gap-3">
         {result?.message ? <p className="text-sm text-muted-foreground">{result.message}</p> : null}
-        <div className="max-h-[360px] overflow-auto rounded-md border">
+        {rows.length ? <p className="text-xs text-muted-foreground">Showing {Math.min(visibleDiscoveryRows, rows.length)} of {rows.length} discovered RIPE root pools. Export includes all rows.</p> : null}
+        <div className="max-h-[420px] overflow-auto rounded-md border" onScroll={loadMoreDiscoveryRows}>
           <Table>
             <TableHeader>
               <TableRow>
@@ -1475,40 +1610,47 @@ function RipePoolsDiscovery({
               </TableRow>
             </TableHeader>
             <TableBody>
-              {rows.map((pool) => (
-                <TableRow key={`${pool.cidr}-${pool.allocation_range}`}>
-                  <TableCell className="font-semibold">{pool.pool_name}</TableCell>
-                  <TableCell>{pool.allocation_range}</TableCell>
-                  <TableCell>{pool.cidr}</TableCell>
-                  <TableCell>{formatHosts(pool.total_ips)}</TableCell>
-                  <TableCell>{pool.ripe_maintainer}</TableCell>
-                  <TableCell>{pool.ripe_status || "-"}</TableCell>
-                  <TableCell><Badge variant={pool.local_sync_status === "LIR Synced" ? "success" : "warning"}>{pool.local_sync_status}</Badge></TableCell>
-                  <TableCell><Badge variant={pool.cst_sync_status === "CST Synced" ? "success" : pool.cst_sync_status === "Partially Synced" ? "warning" : "muted"}>{pool.cst_sync_status}</Badge></TableCell>
-                  <TableCell>{pool.last_sync_date || "-"}</TableCell>
-                  <TableCell className="min-w-[260px]">
-                    <div className="flex flex-wrap justify-end gap-2">
-                      <Button
-                        size="sm"
-                        disabled={pool.local_sync_status === "LIR Synced"}
-                        title={pool.cidr.includes(",") ? "This RIPE range will be synced as multiple local LIR pools." : "Sync this RIPE root pool to local LIR."}
-                        onClick={() => onSync(pool)}
-                      >
-                        Sync to Local LIR
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="outline"
-                        disabled={pool.local_sync_status !== "LIR Synced" || pool.cst_sync_status === "CST Synced"}
-                        title={pool.local_sync_status !== "LIR Synced" ? "Sync to Local LIR before syncing to CST LIR." : "Mark this local LIR pool as synced to CST LIR."}
-                        onClick={() => onSyncCstLir(pool)}
-                      >
-                        Sync to CST LIR
-                      </Button>
-                    </div>
-                  </TableCell>
-                </TableRow>
-              ))}
+              {renderedRows.map((pool) => {
+                const poolKey = ripeDiscoveryPoolKey(pool);
+                const localRunning = actionKey === `local:${poolKey}`;
+                const cstRunning = actionKey === `cst:${poolKey}`;
+                return (
+                  <TableRow key={poolKey}>
+                    <TableCell className="font-semibold">{pool.pool_name}</TableCell>
+                    <TableCell>{pool.allocation_range}</TableCell>
+                    <TableCell>{pool.cidr}</TableCell>
+                    <TableCell>{formatHosts(pool.total_ips)}</TableCell>
+                    <TableCell>{pool.ripe_maintainer}</TableCell>
+                    <TableCell>{pool.ripe_status || "-"}</TableCell>
+                    <TableCell><Badge variant={pool.local_sync_status === "LIR Synced" ? "success" : "warning"}>{pool.local_sync_status}</Badge></TableCell>
+                    <TableCell><Badge variant={pool.cst_sync_status === "CST Synced" ? "success" : pool.cst_sync_status === "Partially Synced" ? "warning" : "muted"}>{pool.cst_sync_status}</Badge></TableCell>
+                    <TableCell>{pool.last_sync_date || "-"}</TableCell>
+                    <TableCell className="min-w-[260px]">
+                      <div className="flex flex-wrap justify-end gap-2">
+                        <Button
+                          size="sm"
+                          disabled={localRunning || pool.local_sync_status === "LIR Synced"}
+                          title={pool.cidr.includes(",") ? "This RIPE range will be synced as multiple local LIR pools." : "Sync this RIPE root pool to local LIR."}
+                          onClick={() => onSync(pool)}
+                        >
+                          {localRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                          Sync to Local LIR
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={cstRunning || pool.local_sync_status !== "LIR Synced" || pool.cst_sync_status === "CST Synced"}
+                          title={pool.local_sync_status !== "LIR Synced" ? "Sync to Local LIR before syncing to CST LIR." : "Mark this local LIR pool as synced to CST LIR."}
+                          onClick={() => onSyncCstLir(pool)}
+                        >
+                          {cstRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                          Sync to CST LIR
+                        </Button>
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
               {!rows.length ? (
                 <TableRow>
                   <TableCell colSpan={10} className="py-6 text-center text-muted-foreground">
@@ -1524,13 +1666,19 @@ function RipePoolsDiscovery({
   );
 }
 
+function ripeDiscoveryPoolKey(pool: RipeDiscoveredRootPool) {
+  return `${pool.cidr}-${pool.allocation_range}`;
+}
+
 function RipeSyncWorklist({
   resources,
+  activeResourceId,
   onOpen,
   onPushToRipe,
   onRefresh
 }: {
   resources: ManagedResource[];
+  activeResourceId: string;
   onOpen: (resource: ManagedResource) => void;
   onPushToRipe: (resource: ManagedResource) => void;
   onRefresh: () => void;
@@ -1587,7 +1735,8 @@ function RipeSyncWorklist({
                   <TableCell>
                     <div className="flex flex-wrap justify-end gap-2">
                       <Button size="sm" variant="outline" onClick={() => onOpen(resource)}>Review</Button>
-                      <Button size="sm" variant={resource.ripeSyncStatus === "FAILED" ? "destructive" : "default"} onClick={() => onPushToRipe(resource)}>
+                      <Button size="sm" variant={resource.ripeSyncStatus === "FAILED" ? "destructive" : "default"} disabled={activeResourceId === resource.id} onClick={() => onPushToRipe(resource)}>
+                        {activeResourceId === resource.id ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
                         {resource.ripeSyncStatus === "FAILED"
                           ? resource.operationType === "RETIRE" ? "Retry RIPE Removal" : "Retry RIPE Push"
                           : resource.operationType === "RETIRE" ? "Remove from RIPE" : "Push to RIPE"}
@@ -3003,26 +3152,29 @@ function Reporting({
   resources,
   auditEvents,
   conflicts,
-  ripeReportPools,
   ripeReportForm,
   ripeReportResult,
+  ripeReportStatus,
   onRipeReportForm,
-  onRunRipeReport
+  onRunRipeReport,
+  onClearRipeReport
 }: {
   resources: ManagedResource[];
   auditEvents: AuditEvent[];
   conflicts: Conflict[];
-  ripeReportPools: RipeAllocatedPool[];
-  ripeReportForm: { poolId: string; dateFrom: string; dateTo: string; reportType: string };
+  ripeReportForm: { dateFrom: string; dateTo: string; reportType: string };
   ripeReportResult: RipeReportResponse | null;
-  onRipeReportForm: (value: { poolId: string; dateFrom: string; dateTo: string; reportType: string }) => void;
+  ripeReportStatus: "idle" | "running" | "complete";
+  onRipeReportForm: (value: { dateFrom: string; dateTo: string; reportType: string }) => void;
   onRunRipeReport: () => void;
+  onClearRipeReport: () => void;
 }) {
   const [activeReport, setActiveReport] = useState<"pool-summary" | "cst-lir" | "resource-utilization" | "ripe-allocation" | null>(null);
   const [poolSummaryFilters, setPoolSummaryFilters] = useState<Record<string, string>>({});
   const [poolSummaryVisibleRows, setPoolSummaryVisibleRows] = useState(REPORT_BATCH_SIZE);
   const [registryVisibleRows, setRegistryVisibleRows] = useState(REPORT_BATCH_SIZE);
   const [utilizationVisibleRows, setUtilizationVisibleRows] = useState(REPORT_BATCH_SIZE);
+  const [ripeVisibleRows, setRipeVisibleRows] = useState(REPORT_BATCH_SIZE);
   const poolSummaryRows = poolSummaryReportRows(resources);
   const filteredPoolSummaryRows = filterReportRows(poolSummaryRows, poolSummaryFilters, POOL_SUMMARY_COLUMNS);
   const reportingResources = presentationResources(resources);
@@ -3031,6 +3183,9 @@ function Reporting({
   const visiblePoolSummaryRows = filteredPoolSummaryRows.slice(0, poolSummaryVisibleRows);
   const visibleRegistryRows = registryRows.slice(0, registryVisibleRows);
   const visibleUtilizationRows = utilizationRows.slice(0, utilizationVisibleRows);
+  const ripeRows = ripeReportResult?.rows ?? [];
+  const ripeColumns = ripeRows.length ? ripeAssignmentColumns(ripeRows) : [];
+  const visibleRipeRows = ripeRows.slice(0, ripeVisibleRows);
   useEffect(() => {
     setPoolSummaryVisibleRows(REPORT_BATCH_SIZE);
   }, [poolSummaryFilters, resources.length]);
@@ -3038,6 +3193,9 @@ function Reporting({
     setRegistryVisibleRows(REPORT_BATCH_SIZE);
     setUtilizationVisibleRows(REPORT_BATCH_SIZE);
   }, [resources.length]);
+  useEffect(() => {
+    setRipeVisibleRows(REPORT_BATCH_SIZE);
+  }, [ripeRows.length]);
   const loadMorePoolSummaryRows = (event: UIEvent<HTMLDivElement>) => {
     if (shouldLoadNextReportBatch(event, poolSummaryVisibleRows, filteredPoolSummaryRows.length)) {
       setPoolSummaryVisibleRows((current) => Math.min(current + REPORT_BATCH_SIZE, filteredPoolSummaryRows.length));
@@ -3053,16 +3211,22 @@ function Reporting({
       setUtilizationVisibleRows((current) => Math.min(current + REPORT_BATCH_SIZE, utilizationRows.length));
     }
   };
-  const openRipeReport = (reportType: string) => {
-    onRipeReportForm({ ...ripeReportForm, reportType });
+  const loadMoreRipeRows = (event: UIEvent<HTMLDivElement>) => {
+    if (shouldLoadNextReportBatch(event, ripeVisibleRows, ripeRows.length)) {
+      setRipeVisibleRows((current) => Math.min(current + REPORT_BATCH_SIZE, ripeRows.length));
+    }
+  };
+  const openRipeReport = () => {
+    onRipeReportForm({ ...ripeReportForm, reportType: "RIPE Assignment Report" });
+    onClearRipeReport();
+    setRipeVisibleRows(REPORT_BATCH_SIZE);
     setActiveReport("ripe-allocation");
   };
   const reportRows = [
     { id: "pool-summary", activeId: "pool-summary" as const, name: "Subnet Summary Report", scope: `${filteredPoolSummaryRows.length} of ${poolSummaryRows.length} registered subnets`, status: "Available" },
     { id: "resource-utilization", activeId: "resource-utilization" as const, name: "Resource Utilization Report", scope: `${reportingResources.length} resources`, status: "Available" },
     { id: "cst-lir", activeId: "cst-lir" as const, name: "CST/LIR Registry Report", scope: `${registryRows.length} CIDRs`, status: "Available" },
-    { id: "ripe-assignment", activeId: "ripe-allocation" as const, reportType: "RIPE Assignment Report", name: "RIPE Assignment Report", scope: `${ripeReportPools.length} RIPE-discovered registry pools`, status: "Available" },
-    { id: "ripe-maintainer-ip", activeId: "ripe-allocation" as const, reportType: "RIPE Maintainer IP Report", name: "RIPE Maintainer IP Report", scope: "mnt-lower ITC-NOC-MNT inetnums", status: "Available" },
+    { id: "ripe-assignment", activeId: "ripe-allocation" as const, name: "RIPE Assignment Report", scope: "Maintainer ITC-NOC-MNT inetnum assignments", status: "Available" },
     { id: "assignments", name: "Assignment Report", scope: `${resources.filter((item) => item.administrativeStatus === "ASSIGNED").length} assignments`, status: "Planned" },
     { id: "reservations", name: "Reservation Report", scope: `${resources.filter((item) => item.administrativeStatus === "RESERVED").length} reservations`, status: "Planned" },
     { id: "fragmentation", name: "Fragmentation Report", scope: `${resources.filter((item) => item.administrativeStatus === "AVAILABLE").length} available subnets`, status: "Planned" },
@@ -3095,7 +3259,7 @@ function Reporting({
                       <button
                         className="text-left text-primary underline-offset-4 hover:underline"
                         type="button"
-                        onClick={() => report.reportType ? openRipeReport(report.reportType) : setActiveReport(report.activeId)}
+                        onClick={() => report.id === "ripe-assignment" ? openRipeReport() : setActiveReport(report.activeId)}
                       >
                         {report.name}
                       </button>
@@ -3118,7 +3282,7 @@ function Reporting({
             <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
               <div>
                 <CardTitle>RIPE Assignment Report</CardTitle>
-                <CardDescription>Queries RIPE inetnum assignments by selected pool range, or all inetnums maintained by the configured mnt-lower value within that pool, and exports all returned attributes.</CardDescription>
+                <CardDescription>Queries all RIPE inetnum objects maintained by the configured maintainer using inverse-attribute=mnt-by, then exports only assignment records.</CardDescription>
               </div>
               <Button variant="outline" onClick={() => setActiveReport(null)}>
                 Back to Reports
@@ -3128,63 +3292,46 @@ function Reporting({
           <CardContent className="grid gap-4">
             <div className="grid gap-3 md:grid-cols-3">
               <label className="grid gap-1">
-                <span className="text-xs font-semibold text-muted-foreground">RIPE Report Type</span>
-                <Select
-                  value={ripeReportForm.reportType}
-                  values={ripeReportTypes}
-                  onChange={(reportType) => onRipeReportForm({ ...ripeReportForm, reportType })}
-                />
-              </label>
-              <label className="grid gap-1">
-                <span className="text-xs font-semibold text-muted-foreground">RIPE Discovered Pool</span>
-                <Select
-                  value={ripeReportForm.poolId}
-                  values={ripeReportPools.map((pool) => pool.id)}
-                  labels={Object.fromEntries(ripeReportPools.map((pool) => [pool.id, `${pool.pool_name} (${pool.cidr})`]))}
-                  onChange={(poolId) => onRipeReportForm({ ...ripeReportForm, poolId })}
-                />
-              </label>
-              <label className="grid gap-1">
                 <span className="text-xs font-semibold text-muted-foreground">Date From</span>
-                <Input value={ripeReportForm.dateFrom} onChange={(event) => onRipeReportForm({ ...ripeReportForm, dateFrom: event.target.value })} placeholder="YYYY-MM-DD" />
+                <Input type="date" value={ripeReportForm.dateFrom} onChange={(event) => onRipeReportForm({ ...ripeReportForm, dateFrom: event.target.value })} />
               </label>
               <label className="grid gap-1">
                 <span className="text-xs font-semibold text-muted-foreground">Date To</span>
-                <Input value={ripeReportForm.dateTo} onChange={(event) => onRipeReportForm({ ...ripeReportForm, dateTo: event.target.value })} placeholder="YYYY-MM-DD" />
+                <Input type="date" value={ripeReportForm.dateTo} onChange={(event) => onRipeReportForm({ ...ripeReportForm, dateTo: event.target.value })} />
               </label>
             </div>
             <div className="flex flex-wrap gap-2">
-              <Button onClick={onRunRipeReport} disabled={!ripeReportForm.poolId || !ripeReportPools.length}>
-                <Radar className="h-4 w-4" />
-                Run {ripeReportForm.reportType}
+              <Button onClick={onRunRipeReport} disabled={ripeReportStatus === "running"}>
+                {ripeReportStatus === "running" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Radar className="h-4 w-4" />}
+                {ripeReportStatus === "running" ? "Running RIPE Assignment Report" : "Run RIPE Assignment Report"}
               </Button>
               <Button variant="outline" onClick={() => ripeReportResult ? exportRipeAssignmentRows(ripeReportResult.rows, ripeReportResult.report_type) : undefined} disabled={!ripeReportResult?.rows.length}>
                 <FileDown className="h-4 w-4" />
                 Export CSV
               </Button>
-              {!ripeReportPools.length ? <p className="self-center text-sm text-muted-foreground">Run RIPE IP Pools Discovery and sync a pool to Local LIR first.</p> : null}
             </div>
             {ripeReportResult ? (
               <div className="grid gap-3 rounded-md border bg-muted/20 p-3">
                 <div>
-                  <p className="font-semibold">{ripeReportResult.report_type} / {ripeReportResult.pool.cidr}</p>
+                  <p className="font-semibold">{ripeReportResult.report_type}</p>
                   <p className="mt-1 text-sm text-muted-foreground">Maintainer: {ripeReportResult.maintainer || "Not configured"}</p>
                   <p className="mt-2 text-sm text-muted-foreground">{ripeReportResult.message}</p>
+                  <p className="mt-1 text-xs text-muted-foreground">Showing {Math.min(ripeVisibleRows, ripeRows.length)} of {ripeRows.length} rows in the preview. Export CSV includes all rows.</p>
                 </div>
                 {ripeReportResult.rows.length ? (
-                  <div className="max-h-[320px] overflow-auto rounded-md border bg-background/40">
+                  <div className="max-h-[420px] overflow-auto rounded-md border bg-background/40" onScroll={loadMoreRipeRows}>
                     <Table>
                       <TableHeader>
                         <TableRow>
-                          {ripeAssignmentColumns(ripeReportResult.rows).map((column) => (
+                          {ripeColumns.map((column) => (
                             <TableHead key={column}>{column}</TableHead>
                           ))}
                         </TableRow>
                       </TableHeader>
                       <TableBody>
-                        {ripeReportResult.rows.map((row, rowIndex) => (
+                        {visibleRipeRows.map((row, rowIndex) => (
                           <TableRow key={`${row.inetnum}-${row.netname}-${rowIndex}`}>
-                            {ripeAssignmentColumns(ripeReportResult.rows).map((column) => (
+                            {ripeColumns.map((column) => (
                               <TableCell key={column} className={column === "inetnum" || column === "cidr" ? "font-semibold" : ""}>{String(row[column] ?? "")}</TableCell>
                             ))}
                           </TableRow>
@@ -3195,35 +3342,6 @@ function Reporting({
                 ) : null}
               </div>
             ) : null}
-            <div className="max-h-[360px] overflow-auto rounded-md border">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Pool Name</TableHead>
-                    <TableHead>CIDR</TableHead>
-                    <TableHead>Range</TableHead>
-                    <TableHead>Source</TableHead>
-                    <TableHead>Created</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {ripeReportPools.map((pool) => (
-                    <TableRow key={pool.id}>
-                      <TableCell className="font-semibold">{pool.pool_name}</TableCell>
-                      <TableCell>{pool.cidr}</TableCell>
-                      <TableCell>{pool.start_ip} - {pool.end_ip}</TableCell>
-                      <TableCell>{pool.source}</TableCell>
-                      <TableCell>{pool.created_date}</TableCell>
-                    </TableRow>
-                  ))}
-                  {!ripeReportPools.length ? (
-                    <TableRow>
-                      <TableCell colSpan={5} className="py-6 text-center text-muted-foreground">No RIPE-discovered registry pools are synced to Local LIR.</TableCell>
-                    </TableRow>
-                  ) : null}
-                </TableBody>
-              </Table>
-            </div>
           </CardContent>
         </Card>
       ) : null}
@@ -3456,6 +3574,13 @@ function Administration(props: {
   ripeConfigForm: RipeConfigPayload;
   ripePoolCsv: string;
   ripeAllocatedPools: RipeAllocatedPool[];
+  cstConfig: CstConfig | null;
+  cstSummary: CstSyncSummary | null;
+  cstBatches: CstSyncBatch[];
+  cstJobs: CstSyncJob[];
+  cstSchedulerRuns: CstSchedulerRun[];
+  cstTransactions: CstTransactionLedger[];
+  cstBusy: boolean;
   onNewUser: (value: { username: string; password: string; role: User["role"] }) => void;
   onPasswordReset: (value: { userId: string; password: string }) => void;
   onRipeConfigForm: (value: RipeConfigPayload) => void;
@@ -3465,6 +3590,15 @@ function Administration(props: {
   onToggleUser: (user: User) => void;
   onSaveRipeConfig: () => void;
   onImportRipePools: () => void;
+  onRefreshCst: () => void;
+  onBootstrapCst: () => void;
+  onReconcileCst: () => void;
+  onRunCstDayMinusOne: () => void;
+  onRetryCstJob: (job: CstSyncJob) => void;
+  onRetryCstBatch: (batch: CstSyncBatch) => void;
+  onToggleCstEnabled: (enabled: boolean) => void;
+  onToggleCstAutoExecute: (autoExecute: boolean) => void;
+  onToggleCstSchedule: (scheduled: boolean) => void;
 }) {
   const roles = ["admin", "operator", "viewer"];
   const policyRows = ["Allocation Rules", "Reservation Rules", "Retention Rules"];
@@ -3575,6 +3709,176 @@ function Administration(props: {
         </CardContent>
       </Card>
       <Card>
+        <CardHeader>
+          <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+            <div>
+              <CardTitle>CST Integration Monitor</CardTitle>
+              <CardDescription>Local controlled transaction store for CST SEND, UPDATE, DELETE, and GET workflows. External CST API calls are not enabled yet.</CardDescription>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <Button variant="outline" onClick={props.onRefreshCst} disabled={props.cstBusy}>
+                {props.cstBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCcw className="h-4 w-4" />}
+                Refresh
+              </Button>
+              <Button variant="secondary" onClick={props.onBootstrapCst}>
+                <Database className="h-4 w-4" />
+                Create Migration Jobs
+              </Button>
+              <Button variant="outline" onClick={props.onReconcileCst}>
+                <Search className="h-4 w-4" />
+                Reconcile
+              </Button>
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent className="grid gap-5">
+          <div className="grid gap-3 md:grid-cols-4">
+            <ReportMetric label="Transactions" value={String(props.cstSummary?.total_transactions ?? 0)} detail="Globally unique CST IDs" />
+            <ReportMetric label="Jobs" value={String(props.cstSummary?.total_jobs ?? 0)} detail={`${props.cstSummary?.success_jobs ?? 0} success / ${props.cstSummary?.pending_jobs ?? 0} pending`} />
+            <ReportMetric label="Failed" value={String((props.cstSummary?.failed_jobs ?? 0) + (props.cstSummary?.blocked_jobs ?? 0))} detail="Failed or blocked local jobs" />
+            <ReportMetric label="Last Batch" value={props.cstSummary?.last_batch_at ? props.cstSummary.last_batch_at.slice(0, 10) : "-"} detail="Latest CST transaction batch" />
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge variant={props.cstConfig?.enabled ? "success" : "warning"}>{props.cstConfig?.enabled ? "CST enabled" : "CST disabled"}</Badge>
+            <Badge variant={props.cstConfig?.scheduled_sync_enabled ? "success" : "default"}>{props.cstConfig?.scheduled_sync_enabled ? `Daily ${props.cstConfig?.schedule_time ?? "00:30"} ${props.cstConfig?.schedule_timezone ?? "Asia/Riyadh"}` : "Schedule off"}</Badge>
+            <Badge variant={props.cstConfig?.auto_execute ? "success" : "default"}>{props.cstConfig?.auto_execute ? "Auto local execution" : "Manual queue"}</Badge>
+            <Badge variant="default">Service provider {props.cstConfig?.service_provider_id ?? "5"}</Badge>
+            <Button size="sm" variant="outline" onClick={() => props.onToggleCstEnabled(!props.cstConfig?.enabled)}>
+              {props.cstConfig?.enabled ? "Disable" : "Enable"}
+            </Button>
+            <Button size="sm" variant="outline" onClick={() => props.onToggleCstSchedule(!props.cstConfig?.scheduled_sync_enabled)}>
+              {props.cstConfig?.scheduled_sync_enabled ? "Disable Schedule" : "Enable Schedule"}
+            </Button>
+            <Button size="sm" variant="outline" onClick={props.onRunCstDayMinusOne}>
+              Run Day-1 Now
+            </Button>
+            <Button size="sm" variant="outline" onClick={() => props.onToggleCstAutoExecute(!props.cstConfig?.auto_execute)}>
+              {props.cstConfig?.auto_execute ? "Use Manual Queue" : "Use Auto Local Execution"}
+            </Button>
+          </div>
+          <div className="rounded-md border bg-muted/20 p-3">
+            <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+              <div>
+                <p className="text-sm font-semibold">Daily CST Schedule</p>
+                <p className="text-xs text-muted-foreground">Runs once per day at {props.cstConfig?.schedule_time ?? "00:30"} {props.cstConfig?.schedule_timezone ?? "Asia/Riyadh"} for the previous local day. Last run: {props.cstConfig?.last_scheduled_run_at || "not yet"}</p>
+              </div>
+              <Badge variant={props.cstConfig?.scheduled_sync_enabled ? "success" : "warning"}>{props.cstConfig?.scheduled_sync_enabled ? "Scheduled" : "Paused"}</Badge>
+            </div>
+            <div className="mt-3 max-h-[180px] overflow-auto rounded-md border bg-background/40">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Target Day</TableHead>
+                    <TableHead>Status</TableHead>
+                    <TableHead>Jobs</TableHead>
+                    <TableHead>Message</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {props.cstSchedulerRuns.slice(0, 8).map((run) => (
+                    <TableRow key={run.id}>
+                      <TableCell>{run.target_date}</TableCell>
+                      <TableCell><Badge variant={run.status === "SUCCESS" ? "success" : run.status === "FAILED" ? "danger" : "warning"}>{run.status}</Badge></TableCell>
+                      <TableCell>{run.total_jobs}</TableCell>
+                      <TableCell className="text-xs text-muted-foreground">{run.message || run.scheduled_for}</TableCell>
+                    </TableRow>
+                  ))}
+                  {!props.cstSchedulerRuns.length ? <TableRow><TableCell colSpan={4} className="py-4 text-center text-muted-foreground">No scheduled CST runs yet.</TableCell></TableRow> : null}
+                </TableBody>
+              </Table>
+            </div>
+          </div>          <div className="grid gap-4 xl:grid-cols-2">
+            <div className="grid gap-2">
+              <div className="flex items-center justify-between gap-2">
+                <h3 className="text-sm font-semibold">Recent Batches</h3>
+                {props.cstBatches[0] ? <Button size="sm" variant="outline" onClick={() => props.onRetryCstBatch(props.cstBatches[0])}>Retry Latest</Button> : null}
+              </div>
+              <div className="max-h-[300px] overflow-auto rounded-md border">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Batch</TableHead>
+                      <TableHead>Workflow</TableHead>
+                      <TableHead>Status</TableHead>
+                      <TableHead>Jobs</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {props.cstBatches.slice(0, 40).map((batch) => (
+                      <TableRow key={batch.id}>
+                        <TableCell className="font-mono text-xs">{batch.id}</TableCell>
+                        <TableCell>{batch.workflow_type}</TableCell>
+                        <TableCell><Badge variant={batch.status === "SUCCESS" ? "success" : batch.status === "FAILED" || batch.status === "BLOCKED" ? "danger" : "warning"}>{batch.status}</Badge></TableCell>
+                        <TableCell>{batch.completed_jobs}/{batch.total_jobs}</TableCell>
+                      </TableRow>
+                    ))}
+                    {!props.cstBatches.length ? <TableRow><TableCell colSpan={4} className="py-6 text-center text-muted-foreground">No CST batches yet.</TableCell></TableRow> : null}
+                  </TableBody>
+                </Table>
+              </div>
+            </div>
+            <div className="grid gap-2">
+              <h3 className="text-sm font-semibold">Recent Jobs</h3>
+              <div className="max-h-[300px] overflow-auto rounded-md border">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>CIDR</TableHead>
+                      <TableHead>Operation</TableHead>
+                      <TableHead>Status</TableHead>
+                      <TableHead />
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {props.cstJobs.slice(0, 60).map((job) => (
+                      <TableRow key={job.id}>
+                        <TableCell>
+                          <p className="font-semibold">{job.cidr}</p>
+                          <p className="font-mono text-xs text-muted-foreground">{job.transaction_id}</p>
+                        </TableCell>
+                        <TableCell>{job.operation}</TableCell>
+                        <TableCell><Badge variant={job.status === "SUCCESS" ? "success" : job.status === "FAILED" || job.status === "BLOCKED" ? "danger" : job.status === "PENDING" ? "warning" : "default"}>{job.status}</Badge></TableCell>
+                        <TableCell>
+                          {job.status === "FAILED" || job.status === "BLOCKED" || job.status === "PENDING" ? <Button size="sm" variant="outline" onClick={() => props.onRetryCstJob(job)}>Retry</Button> : null}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                    {!props.cstJobs.length ? <TableRow><TableCell colSpan={4} className="py-6 text-center text-muted-foreground">No CST jobs yet.</TableCell></TableRow> : null}
+                  </TableBody>
+                </Table>
+              </div>
+            </div>
+          </div>
+          <div className="grid gap-2">
+            <h3 className="text-sm font-semibold">Transaction Ledger</h3>
+            <div className="max-h-[300px] overflow-auto rounded-md border">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Transaction ID</TableHead>
+                    <TableHead>CIDR</TableHead>
+                    <TableHead>Status</TableHead>
+                    <TableHead>Timestamp</TableHead>
+                    <TableHead>Batch</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {props.cstTransactions.slice(0, 80).map((item) => (
+                    <TableRow key={item.transaction_id}>
+                      <TableCell className="font-mono text-xs">{item.transaction_id}</TableCell>
+                      <TableCell className="font-semibold">{item.cidr}</TableCell>
+                      <TableCell><Badge variant={item.last_status === "SUCCESS" ? "success" : item.last_status === "FAILED" || item.last_status === "BLOCKED" ? "danger" : "warning"}>{item.last_status}</Badge></TableCell>
+                      <TableCell>{formatDateTime(item.first_used_at)}</TableCell>
+                      <TableCell className="font-mono text-xs">{item.batch_id}</TableCell>
+                    </TableRow>
+                  ))}
+                  {!props.cstTransactions.length ? <TableRow><TableCell colSpan={5} className="py-6 text-center text-muted-foreground">No CST transaction IDs have been generated.</TableCell></TableRow> : null}
+                </TableBody>
+              </Table>
+            </div>
+          </div>
+        </CardContent>
+      </Card>      <Card>
         <CardHeader>
           <CardTitle>Policies</CardTitle>
           <CardDescription>Registry governance policy areas.</CardDescription>
@@ -5142,18 +5446,16 @@ function ripeStatusForAssignment(assignment: Assignment, required: boolean): Rip
   }
   const normalized = String(assignment.ripe_sync_status || "PENDING").toUpperCase();
   if (assignment.status === "Retiring") {
-    if (normalized === "FAILED") {
-      return "FAILED";
-    }
     if ((normalized === "SUCCESS" || normalized === "SYNCHRONIZED") && assignment.action_flag === "D") {
       return "SUCCESS";
     }
-    if (!["NOT_REQUIRED", "EXCLUDED"].includes(normalized)) {
+    if (normalized === "FAILED" && assignment.action_flag === "D") {
+      return "FAILED";
+    }
+    if (normalized === "SUCCESS" || normalized === "SYNCHRONIZED" || normalized === "DECOMMISSION_PENDING") {
       return "DECOMMISSION_PENDING";
     }
-  }
-  if (assignment.status === "Retiring" && !["NOT_REQUIRED", "EXCLUDED"].includes(normalized)) {
-    return "DECOMMISSION_PENDING";
+    return "NOT_REQUIRED";
   }
   if (normalized === "SUCCESS" || normalized === "SYNCHRONIZED") {
     return "SUCCESS";
@@ -5323,3 +5625,31 @@ function errorMessage(error: unknown) {
   }
   return error instanceof Error ? error.message : "Unknown error";
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

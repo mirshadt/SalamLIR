@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, time as datetime_time, timedelta, timezone
 import base64
 import csv
 import hashlib
@@ -17,6 +17,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 from uuid import NAMESPACE_URL, uuid4, uuid5
+from zoneinfo import ZoneInfo
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,6 +31,8 @@ DB_PATH = Path(__file__).with_name("ipam.db")
 PUBLIC_FAVICON_PATH = Path(__file__).resolve().parent.parent / "public" / "favicon.png"
 DB_BUSY_TIMEOUT_MS = 30_000
 DB_WRITE_LOCK = threading.RLock()
+CST_SCHEDULER_LOCK = threading.Lock()
+CST_SCHEDULER_STARTED = False
 DEFAULT_SERVICE_PROVIDER_ID = "5"
 DEFAULT_SERVICE_PROVIDER_NAME = "Salam"
 DEFAULT_ASN = "AS35753"
@@ -427,14 +430,13 @@ class RipeAllocatedPoolBulkResult(BaseModel):
 
 
 class RipeReportRequest(BaseModel):
-    pool_id: str
     date_from: str = ""
     date_to: str = ""
-    report_type: str = "Assigned Ranges"
+    report_type: str = "RIPE Assignment Report"
 
 
 class RipeReportResponse(BaseModel):
-    pool: RipeAllocatedPool
+    pool: RipeAllocatedPool | None = None
     report_type: str
     date_from: str = ""
     date_to: str = ""
@@ -574,13 +576,115 @@ class AssignmentDetailRecord(BaseModel):
     updated_at: str
 
 
+
+class CstConfig(BaseModel):
+    id: str = "default"
+    enabled: bool = True
+    service_provider_id: str = DEFAULT_SERVICE_PROVIDER_ID
+    auto_execute: bool = True
+    scheduled_sync_enabled: bool = True
+    schedule_time: str = "00:30"
+    schedule_timezone: str = "Asia/Riyadh"
+    last_scheduled_run_date: str = ""
+    last_scheduled_run_at: str = ""
+    batch_size_limit: int = 500
+    hourly_request_limit: int = 1000
+    updated_at: str
+
+
+class CstConfigUpdate(BaseModel):
+    enabled: bool | None = None
+    service_provider_id: str | None = None
+    auto_execute: bool | None = None
+    scheduled_sync_enabled: bool | None = None
+    schedule_time: str | None = None
+    schedule_timezone: str | None = None
+    batch_size_limit: int | None = None
+    hourly_request_limit: int | None = None
+
+
+class CstSyncBatch(BaseModel):
+    id: str
+    workflow_type: str
+    status: str
+    total_jobs: int = 0
+    completed_jobs: int = 0
+    failed_jobs: int = 0
+    blocked_jobs: int = 0
+    created_at: str
+    completed_at: str = ""
+
+
+class CstSyncJob(BaseModel):
+    id: str
+    batch_id: str
+    resource_uuid: str
+    transaction_id: str
+    operation: str
+    sequence_no: int = 1
+    depends_on_job_id: str = ""
+    cidr: str
+    service_provider_id: str
+    payload_json: str = ""
+    response_json: str = ""
+    status: str = "PENDING"
+    attempt_count: int = 0
+    last_error: str = ""
+    created_at: str
+    updated_at: str
+
+
+class CstTransactionLedger(BaseModel):
+    transaction_id: str
+    cidr: str
+    resource_uuid: str
+    service_provider_id: str
+    first_used_at: str
+    last_status: str
+    retired_at: str = ""
+    retired_reason: str = ""
+    batch_id: str = ""
+    correlation_id: str = ""
+
+
+class CstSyncSummary(BaseModel):
+    enabled: bool = True
+    auto_execute: bool = True
+    scheduled_sync_enabled: bool = True
+    schedule_time: str = "00:30"
+    schedule_timezone: str = "Asia/Riyadh"
+    last_scheduled_run_date: str = ""
+    last_scheduled_run_at: str = ""
+    total_jobs: int = 0
+    pending_jobs: int = 0
+    running_jobs: int = 0
+    success_jobs: int = 0
+    failed_jobs: int = 0
+    blocked_jobs: int = 0
+    total_transactions: int = 0
+    last_batch_at: str = ""
+
+
+class CstSchedulerRun(BaseModel):
+    id: str
+    target_date: str
+    scheduled_for: str
+    status: str
+    batch_id: str = ""
+    total_jobs: int = 0
+    message: str = ""
+    triggered_by: str = "scheduler"
+    started_at: str
+    completed_at: str = ""
+
+
 class ResourceWithAssignment(ResourceRecord):
     assignment: AssignmentDetailRecord | None = None
 
 
 SUPPORTED_RESOURCE_STATUSES = {"ASSIGNED_TO_BUSINESS", "RESERVED", "AVAILABLE", "RETIRED"}
 SUPPORTED_OWNERSHIP_TYPES = {"BUSINESS", "INDIVIDUAL", "INTERNAL", "INFRASTRUCTURE", "POOL"}
-CST_SYNC_STATUSES = {"PENDING", "SUCCESS", "FAILED", "NOT_REQUIRED"}
+CST_SYNC_STATUSES = {"NOT_CONFIGURED", "NOT_REQUIRED", "PENDING", "RUNNING", "SUCCESS", "FAILED", "BLOCKED"}
 RIPE_SYNC_STATUSES = {"PENDING", "SUCCESS", "FAILED", "NOT_REQUIRED"}
 ACTION_FLAGS = {"N", "U", "D", "S", "F"}
 
@@ -735,21 +839,6 @@ def ripe_config_from_row(row: sqlite3.Row) -> RipeConfigOut:
 
 def ripe_allocated_pool_from_row(row: sqlite3.Row) -> RipeAllocatedPool:
     return RipeAllocatedPool(**dict(row))
-
-
-def ripe_report_pool_from_pool_row(row: sqlite3.Row) -> RipeAllocatedPool:
-    pool = pool_from_row(row)
-    return RipeAllocatedPool(
-        id=pool.id,
-        pool_name=pool.name,
-        cidr=pool.cidr,
-        start_ip=pool.start,
-        end_ip=pool.end,
-        allocation_type="RIPE Discovered Pool",
-        source=pool.source_system or pool.source,
-        created_date=(pool.last_audit_at or pool.created_at)[:10],
-        created_at=pool.created_at,
-    )
 
 
 def resource_from_row(row: sqlite3.Row) -> ResourceRecord:
@@ -1120,7 +1209,10 @@ def add_missing_columns(connection: sqlite3.Connection, table: str, model: type[
         default_value = field.default
         if default_value is None:
             default_value = ""
-        if isinstance(default_value, (int, float)):
+        if isinstance(default_value, bool):
+            column_type = "INTEGER"
+            default_sql = "1" if default_value else "0"
+        elif isinstance(default_value, (int, float)):
             column_type = "INTEGER" if isinstance(default_value, int) else "REAL"
             default_sql = str(default_value)
         else:
@@ -1151,6 +1243,595 @@ def record_audit(
     )
 
 
+
+def cst_config_from_row(row: sqlite3.Row) -> CstConfig:
+    values = dict(row)
+    return CstConfig(
+        id=str(values.get("id", "default")),
+        enabled=bool(values.get("enabled", 1)),
+        service_provider_id=str(values.get("service_provider_id") or DEFAULT_SERVICE_PROVIDER_ID),
+        auto_execute=bool(values.get("auto_execute", 1)),
+        scheduled_sync_enabled=bool(values.get("scheduled_sync_enabled", 1)),
+        schedule_time=str(values.get("schedule_time") or "00:30"),
+        schedule_timezone=str(values.get("schedule_timezone") or "Asia/Riyadh"),
+        last_scheduled_run_date=str(values.get("last_scheduled_run_date") or ""),
+        last_scheduled_run_at=str(values.get("last_scheduled_run_at") or ""),
+        batch_size_limit=int(values.get("batch_size_limit") or 500),
+        hourly_request_limit=int(values.get("hourly_request_limit") or 1000),
+        updated_at=str(values.get("updated_at") or ""),
+    )
+
+
+def cst_batch_from_row(row: sqlite3.Row) -> CstSyncBatch:
+    return CstSyncBatch(**dict(row))
+
+
+def cst_job_from_row(row: sqlite3.Row) -> CstSyncJob:
+    return CstSyncJob(**dict(row))
+
+
+def cst_ledger_from_row(row: sqlite3.Row) -> CstTransactionLedger:
+    return CstTransactionLedger(**dict(row))
+
+
+def cst_scheduler_run_from_row(row: sqlite3.Row) -> CstSchedulerRun:
+    return CstSchedulerRun(**dict(row))
+
+
+def ensure_cst_config(connection: sqlite3.Connection) -> CstConfig:
+    row = connection.execute("SELECT * FROM cst_config WHERE id = 'default'").fetchone()
+    if row is None:
+        connection.execute(
+            """
+            INSERT INTO cst_config (
+              id, enabled, service_provider_id, auto_execute, scheduled_sync_enabled,
+              schedule_time, schedule_timezone, last_scheduled_run_date, last_scheduled_run_at,
+              batch_size_limit, hourly_request_limit, updated_at
+            )
+            VALUES ('default', 1, ?, 1, 1, '00:30', 'Asia/Riyadh', '', '', 500, 1000, ?)
+            """,
+            (DEFAULT_SERVICE_PROVIDER_ID, now_iso()),
+        )
+        row = connection.execute("SELECT * FROM cst_config WHERE id = 'default'").fetchone()
+    return cst_config_from_row(row)
+
+
+def resource_requires_cst(resource: ResourceRecord) -> bool:
+    return resource.ip_type == "PUBLIC" and resource.status != "RETIRED"
+
+
+def cst_transaction_id_for_resource(connection: sqlite3.Connection, resource: ResourceRecord, operation: str, batch_id: str, correlation_id: str) -> str:
+    existing = connection.execute(
+        """
+        SELECT transaction_id, retired_at
+        FROM cst_transaction_ledger
+        WHERE resource_uuid = ?
+        ORDER BY first_used_at DESC
+        LIMIT 1
+        """,
+        (resource.resource_uuid,),
+    ).fetchone()
+    if existing and operation != "SEND":
+        return str(existing["transaction_id"])
+    if existing and not str(existing["retired_at"] or ""):
+        return str(existing["transaction_id"])
+
+    service_provider_id = resource.service_provider_id or DEFAULT_SERVICE_PROVIDER_ID
+    while True:
+        candidate = str(uuid4())
+        duplicate = connection.execute(
+            "SELECT 1 FROM cst_transaction_ledger WHERE transaction_id = ?",
+            (candidate,),
+        ).fetchone()
+        if duplicate is None:
+            break
+    created_at = now_iso()
+    connection.execute(
+        """
+        INSERT INTO cst_transaction_ledger (
+          transaction_id, cidr, resource_uuid, service_provider_id, first_used_at,
+          last_status, retired_at, retired_reason, batch_id, correlation_id
+        )
+        VALUES (?, ?, ?, ?, ?, ?, '', '', ?, ?)
+        """,
+        (candidate, resource.cidr, resource.resource_uuid, service_provider_id, created_at, "PENDING", batch_id, correlation_id),
+    )
+    return candidate
+
+
+def cst_payload_for_resource(resource: ResourceRecord, operation: str, transaction_id: str, correlation_id: str) -> dict:
+    return {
+        "transactionId": transaction_id,
+        "correlationId": correlation_id,
+        "operation": operation,
+        "resourceUuid": resource.resource_uuid,
+        "versionUuid": resource.version_uuid,
+        "cidr": resource.cidr,
+        "startIp": resource.start_ip,
+        "endIp": resource.end_ip,
+        "prefix": resource.prefix,
+        "size": resource.size,
+        "ipVersion": resource.ip_version,
+        "serviceProviderId": resource.service_provider_id or DEFAULT_SERVICE_PROVIDER_ID,
+        "serviceProviderName": resource.service_provider_name or DEFAULT_SERVICE_PROVIDER_NAME,
+        "asn": resource.asn or DEFAULT_ASN,
+        "assignmentStatusId": resource.assignment_status_id,
+        "assignmentStatus": assignment_status_id_name(resource.assignment_status_id),
+        "ownershipType": resource.ownership_type,
+        "resourceStatus": resource.status,
+        "serviceId": resource.service_id,
+        "organizationName": resource.organization_name or resource.customer_name,
+        "organizationId": resource.organization_id,
+        "customerTypeId": resource.customer_type_id,
+        "regionId": resource.region_id,
+        "cityId": resource.city_id,
+        "assignmentDate": resource.assignment_date,
+        "updateDate": resource.update_date,
+        "sourceEntityType": resource.source_entity_type,
+        "sourceEntityId": resource.source_entity_id,
+    }
+
+
+
+def cst_resource_from_network(
+    network: IPv4Network,
+    resource_uuid: str,
+    source_entity_type: str,
+    source_entity_id: str,
+    description: str,
+    transaction_id: str = "",
+) -> ResourceRecord:
+    timestamp = now_iso()
+    return ResourceRecord(
+        resource_uuid=resource_uuid,
+        version_uuid=new_version_uuid(),
+        parent_resource_uuid="",
+        parent_version_uuid="",
+        transaction_id=transaction_id,
+        cidr=str(network),
+        prefix=network.prefixlen,
+        start_ip=str(network.network_address),
+        end_ip=str(network.broadcast_address),
+        size=network.num_addresses,
+        ip_version=1,
+        ownership_type="POOL",
+        status="AVAILABLE",
+        cidr_role="SUBNET",
+        service_provider_id=DEFAULT_SERVICE_PROVIDER_ID,
+        service_provider_name=DEFAULT_SERVICE_PROVIDER_NAME,
+        asn=DEFAULT_ASN,
+        assignment_status_id=1,
+        description=description,
+        action_flag="N",
+        cst_sync_status="PENDING",
+        ripe_sync_status="NOT_REQUIRED",
+        ip_type="PRIVATE" if network.is_private else "PUBLIC",
+        root_pool_uuid="",
+        source_entity_type=source_entity_type,
+        source_entity_id=source_entity_id,
+        created_at=timestamp,
+        updated_at=timestamp,
+    )
+
+
+def cst_resource_from_ledger(row: sqlite3.Row) -> ResourceRecord:
+    network = normalize_network(str(row["cidr"]))
+    return cst_resource_from_network(
+        network,
+        str(row["resource_uuid"]),
+        "cst_lir_ledger",
+        str(row["transaction_id"]),
+        "Existing CST LIR object scheduled for replacement",
+        str(row["transaction_id"]),
+    )
+
+
+def remaining_networks_after_subtract(container: IPv4Network, allocated: IPv4Network) -> list[IPv4Network]:
+    remaining: list[IPv4Network] = []
+    if int(container.network_address) < int(allocated.network_address):
+        remaining.extend(summarize_address_range(container.network_address, IPv4Address(int(allocated.network_address) - 1)))
+    if int(allocated.broadcast_address) < int(container.broadcast_address):
+        remaining.extend(summarize_address_range(IPv4Address(int(allocated.broadcast_address) + 1), container.broadcast_address))
+    return remaining
+
+
+def active_cst_containers_for_network(connection: sqlite3.Connection, network: IPv4Network) -> list[sqlite3.Row]:
+    rows = connection.execute(
+        """
+        SELECT *
+        FROM cst_transaction_ledger
+        WHERE retired_at = ''
+          AND last_status = 'SUCCESS'
+        ORDER BY first_used_at DESC
+        """
+    ).fetchall()
+    containers: list[tuple[int, sqlite3.Row]] = []
+    for row in rows:
+        try:
+            ledger_network = normalize_network(str(row["cidr"]))
+        except HTTPException:
+            continue
+        if network.subnet_of(ledger_network):
+            containers.append((ledger_network.prefixlen, row))
+    containers.sort(key=lambda item: item[0], reverse=True)
+    return [row for _prefix, row in containers[:1]]
+
+
+def create_cst_assignment_create_jobs(
+    connection: sqlite3.Connection,
+    assignment: Assignment,
+    assignment_resource: ResourceRecord,
+    workflow_type: str,
+) -> list[CstSyncJob]:
+    assigned_network = network_of(assignment)
+    operations: list[tuple[ResourceRecord, str]] = []
+    for row in active_cst_containers_for_network(connection, assigned_network):
+        container_resource = cst_resource_from_ledger(row)
+        container_network = normalize_network(str(row["cidr"]))
+        operations.append((container_resource, "DELETE"))
+        for fragment in remaining_networks_after_subtract(container_network, assigned_network):
+            fragment_uuid = stable_uuid("cst-fragment", str(row["transaction_id"]), assignment.id, str(fragment))
+            operations.append(
+                (
+                    cst_resource_from_network(
+                        fragment,
+                        fragment_uuid,
+                        "cst_remaining_fragment",
+                        f"{assignment.id}:{fragment}",
+                        f"Remaining unassigned CST fragment after assigning {assignment.cidr}",
+                    ),
+                    "SEND",
+                )
+            )
+    operations.append((assignment_resource, "SEND"))
+    return create_cst_sync_jobs(connection, operations, workflow_type)
+def create_cst_sync_jobs(
+    connection: sqlite3.Connection,
+    resource_operations: list[tuple[ResourceRecord, str]],
+    workflow_type: str,
+) -> list[CstSyncJob]:
+    eligible = [(resource, operation) for resource, operation in resource_operations if resource.ip_type == "PUBLIC"]
+    if not eligible:
+        return []
+
+    config = ensure_cst_config(connection)
+    batch_id = f"cst-batch-{uuid4().hex[:12]}"
+    correlation_id = f"cst-corr-{uuid4().hex[:12]}"
+    created_at = now_iso()
+    connection.execute(
+        """
+        INSERT INTO cst_sync_batches (
+          id, workflow_type, status, total_jobs, completed_jobs, failed_jobs,
+          blocked_jobs, created_at, completed_at
+        )
+        VALUES (?, ?, 'RUNNING', ?, 0, 0, 0, ?, '')
+        """,
+        (batch_id, workflow_type, len(eligible), created_at),
+    )
+
+    jobs: list[CstSyncJob] = []
+    for sequence_no, (resource, operation) in enumerate(eligible, start=1):
+        transaction_id = cst_transaction_id_for_resource(connection, resource, operation, batch_id, correlation_id)
+        payload = cst_payload_for_resource(resource, operation, transaction_id, correlation_id)
+        if not config.enabled:
+            status = "BLOCKED"
+            last_error = "CST integration is disabled in Administration"
+            response = {"temporaryStorage": True, "externalApiCalled": False, "accepted": False, "message": last_error}
+        elif config.scheduled_sync_enabled and not workflow_type.startswith("CST_DAILY_DAY_MINUS_1"):
+            status = "PENDING"
+            last_error = ""
+            response = {"temporaryStorage": True, "externalApiCalled": False, "accepted": True, "message": f"Queued for daily CST sync at {config.schedule_time} {config.schedule_timezone}"}
+        elif config.auto_execute:
+            status = "SUCCESS"
+            last_error = ""
+            response = {
+                "temporaryStorage": True,
+                "externalApiCalled": False,
+                "accepted": True,
+                "message": "Stored in local CST transaction table. External CST API integration is pending.",
+                "processedAt": now_iso(),
+            }
+        else:
+            status = "PENDING"
+            last_error = ""
+            response = {"temporaryStorage": True, "externalApiCalled": False, "accepted": True, "message": "Queued locally for CST processing"}
+
+        updated_at = now_iso()
+        job = CstSyncJob(
+            id=f"cst-job-{uuid4().hex[:12]}",
+            batch_id=batch_id,
+            resource_uuid=resource.resource_uuid,
+            transaction_id=transaction_id,
+            operation=operation,
+            sequence_no=sequence_no,
+            cidr=resource.cidr,
+            service_provider_id=resource.service_provider_id or DEFAULT_SERVICE_PROVIDER_ID,
+            payload_json=json.dumps(payload, sort_keys=True),
+            response_json=json.dumps(response, sort_keys=True),
+            status=status,
+            attempt_count=1 if status == "SUCCESS" else 0,
+            last_error=last_error,
+            created_at=created_at,
+            updated_at=updated_at,
+        )
+        data = job.model_dump()
+        columns = list(data.keys())
+        connection.execute(
+            f"INSERT INTO cst_sync_jobs ({', '.join(columns)}) VALUES ({', '.join(f':{column}' for column in columns)})",
+            data,
+        )
+        retired_at = updated_at if operation == "DELETE" and status == "SUCCESS" else ""
+        retired_reason = "Removed from CST LIR registry" if retired_at else ""
+        connection.execute(
+            """
+            UPDATE cst_transaction_ledger
+            SET cidr = ?, last_status = ?, retired_at = COALESCE(NULLIF(?, ''), retired_at),
+                retired_reason = COALESCE(NULLIF(?, ''), retired_reason), batch_id = ?, correlation_id = ?
+            WHERE transaction_id = ?
+            """,
+            (resource.cidr, status, retired_at, retired_reason, batch_id, correlation_id, transaction_id),
+        )
+        action_flag = "D" if operation == "DELETE" and status == "SUCCESS" else "S" if status == "SUCCESS" else "F" if status in {"FAILED", "BLOCKED"} else "U"
+        connection.execute(
+            """
+            UPDATE ip_resources
+            SET transaction_id = ?, cst_sync_status = ?, action_flag = ?, update_date = ?, updated_at = ?
+            WHERE resource_uuid = ?
+            """,
+            (transaction_id, status, action_flag, updated_at, updated_at, resource.resource_uuid),
+        )
+        if resource.source_entity_type == "assignment":
+            connection.execute(
+                "UPDATE assignments SET cst_sync_status = ?, action_flag = ? WHERE id = ?",
+                (status, action_flag, resource.source_entity_id),
+            )
+        jobs.append(job)
+
+    completed_jobs = sum(1 for job in jobs if job.status == "SUCCESS")
+    failed_jobs = sum(1 for job in jobs if job.status == "FAILED")
+    blocked_jobs = sum(1 for job in jobs if job.status == "BLOCKED")
+    batch_status = "SUCCESS" if completed_jobs == len(jobs) else "BLOCKED" if blocked_jobs else "FAILED" if failed_jobs else "PENDING"
+    connection.execute(
+        """
+        UPDATE cst_sync_batches
+        SET status = ?, completed_jobs = ?, failed_jobs = ?, blocked_jobs = ?, completed_at = ?
+        WHERE id = ?
+        """,
+        (batch_status, completed_jobs, failed_jobs, blocked_jobs, now_iso() if batch_status != "PENDING" else "", batch_id),
+    )
+    return jobs
+
+
+def retry_cst_jobs(connection: sqlite3.Connection, job_rows: list[sqlite3.Row]) -> list[CstSyncJob]:
+    updated_jobs: list[CstSyncJob] = []
+    for row in job_rows:
+        job = cst_job_from_row(row)
+        response = {
+            "temporaryStorage": True,
+            "externalApiCalled": False,
+            "accepted": True,
+            "message": "Retry stored locally. External CST API integration is pending.",
+            "processedAt": now_iso(),
+        }
+        updated_at = now_iso()
+        connection.execute(
+            """
+            UPDATE cst_sync_jobs
+            SET status = 'SUCCESS', attempt_count = attempt_count + 1, last_error = '', response_json = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (json.dumps(response, sort_keys=True), updated_at, job.id),
+        )
+        connection.execute(
+            "UPDATE cst_transaction_ledger SET last_status = 'SUCCESS', batch_id = ? WHERE transaction_id = ?",
+            (job.batch_id, job.transaction_id),
+        )
+        action_flag = "D" if job.operation == "DELETE" else "S"
+        retired_at = updated_at if job.operation == "DELETE" else ""
+        retired_reason = "Removed from CST LIR registry" if retired_at else ""
+        connection.execute(
+            """
+            UPDATE cst_transaction_ledger
+            SET retired_at = COALESCE(NULLIF(?, ''), retired_at), retired_reason = COALESCE(NULLIF(?, ''), retired_reason)
+            WHERE transaction_id = ?
+            """,
+            (retired_at, retired_reason, job.transaction_id),
+        )
+        connection.execute(
+            "UPDATE ip_resources SET cst_sync_status = 'SUCCESS', transaction_id = ?, action_flag = ?, updated_at = ? WHERE resource_uuid = ?",
+            (job.transaction_id, action_flag, updated_at, job.resource_uuid),
+        )
+        updated = connection.execute("SELECT * FROM cst_sync_jobs WHERE id = ?", (job.id,)).fetchone()
+        updated_jobs.append(cst_job_from_row(updated))
+    for batch_id in {job.batch_id for job in updated_jobs}:
+        rows = connection.execute("SELECT status FROM cst_sync_jobs WHERE batch_id = ?", (batch_id,)).fetchall()
+        total = len(rows)
+        completed = sum(1 for item in rows if item["status"] == "SUCCESS")
+        failed = sum(1 for item in rows if item["status"] == "FAILED")
+        blocked = sum(1 for item in rows if item["status"] == "BLOCKED")
+        status = "SUCCESS" if completed == total else "BLOCKED" if blocked else "FAILED" if failed else "PENDING"
+        connection.execute(
+            "UPDATE cst_sync_batches SET status = ?, completed_jobs = ?, failed_jobs = ?, blocked_jobs = ?, completed_at = ? WHERE id = ?",
+            (status, completed, failed, blocked, now_iso() if status == "SUCCESS" else "", batch_id),
+        )
+    return updated_jobs
+
+
+def cst_schedule_timezone(config: CstConfig) -> ZoneInfo:
+    try:
+        return ZoneInfo(config.schedule_timezone or "Asia/Riyadh")
+    except Exception:
+        return ZoneInfo("Asia/Riyadh")
+
+
+def parse_cst_schedule_time(value: str) -> datetime_time:
+    try:
+        hour_text, minute_text = str(value or "00:30").split(":", 1)
+        return datetime_time(hour=int(hour_text), minute=int(minute_text[:2]))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="CST schedule time must use HH:MM format") from exc
+
+
+def cst_local_day_bounds_utc(target_date: str, timezone_name: str) -> tuple[str, str]:
+    try:
+        target = datetime.fromisoformat(target_date).date()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="target_date must use YYYY-MM-DD format") from exc
+    try:
+        zone = ZoneInfo(timezone_name or "Asia/Riyadh")
+    except Exception:
+        zone = ZoneInfo("Asia/Riyadh")
+    start_local = datetime.combine(target, datetime_time.min, zone)
+    end_local = start_local + timedelta(days=1)
+    return start_local.astimezone(timezone.utc).isoformat(), end_local.astimezone(timezone.utc).isoformat()
+
+
+def run_cst_day_minus_one_sync(target_date: str = "", triggered_by: str = "manual") -> CstSchedulerRun:
+    with DB_WRITE_LOCK:
+        with connect() as connection:
+            config = ensure_cst_config(connection)
+            zone = cst_schedule_timezone(config)
+            if not target_date:
+                target_date = (datetime.now(zone).date() - timedelta(days=1)).isoformat()
+            existing = connection.execute(
+                "SELECT * FROM cst_scheduler_runs WHERE target_date = ?",
+                (target_date,),
+            ).fetchone()
+            if existing:
+                return cst_scheduler_run_from_row(existing)
+
+            started_at = now_iso()
+            scheduled_for_date = (datetime.fromisoformat(target_date).date() + timedelta(days=1)).isoformat()
+            scheduled_for = f"{scheduled_for_date} {config.schedule_time} {config.schedule_timezone}"
+            run_id = f"cst-schedule-{uuid4().hex[:12]}"
+            batch_id = f"cst-batch-{uuid4().hex[:12]}"
+            start_utc, end_utc = cst_local_day_bounds_utc(target_date, config.schedule_timezone)
+            job_rows = connection.execute(
+                """
+                SELECT *
+                FROM cst_sync_jobs
+                WHERE status IN ('PENDING', 'FAILED', 'BLOCKED')
+                  AND created_at >= ?
+                  AND created_at < ?
+                ORDER BY created_at, sequence_no
+                """,
+                (start_utc, end_utc),
+            ).fetchall()
+            total_jobs = len(job_rows)
+            connection.execute(
+                """
+                INSERT INTO cst_scheduler_runs (
+                  id, target_date, scheduled_for, status, batch_id, total_jobs,
+                  message, triggered_by, started_at, completed_at
+                )
+                VALUES (?, ?, ?, 'RUNNING', ?, ?, '', ?, ?, '')
+                """,
+                (run_id, target_date, scheduled_for, batch_id, total_jobs, triggered_by, started_at),
+            )
+            connection.execute(
+                """
+                INSERT INTO cst_sync_batches (
+                  id, workflow_type, status, total_jobs, completed_jobs, failed_jobs,
+                  blocked_jobs, created_at, completed_at
+                )
+                VALUES (?, ?, 'RUNNING', ?, 0, 0, 0, ?, '')
+                """,
+                (batch_id, f"CST_DAILY_DAY_MINUS_1:{target_date}", total_jobs, started_at),
+            )
+            if total_jobs:
+                for sequence_no, row in enumerate(job_rows, start=1):
+                    connection.execute(
+                        "UPDATE cst_sync_jobs SET batch_id = ?, sequence_no = ?, updated_at = ? WHERE id = ?",
+                        (batch_id, sequence_no, started_at, row["id"]),
+                    )
+                updated_rows = connection.execute(
+                    "SELECT * FROM cst_sync_jobs WHERE batch_id = ? ORDER BY sequence_no",
+                    (batch_id,),
+                ).fetchall()
+                retry_cst_jobs(connection, updated_rows)
+                message = f"Processed {total_jobs} CST job(s) created on {target_date}."
+            else:
+                connection.execute(
+                    "UPDATE cst_sync_batches SET status = 'SUCCESS', completed_at = ? WHERE id = ?",
+                    (now_iso(), batch_id),
+                )
+                message = f"No pending CST jobs found for {target_date}."
+            completed_at = now_iso()
+            connection.execute(
+                "UPDATE cst_scheduler_runs SET status = 'SUCCESS', message = ?, completed_at = ? WHERE id = ?",
+                (message, completed_at, run_id),
+            )
+            record_audit(connection, "CST Daily Day-1 Sync", "cst_scheduler_run", run_id, "", json.dumps({"target_date": target_date, "jobs": total_jobs, "batch_id": batch_id, "triggered_by": triggered_by}))
+            row = connection.execute("SELECT * FROM cst_scheduler_runs WHERE id = ?", (run_id,)).fetchone()
+            return cst_scheduler_run_from_row(row)
+
+
+def run_due_cst_daily_schedule() -> None:
+    with CST_SCHEDULER_LOCK:
+        with connect() as connection:
+            config = ensure_cst_config(connection)
+            if not config.enabled or not config.scheduled_sync_enabled:
+                return
+            zone = cst_schedule_timezone(config)
+            local_now = datetime.now(zone)
+            schedule_time = parse_cst_schedule_time(config.schedule_time)
+            scheduled_at = datetime.combine(local_now.date(), schedule_time, zone)
+            if local_now < scheduled_at:
+                return
+            if config.last_scheduled_run_date == local_now.date().isoformat():
+                return
+            target_date = (local_now.date() - timedelta(days=1)).isoformat()
+        run_cst_day_minus_one_sync(target_date, "scheduler")
+        with connect() as connection:
+            connection.execute(
+                "UPDATE cst_config SET last_scheduled_run_date = ?, last_scheduled_run_at = ?, updated_at = ? WHERE id = 'default'",
+                (datetime.now(zone).date().isoformat(), now_iso(), now_iso()),
+            )
+
+
+def cst_scheduler_loop() -> None:
+    while True:
+        try:
+            run_due_cst_daily_schedule()
+        except Exception:
+            pass
+        time.sleep(60)
+
+
+@app.on_event("startup")
+def start_cst_scheduler() -> None:
+    global CST_SCHEDULER_STARTED
+    if CST_SCHEDULER_STARTED:
+        return
+    CST_SCHEDULER_STARTED = True
+    thread = threading.Thread(target=cst_scheduler_loop, name="cst-daily-scheduler", daemon=True)
+    thread.start()
+def migrate_legacy_cst_transaction_ids(connection: sqlite3.Connection) -> None:
+    legacy_rows = connection.execute(
+        "SELECT transaction_id FROM cst_transaction_ledger WHERE transaction_id LIKE 'CST-%'"
+    ).fetchall()
+    for row in legacy_rows:
+        old_id = str(row["transaction_id"])
+        while True:
+            new_id = str(uuid4())
+            duplicate = connection.execute(
+                "SELECT 1 FROM cst_transaction_ledger WHERE transaction_id = ?",
+                (new_id,),
+            ).fetchone()
+            if duplicate is None:
+                break
+        connection.execute(
+            "UPDATE cst_sync_jobs SET transaction_id = ?, payload_json = REPLACE(payload_json, ?, ?), response_json = REPLACE(response_json, ?, ?) WHERE transaction_id = ?",
+            (new_id, old_id, new_id, old_id, new_id, old_id),
+        )
+        connection.execute(
+            "UPDATE ip_resources SET transaction_id = ? WHERE transaction_id = ?",
+            (new_id, old_id),
+        )
+        connection.execute(
+            "UPDATE cst_transaction_ledger SET transaction_id = ? WHERE transaction_id = ?",
+            (new_id, old_id),
+        )
 def insert_pool(connection: sqlite3.Connection, pool: Pool) -> None:
     data = pool.model_dump()
     columns = list(data.keys())
@@ -1251,7 +1932,7 @@ def init_db() -> None:
 
             CREATE TABLE IF NOT EXISTS assignment_details (
               id TEXT PRIMARY KEY,
-              resource_uuid TEXT NOT NULL UNIQUE,
+              resource_uuid TEXT NOT NULL,
               version_uuid TEXT NOT NULL,
               assignment_type TEXT NOT NULL,
               assignment_date TEXT NOT NULL,
@@ -1354,33 +2035,106 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_ripe_allocated_pools_cidr ON ripe_allocated_pools (cidr);
             CREATE INDEX IF NOT EXISTS idx_ripe_allocated_pools_created ON ripe_allocated_pools (created_date);
-            """
-        )
-        add_missing_columns(connection, "pools", Pool)
-        add_missing_columns(connection, "assignments", Assignment)
-        add_missing_columns(connection, "ip_resources", ResourceRecord)
-        add_missing_columns(connection, "assignment_details", AssignmentDetailRecord)
-        add_missing_columns(connection, "bulk_batches", BulkBatch)
-        add_missing_columns(connection, "audit_events", AuditEvent)
-        assignment_columns = {
-            row["name"] for row in connection.execute("PRAGMA table_info(assignments)").fetchall()
-        }
-        if "assignment_date" not in assignment_columns:
-            connection.execute(
-                "ALTER TABLE assignments ADD COLUMN assignment_date TEXT NOT NULL DEFAULT '2026-06-01'"
-            )
 
-        ripe_config_count = connection.execute("SELECT COUNT(*) FROM ripe_config").fetchone()[0]
-        if ripe_config_count == 0:
+            CREATE TABLE IF NOT EXISTS cst_config (
+              id TEXT PRIMARY KEY,
+              enabled INTEGER NOT NULL,
+              service_provider_id TEXT NOT NULL,
+              auto_execute INTEGER NOT NULL,
+              scheduled_sync_enabled INTEGER NOT NULL DEFAULT 1,
+              schedule_time TEXT NOT NULL DEFAULT '00:30',
+              schedule_timezone TEXT NOT NULL DEFAULT 'Asia/Riyadh',
+              last_scheduled_run_date TEXT NOT NULL DEFAULT '',
+              last_scheduled_run_at TEXT NOT NULL DEFAULT '',
+              batch_size_limit INTEGER NOT NULL,
+              hourly_request_limit INTEGER NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS cst_sync_batches (
+              id TEXT PRIMARY KEY,
+              workflow_type TEXT NOT NULL,
+              status TEXT NOT NULL,
+              total_jobs INTEGER NOT NULL,
+              completed_jobs INTEGER NOT NULL,
+              failed_jobs INTEGER NOT NULL,
+              blocked_jobs INTEGER NOT NULL,
+              created_at TEXT NOT NULL,
+              completed_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS cst_sync_jobs (
+              id TEXT PRIMARY KEY,
+              batch_id TEXT NOT NULL,
+              resource_uuid TEXT NOT NULL,
+              transaction_id TEXT NOT NULL,
+              operation TEXT NOT NULL,
+              sequence_no INTEGER NOT NULL,
+              depends_on_job_id TEXT NOT NULL,
+              cidr TEXT NOT NULL,
+              service_provider_id TEXT NOT NULL,
+              payload_json TEXT NOT NULL,
+              response_json TEXT NOT NULL,
+              status TEXT NOT NULL,
+              attempt_count INTEGER NOT NULL,
+              last_error TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS cst_transaction_ledger (
+              transaction_id TEXT PRIMARY KEY,
+              cidr TEXT NOT NULL,
+              resource_uuid TEXT NOT NULL,
+              service_provider_id TEXT NOT NULL,
+              first_used_at TEXT NOT NULL,
+              last_status TEXT NOT NULL,
+              retired_at TEXT NOT NULL,
+              retired_reason TEXT NOT NULL,
+              batch_id TEXT NOT NULL,
+              correlation_id TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_cst_batches_created ON cst_sync_batches (created_at);
+            CREATE INDEX IF NOT EXISTS idx_cst_batches_status ON cst_sync_batches (status);
+            CREATE INDEX IF NOT EXISTS idx_cst_jobs_batch ON cst_sync_jobs (batch_id);
+            CREATE INDEX IF NOT EXISTS idx_cst_jobs_status ON cst_sync_jobs (status);
+            CREATE INDEX IF NOT EXISTS idx_cst_jobs_transaction ON cst_sync_jobs (transaction_id);
+            CREATE INDEX IF NOT EXISTS idx_cst_ledger_cidr ON cst_transaction_ledger (cidr);
+            CREATE INDEX IF NOT EXISTS idx_cst_ledger_status ON cst_transaction_ledger (last_status);
+            CREATE INDEX IF NOT EXISTS idx_cst_ledger_resource ON cst_transaction_ledger (resource_uuid);
+
+            CREATE TABLE IF NOT EXISTS cst_scheduler_runs (
+              id TEXT PRIMARY KEY,
+              target_date TEXT NOT NULL UNIQUE,
+              scheduled_for TEXT NOT NULL,
+              status TEXT NOT NULL,
+              batch_id TEXT NOT NULL,
+              total_jobs INTEGER NOT NULL,
+              message TEXT NOT NULL,
+              triggered_by TEXT NOT NULL,
+              started_at TEXT NOT NULL,
+              completed_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_cst_scheduler_runs_started ON cst_scheduler_runs (started_at);
+                    """
+                )
+        add_missing_columns(connection, "cst_config", CstConfig)
+        migrate_legacy_cst_transaction_ids(connection)
+
+        cst_config_count = connection.execute("SELECT COUNT(*) FROM cst_config").fetchone()[0]
+        if cst_config_count == 0:
             connection.execute(
                 """
-                INSERT INTO ripe_config (
-                  id, base_url, auth_type, username, encrypted_password,
-                  connection_timeout, read_timeout, default_maintainer, updated_at
+                INSERT INTO cst_config (
+                  id, enabled, service_provider_id, auto_execute, scheduled_sync_enabled,
+                  schedule_time, schedule_timezone, last_scheduled_run_date, last_scheduled_run_at,
+                  batch_size_limit, hourly_request_limit, updated_at
                 )
-                VALUES ('default', 'https://rest.db.ripe.net', 'Basic Authentication', '', '', 10, 30, 'ITC-NOC-MNT', ?)
+                VALUES ('default', 1, ?, 1, 1, '00:30', 'Asia/Riyadh', '', '', 500, 1000, ?)
                 """,
-                (now_iso(),),
+                (DEFAULT_SERVICE_PROVIDER_ID, now_iso()),
             )
 
         user_count = connection.execute("SELECT COUNT(*) FROM users").fetchone()[0]
@@ -1752,17 +2506,17 @@ def ripe_objects_to_rows(objects: list[dict]) -> list[dict[str, str | int]]:
     return rows
 
 
-def query_ripe_objects_by_inverse(config_row: sqlite3.Row, inverse_attribute: str, maintainer: str) -> tuple[list[dict], str]:
+def query_ripe_objects_by_inverse(config_row: sqlite3.Row, inverse_attribute: str, maintainer: str, include_no_referenced: bool = True) -> tuple[list[dict], str]:
     base_url = str(config_row["base_url"]).rstrip("/")
-    query = urlencode(
-        {
-            "source": "ripe",
-            "type-filter": "inetnum",
-            "flags": "no-referenced",
-            "inverse-attribute": inverse_attribute,
-            "query-string": maintainer,
-        }
-    )
+    query_params = {
+        "source": "ripe",
+        "type-filter": "inetnum",
+        "inverse-attribute": inverse_attribute,
+        "query-string": maintainer,
+    }
+    if include_no_referenced:
+        query_params["flags"] = "no-referenced"
+    query = urlencode(query_params)
     request = Request(f"{base_url}/search.json?{query}", headers={"Accept": "application/json"})
     username = str(config_row["username"] or "")
     password = decrypt_secret(str(config_row["encrypted_password"] or ""))
@@ -1777,16 +2531,14 @@ def query_ripe_objects_by_inverse(config_row: sqlite3.Row, inverse_attribute: st
     return payload.get("objects", {}).get("object", []), f"{inverse_attribute} query returned {len(payload.get('objects', {}).get('object', []))} inetnum objects"
 
 
-def query_ripe_mnt_lower_objects(config_row: sqlite3.Row) -> tuple[list[dict], str]:
-    maintainer = str(config_row["default_maintainer"] or "ITC-NOC-MNT")
-    return query_ripe_objects_by_inverse(config_row, "mnt-lower", maintainer)
 
 
 def discovered_root_pools(config_row: sqlite3.Row) -> RipeDiscoveryResponse:
     maintainer = str(config_row["default_maintainer"] or "ITC-NOC-MNT")
-    ripe_objects, ripe_message = query_ripe_mnt_lower_objects(config_row)
+    mnt_by_objects, mnt_by_message = query_ripe_objects_by_inverse(config_row, "mnt-by", maintainer, include_no_referenced=False)
+    mnt_lower_objects, mnt_lower_message = query_ripe_objects_by_inverse(config_row, "mnt-lower", maintainer, include_no_referenced=False)
     by_inetnum: dict[str, dict] = {}
-    for ripe_object in ripe_objects:
+    for ripe_object in [*mnt_by_objects, *mnt_lower_objects]:
         values = attributes_by_name(ripe_object)
         inetnum = values.get("inetnum", "")
         parsed = inetnum_range(inetnum)
@@ -1802,13 +2554,16 @@ def discovered_root_pools(config_row: sqlite3.Row) -> RipeDiscoveryResponse:
             continue
         start_ip, end_ip = parsed
         candidates.append((int(start_ip), int(end_ip), ripe_object, values))
-    candidates.sort(key=lambda item: (item[0], -(item[1] - item[0])))
 
+    # Largest ranges first; when equal, keep stable address order. Any later range fully
+    # contained in a retained larger range is a child/subnet, not a RIPE root pool.
+    candidates.sort(key=lambda item: (-(item[1] - item[0] + 1), item[0], item[1]))
     roots: list[tuple[int, int, dict, dict[str, str]]] = []
     for start, end, ripe_object, values in candidates:
-        if any(root_start <= start and end <= root_end and (root_start, root_end) != (start, end) for root_start, root_end, _root, _values in roots):
+        if any(root_start <= start and end <= root_end for root_start, root_end, _root_object, _root_values in roots):
             continue
         roots.append((start, end, ripe_object, values))
+    roots.sort(key=lambda item: (item[0], item[1]))
 
     current_discovery_cidrs = {part for start, end, _ripe_object, _values in roots for part in cidr_parts(cidr_for_root_range(IPv4Address(start), IPv4Address(end)))}
     discovery_time = now_iso()
@@ -1875,7 +2630,7 @@ def discovered_root_pools(config_row: sqlite3.Row) -> RipeDiscoveryResponse:
     return RipeDiscoveryResponse(
         maintainer=maintainer,
         rows=rows,
-        message=f"{ripe_message}. Discovered {len(rows)} root pools after de-duplication and containment filtering.",
+        message=f"{mnt_by_message}; {mnt_lower_message}. Merged and de-duplicated maintainer inetnum objects, sorted largest ranges first, then retained {len(rows)} RIPE root pools after containment filtering for maintainer {maintainer}.",
     )
 
 
@@ -1907,18 +2662,62 @@ def query_ripe_inetnum_rows(pool: RipeAllocatedPool, config_row: sqlite3.Row) ->
 
 
 def query_ripe_mnt_lower_rows(pool: RipeAllocatedPool, config_row: sqlite3.Row) -> tuple[list[dict[str, str | int]], str]:
+    base_url = str(config_row["base_url"]).rstrip("/")
     maintainer = str(config_row["default_maintainer"] or "ITC-NOC-MNT")
-    ripe_objects, message = query_ripe_mnt_lower_objects(config_row)
-    if not ripe_objects and "failed" in message:
-        return [], f"RIPE Database mnt-lower query did not complete: {message}"
+    query = urlencode(
+        {
+            "source": "ripe",
+            "type-filter": "inetnum",
+            "inverse-attribute": "mnt-lower",
+            "query-string": maintainer,
+        }
+    )
+    request = Request(f"{base_url}/search.json?{query}", headers={"Accept": "application/json"})
+    username = str(config_row["username"] or "")
+    password = decrypt_secret(str(config_row["encrypted_password"] or ""))
+    if username and password:
+        token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+        request.add_header("Authorization", f"Basic {token}")
+    try:
+        with urlopen(request, timeout=max(1, int(config_row["read_timeout"]))) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+        return [], f"RIPE Database mnt-lower query did not complete: {exc}"
 
-    all_rows = ripe_objects_to_rows(ripe_objects)
+    all_rows = ripe_objects_to_rows(payload.get("objects", {}).get("object", []))
     rows = [row for row in all_rows if inetnum_in_pool(str(row.get("inetnum", "")), pool)]
     return (
         rows,
         f"Retrieved {len(rows)} of {len(all_rows)} RIPE inetnum rows for mnt-lower {maintainer} within {pool.start_ip} - {pool.end_ip}.",
     )
 
+def ripe_inetnum_classification(status: str) -> str:
+    normalized = str(status or "").strip().upper()
+    return "ASSIGNMENT" if normalized.startswith("ASSIGNED") else "ALLOCATION"
+
+
+def query_ripe_assignment_rows_by_maintainer(config_row: sqlite3.Row) -> tuple[list[dict[str, str | int]], str]:
+    maintainer = str(config_row["default_maintainer"] or "ITC-NOC-MNT")
+    ripe_objects, message = query_ripe_objects_by_inverse(config_row, "mnt-by", maintainer)
+    source_rows = ripe_objects_to_rows(ripe_objects)
+    assignment_rows: list[dict[str, str | int]] = []
+    for row in source_rows:
+        classification = ripe_inetnum_classification(str(row.get("status", "")))
+        if classification != "ASSIGNMENT":
+            continue
+        row["classification"] = classification
+        row["matched_inverse_attributes"] = "mnt-by"
+        assignment_rows.append(row)
+
+    def row_start(item: dict[str, str | int]) -> int:
+        parsed = inetnum_range(str(item.get("inetnum", "")))
+        return int(parsed[0]) if parsed else 0
+
+    assignment_rows.sort(key=row_start)
+    return (
+        assignment_rows,
+        f"Retrieved {len(assignment_rows)} RIPE inetnum assignment rows for maintainer {maintainer} using inverse-attribute=mnt-by. Source rows scanned: {len(source_rows)}. {message}",
+    )
 
 def ripe_netname_token(value: str) -> str:
     token = re.sub(r"[^A-Za-z0-9_]+", "_", str(value or "").strip().upper())
@@ -2375,57 +3174,23 @@ def bulk_import_ripe_allocated_pools(payload: RipeAllocatedPoolBulkRequest) -> R
     return RipeAllocatedPoolBulkResult(imported=len(imported), blocked=len(errors), errors=errors, pools=imported)
 
 
-@app.get("/ripe/reports/pools", response_model=list[RipeAllocatedPool])
-def list_ripe_report_pools() -> list[RipeAllocatedPool]:
-    with connect() as connection:
-        rows = connection.execute(
-            """
-            SELECT *
-            FROM pools
-            WHERE source_system = 'RIPE IP Pools Discovery'
-              AND upper(COALESCE(resource_status, lifecycle_state, 'Available')) != 'RETIRED'
-              AND COALESCE(tags, '') NOT LIKE '%ripe_discovery_presence=Stale%'
-            ORDER BY start
-            """
-        ).fetchall()
-    return [ripe_report_pool_from_pool_row(row) for row in rows]
-
-
 @app.post("/ripe/reports/query", response_model=RipeReportResponse)
 def query_ripe_report(payload: RipeReportRequest) -> RipeReportResponse:
     with connect() as connection:
-        pool_row = connection.execute(
-            """
-            SELECT *
-            FROM pools
-            WHERE id = ?
-              AND source_system = 'RIPE IP Pools Discovery'
-              AND upper(COALESCE(resource_status, lifecycle_state, 'Available')) != 'RETIRED'
-              AND COALESCE(tags, '') NOT LIKE '%ripe_discovery_presence=Stale%'
-            """,
-            (payload.pool_id,),
-        ).fetchone()
         config_row = connection.execute("SELECT * FROM ripe_config WHERE id = 'default'").fetchone()
-    if pool_row is None:
-        raise HTTPException(status_code=404, detail="RIPE report pool not found in Resource Registry discovered RIPE pools")
     if config_row is None:
         raise HTTPException(status_code=404, detail="RIPE configuration not initialized")
-    pool = ripe_report_pool_from_pool_row(pool_row)
     config = ripe_config_from_row(config_row)
-    if payload.report_type == "RIPE Maintainer IP Report":
-        rows, message = query_ripe_mnt_lower_rows(pool, config_row)
-    else:
-        rows, message = query_ripe_inetnum_rows(pool, config_row)
+    rows, message = query_ripe_assignment_rows_by_maintainer(config_row)
     return RipeReportResponse(
-        pool=pool,
-        report_type=payload.report_type,
+        pool=None,
+        report_type="RIPE Assignment Report",
         date_from=payload.date_from,
         date_to=payload.date_to,
         maintainer=config.default_maintainer,
         rows=rows,
         message=message,
     )
-
 
 @app.get("/ripe/discovery/root-pools", response_model=RipeDiscoveryResponse)
 def discover_ripe_root_pools() -> RipeDiscoveryResponse:
@@ -2508,18 +3273,8 @@ def sync_ripe_root_pool_to_cst(payload: RipeDiscoverySyncRequest) -> list[Pool]:
 
         for row in pool_rows:
             before = pool_from_row(row)
-            sync_pool_resource(connection, before)
-            connection.execute(
-                """
-                UPDATE ip_resources
-                SET cst_sync_status = 'SUCCESS',
-                    action_flag = 'S',
-                    update_date = ?,
-                    updated_at = ?
-                WHERE source_entity_type = 'pool' AND source_entity_id = ?
-                """,
-                (sync_time, sync_time, before.id),
-            )
+            resource = sync_pool_resource(connection, before)
+            create_cst_sync_jobs(connection, [(resource, "SEND")], "RIPE_ROOT_POOL_CST_SYNC")
             connection.execute(
                 "UPDATE pools SET tags = ?, last_audit_at = ? WHERE id = ?",
                 (
@@ -2601,6 +3356,160 @@ def push_assignment_to_ripe(assignment_id: str) -> RipePushResponse:
     )
 
 
+@app.get("/cst/config", response_model=CstConfig)
+def get_cst_config() -> CstConfig:
+    with connect() as connection:
+        return ensure_cst_config(connection)
+
+
+@app.put("/cst/config", response_model=CstConfig)
+def update_cst_config(payload: CstConfigUpdate) -> CstConfig:
+    updates = payload.model_dump(exclude_unset=True)
+    if not updates:
+        return get_cst_config()
+    allowed = {"enabled", "service_provider_id", "auto_execute", "scheduled_sync_enabled", "schedule_time", "schedule_timezone", "batch_size_limit", "hourly_request_limit"}
+    values = {key: value for key, value in updates.items() if key in allowed and value is not None}
+    if not values:
+        return get_cst_config()
+    if "batch_size_limit" in values and int(values["batch_size_limit"]) < 1:
+        raise HTTPException(status_code=400, detail="batchSizeLimit must be at least 1")
+    if "hourly_request_limit" in values and int(values["hourly_request_limit"]) < 1:
+        raise HTTPException(status_code=400, detail="hourlyRequestLimit must be at least 1")
+    if "schedule_time" in values:
+        parse_cst_schedule_time(str(values["schedule_time"]))
+    if "schedule_timezone" in values:
+        try:
+            ZoneInfo(str(values["schedule_timezone"]))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Unsupported CST schedule timezone") from exc
+    if "enabled" in values:
+        values["enabled"] = 1 if values["enabled"] else 0
+    if "auto_execute" in values:
+        values["auto_execute"] = 1 if values["auto_execute"] else 0
+    if "scheduled_sync_enabled" in values:
+        values["scheduled_sync_enabled"] = 1 if values["scheduled_sync_enabled"] else 0
+    values["updated_at"] = now_iso()
+    with connect() as connection:
+        ensure_cst_config(connection)
+        set_sql = ", ".join(f"{key} = ?" for key in values)
+        connection.execute(f"UPDATE cst_config SET {set_sql} WHERE id = 'default'", tuple(values.values()))
+        row = connection.execute("SELECT * FROM cst_config WHERE id = 'default'").fetchone()
+    return cst_config_from_row(row)
+
+
+@app.get("/cst/summary", response_model=CstSyncSummary)
+def get_cst_summary() -> CstSyncSummary:
+    with connect() as connection:
+        config = ensure_cst_config(connection)
+        counts = {row["status"]: row["count"] for row in connection.execute("SELECT status, COUNT(*) AS count FROM cst_sync_jobs GROUP BY status").fetchall()}
+        total_jobs = connection.execute("SELECT COUNT(*) FROM cst_sync_jobs").fetchone()[0]
+        total_transactions = connection.execute("SELECT COUNT(*) FROM cst_transaction_ledger").fetchone()[0]
+        last_batch = connection.execute("SELECT created_at FROM cst_sync_batches ORDER BY created_at DESC LIMIT 1").fetchone()
+    return CstSyncSummary(
+        enabled=config.enabled,
+        auto_execute=config.auto_execute,
+        scheduled_sync_enabled=config.scheduled_sync_enabled,
+        schedule_time=config.schedule_time,
+        schedule_timezone=config.schedule_timezone,
+        last_scheduled_run_date=config.last_scheduled_run_date,
+        last_scheduled_run_at=config.last_scheduled_run_at,
+        total_jobs=total_jobs,
+        pending_jobs=int(counts.get("PENDING", 0)),
+        running_jobs=int(counts.get("RUNNING", 0)),
+        success_jobs=int(counts.get("SUCCESS", 0)),
+        failed_jobs=int(counts.get("FAILED", 0)),
+        blocked_jobs=int(counts.get("BLOCKED", 0)),
+        total_transactions=total_transactions,
+        last_batch_at=str(last_batch["created_at"] if last_batch else ""),
+    )
+
+
+@app.get("/cst/scheduler-runs", response_model=list[CstSchedulerRun])
+def list_cst_scheduler_runs() -> list[CstSchedulerRun]:
+    with connect() as connection:
+        rows = connection.execute("SELECT * FROM cst_scheduler_runs ORDER BY started_at DESC LIMIT 120").fetchall()
+    return [cst_scheduler_run_from_row(row) for row in rows]
+
+
+@app.post("/cst/schedule/run-day-minus-one", response_model=CstSchedulerRun)
+def run_cst_day_minus_one_now(target_date: str = "") -> CstSchedulerRun:
+    return run_cst_day_minus_one_sync(target_date, "manual")
+
+@app.get("/cst/batches", response_model=list[CstSyncBatch])
+def list_cst_batches() -> list[CstSyncBatch]:
+    with connect() as connection:
+        rows = connection.execute("SELECT * FROM cst_sync_batches ORDER BY created_at DESC LIMIT 200").fetchall()
+    return [cst_batch_from_row(row) for row in rows]
+
+
+@app.get("/cst/jobs", response_model=list[CstSyncJob])
+def list_cst_jobs() -> list[CstSyncJob]:
+    with connect() as connection:
+        rows = connection.execute("SELECT * FROM cst_sync_jobs ORDER BY created_at DESC, sequence_no DESC LIMIT 500").fetchall()
+    return [cst_job_from_row(row) for row in rows]
+
+
+@app.get("/cst/transactions", response_model=list[CstTransactionLedger])
+def list_cst_transactions() -> list[CstTransactionLedger]:
+    with connect() as connection:
+        rows = connection.execute("SELECT * FROM cst_transaction_ledger ORDER BY first_used_at DESC LIMIT 500").fetchall()
+    return [cst_ledger_from_row(row) for row in rows]
+
+
+@app.post("/cst/bootstrap-current", response_model=list[CstSyncJob])
+def bootstrap_current_cst_resources() -> list[CstSyncJob]:
+    with connect() as connection:
+        resources = [
+            resource_from_row(row)
+            for row in connection.execute(
+                """
+                SELECT * FROM ip_resources
+                WHERE ip_type = 'PUBLIC'
+                  AND status != 'RETIRED'
+                  AND resource_uuid NOT IN (SELECT resource_uuid FROM cst_transaction_ledger)
+                ORDER BY prefix, cidr
+                """
+            ).fetchall()
+        ]
+        jobs = create_cst_sync_jobs(connection, [(resource, "SEND") for resource in resources], "INITIAL_LIR_MIGRATION")
+        record_audit(connection, "CST Initial Migration Jobs Created", "cst_batch", jobs[0].batch_id if jobs else "", "", json.dumps({"jobs": len(jobs)}))
+    return jobs
+
+
+@app.post("/cst/reconcile", response_model=list[CstSyncJob])
+def reconcile_cst_resources() -> list[CstSyncJob]:
+    with connect() as connection:
+        resources = [
+            resource_from_row(row)
+            for row in connection.execute(
+                "SELECT * FROM ip_resources WHERE ip_type = 'PUBLIC' ORDER BY prefix, cidr"
+            ).fetchall()
+        ]
+        jobs = create_cst_sync_jobs(connection, [(resource, "GET") for resource in resources], "CST_RECONCILIATION")
+        record_audit(connection, "CST Reconciliation Jobs Created", "cst_batch", jobs[0].batch_id if jobs else "", "", json.dumps({"jobs": len(jobs)}))
+    return jobs
+
+
+@app.post("/cst/jobs/{job_id}/retry", response_model=CstSyncJob)
+def retry_cst_job(job_id: str) -> CstSyncJob:
+    with connect() as connection:
+        row = connection.execute("SELECT * FROM cst_sync_jobs WHERE id = ?", (job_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="CST job not found")
+        return retry_cst_jobs(connection, [row])[0]
+
+
+@app.post("/cst/batches/{batch_id}/retry-failed", response_model=list[CstSyncJob])
+def retry_failed_cst_batch(batch_id: str) -> list[CstSyncJob]:
+    with connect() as connection:
+        rows = connection.execute(
+            "SELECT * FROM cst_sync_jobs WHERE batch_id = ? AND status IN ('FAILED', 'BLOCKED', 'PENDING') ORDER BY sequence_no",
+            (batch_id,),
+        ).fetchall()
+        if not rows:
+            return []
+        return retry_cst_jobs(connection, rows)
+
 @app.get("/pools", response_model=list[Pool])
 def list_pools() -> list[Pool]:
     return list_pools_from_db()
@@ -2629,7 +3538,9 @@ def add_pool(payload: PoolCreate) -> Pool:
     pool = Pool(**pool_data)
     with connect() as connection:
         insert_pool(connection, pool)
-        sync_pool_resource(connection, pool)
+        resource = sync_pool_resource(connection, pool)
+        if resource_requires_cst(resource):
+            create_cst_sync_jobs(connection, [(resource, "SEND")], "POOL_CREATE")
         record_audit(connection, "Pool Creation", "pool", pool.id, "", pool.model_dump_json())
     return pool
 
@@ -2779,6 +3690,8 @@ def process_pool_bulk(csv_text: str) -> BulkImportResult:
                     pool = pool_from_network(network, name if len(networks) == 1 else f"{name} {network}", region, "CSV bulk import")
                     insert_pool(connection, pool)
                     resource = sync_pool_resource(connection, pool)
+                    if resource_requires_cst(resource):
+                        create_cst_sync_jobs(connection, [(resource, "SEND")], "POOL_BULK_IMPORT")
                     record_audit(connection, "Pool Creation", "pool", pool.id, "", pool.model_dump_json())
                     imported += 1
                     output_rows.append(
@@ -2947,7 +3860,9 @@ def partition_pool(payload: PartitionRequest) -> PartitionResult:
 
     with connect() as connection:
         insert_assignment(connection, allocated)
-        sync_assignment_resource(connection, allocated)
+        resource = sync_assignment_resource(connection, allocated)
+        if resource_requires_cst(resource):
+            create_cst_assignment_create_jobs(connection, allocated, resource, "POOL_PARTITION_ASSIGNMENT")
         record_audit(connection, "Subnet Allocation", "assignment", allocated.id, "", allocated.model_dump_json())
 
     return PartitionResult(
@@ -3045,7 +3960,9 @@ def add_assignment(payload: AssignmentCreate) -> Assignment:
     assignment = assignment_from_network(network, payload)
     with connect() as connection:
         insert_assignment(connection, assignment)
-        sync_assignment_resource(connection, assignment)
+        resource = sync_assignment_resource(connection, assignment)
+        if resource_requires_cst(resource):
+            create_cst_assignment_create_jobs(connection, assignment, resource, "ASSIGNMENT_CREATE")
         record_audit(connection, "Subnet Allocation", "assignment", assignment.id, "", assignment.model_dump_json())
     return assignment
 
@@ -3068,6 +3985,8 @@ def process_assignment_bulk(csv_text: str) -> BulkImportResult:
                     with connect() as connection:
                         insert_assignment(connection, assignment)
                         resource = sync_assignment_resource(connection, assignment)
+                        if resource_requires_cst(resource):
+                            create_cst_assignment_create_jobs(connection, assignment, resource, "ASSIGNMENT_BULK_IMPORT")
                         record_audit(connection, "Subnet Allocation", "assignment", assignment.id, "", assignment.model_dump_json())
                     imported += 1
                     output_rows.append(
@@ -3179,14 +4098,35 @@ def update_assignment_status(assignment_id: str, payload: StatusUpdate) -> Assig
     before = find_assignment(assignment_id)
     with connect() as connection:
         assert_resource_can_change(connection, "assignment", assignment_id)
-        result = connection.execute(
-            "UPDATE assignments SET status = ? WHERE id = ?",
-            (payload.status, assignment_id),
-        )
+        if payload.status == "Retiring" and str(before.ripe_sync_status or "").upper() not in {"SUCCESS", "SYNCHRONIZED"}:
+            result = connection.execute(
+                "UPDATE assignments SET status = ?, ripe_sync_status = ?, action_flag = ? WHERE id = ?",
+                (payload.status, "NOT_REQUIRED", before.action_flag or "D", assignment_id),
+            )
+        else:
+            result = connection.execute(
+                "UPDATE assignments SET status = ? WHERE id = ?",
+                (payload.status, assignment_id),
+            )
         if result.rowcount == 0:
             raise HTTPException(status_code=404, detail="Assignment not found")
         after = assignment_from_row(connection.execute("SELECT * FROM assignments WHERE id = ?", (assignment_id,)).fetchone())
-        sync_assignment_resource(connection, after)
+        resource = sync_assignment_resource(connection, after)
+        if payload.status == "Retiring":
+            if str(before.cst_sync_status or "").upper() in {"SUCCESS", "SYNCHRONIZED"}:
+                create_cst_sync_jobs(connection, [(resource, "DELETE")], "ASSIGNMENT_RELEASE")
+            else:
+                connection.execute(
+                    "UPDATE assignments SET cst_sync_status = ?, action_flag = ? WHERE id = ?",
+                    ("NOT_REQUIRED", before.action_flag or "D", assignment_id),
+                )
+                connection.execute(
+                    "UPDATE ip_resources SET cst_sync_status = ?, action_flag = ?, updated_at = ? WHERE resource_uuid = ?",
+                    ("NOT_REQUIRED", before.action_flag or "D", now_iso(), resource.resource_uuid),
+                )
+        elif resource_requires_cst(resource) and str(after.cst_sync_status or "").upper() != "SUCCESS":
+            create_cst_sync_jobs(connection, [(resource, "UPDATE")], "ASSIGNMENT_STATUS_CHANGE")
+        after = assignment_from_row(connection.execute("SELECT * FROM assignments WHERE id = ?", (assignment_id,)).fetchone())
         record_audit(connection, "Assignment Changes", "assignment", assignment_id, before.model_dump_json(), after.model_dump_json())
     return after
 
@@ -3288,3 +4228,21 @@ def list_conflicts() -> list[Conflict]:
 
 
 init_db()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
