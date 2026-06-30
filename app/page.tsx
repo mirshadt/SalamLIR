@@ -545,6 +545,7 @@ export default function Page() {
         window.localStorage.setItem("ipam-token", result.accessToken);
         window.localStorage.setItem("ipam-refresh-token", result.refreshToken ?? "");
         window.localStorage.setItem("ipam-username", result.username);
+        window.localStorage.setItem("ipam-role", "admin");
         window.localStorage.setItem("ipam-auth-provider", "keycloak");
         window.history.replaceState({}, document.title, window.location.pathname);
         finish(result.accessToken);
@@ -579,6 +580,7 @@ export default function Page() {
             const result = await login(username.trim(), password);
             window.localStorage.setItem("ipam-token", result.token);
             window.localStorage.setItem("ipam-username", result.username);
+            window.localStorage.setItem("ipam-role", result.role);
             window.localStorage.setItem("ipam-auth-provider", "local");
             setSession(result.token);
             setPassword("");
@@ -598,6 +600,7 @@ export default function Page() {
         window.localStorage.removeItem("ipam-token");
         window.localStorage.removeItem("ipam-refresh-token");
         window.localStorage.removeItem("ipam-username");
+        window.localStorage.removeItem("ipam-role");
         window.localStorage.removeItem("ipam-auth-provider");
         setSession("");
         if (provider === "keycloak") {
@@ -669,6 +672,7 @@ function RegistryWorkspace({ onLogout }: { onLogout: () => void }) {
   const [view, setView] = useState<ViewKey>("executive");
   const [routeReady, setRouteReady] = useState(false);
   const [signedInUser, setSignedInUser] = useState("admin");
+  const [signedInRole, setSignedInRole] = useState<User["role"]>("admin");
   const [selectedResourceId, setSelectedResourceId] = useState("");
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [globalSearch, setGlobalSearch] = useState("");
@@ -740,6 +744,8 @@ function RegistryWorkspace({ onLogout }: { onLogout: () => void }) {
 
   useEffect(() => {
     setSignedInUser(window.localStorage.getItem("ipam-username") ?? "admin");
+    const storedRole = window.localStorage.getItem("ipam-role");
+    setSignedInRole(storedRole === "operator" || storedRole === "viewer" ? storedRole : "admin");
   }, []);
 
   useEffect(() => {
@@ -1292,6 +1298,7 @@ function RegistryWorkspace({ onLogout }: { onLogout: () => void }) {
             {view === "administration" ? (
               <Administration
                 users={users}
+                currentRole={signedInRole}
                 newUser={newUser}
                 passwordReset={passwordReset}
                 ripeConfig={ripeConfig}
@@ -3568,6 +3575,7 @@ function shouldLoadNextReportBatch(event: UIEvent<HTMLDivElement>, visibleRows: 
 
 function Administration(props: {
   users: User[];
+  currentRole: User["role"];
   newUser: { username: string; password: string; role: User["role"] };
   passwordReset: { userId: string; password: string };
   ripeConfig: RipeConfig | null;
@@ -3601,11 +3609,12 @@ function Administration(props: {
   onToggleCstSchedule: (scheduled: boolean) => void;
 }) {
   const roles = ["admin", "operator", "viewer"];
+  const canManageUsers = props.currentRole === "admin";
   const policyRows = ["Allocation Rules", "Reservation Rules", "Retention Rules"];
   return (
     <div className="grid gap-5">
       <PageTitle title="Administration" description="Users, roles, and registry policies for LIR operations." />
-      <Card>
+      {canManageUsers ? <Card>
         <CardHeader>
           <CardTitle>Users & Roles</CardTitle>
           <CardDescription>Administrator, LIR Manager, IP Administrator, Auditor, and Read Only User roles.</CardDescription>
@@ -3643,7 +3652,7 @@ function Administration(props: {
             ))}
           </div>
         </CardContent>
-      </Card>
+      </Card> : null}
       <Card>
         <CardHeader>
           <CardTitle>RIPE Integration</CardTitle>
