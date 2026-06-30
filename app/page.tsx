@@ -672,7 +672,7 @@ function RegistryWorkspace({ onLogout }: { onLogout: () => void }) {
   const [view, setView] = useState<ViewKey>("executive");
   const [routeReady, setRouteReady] = useState(false);
   const [signedInUser, setSignedInUser] = useState("admin");
-  const [signedInRole, setSignedInRole] = useState<User["role"]>("admin");
+  const [signedInRole, setSignedInRole] = useState<User["role"]>("operator");
   const [selectedResourceId, setSelectedResourceId] = useState("");
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [globalSearch, setGlobalSearch] = useState("");
@@ -745,7 +745,7 @@ function RegistryWorkspace({ onLogout }: { onLogout: () => void }) {
   useEffect(() => {
     setSignedInUser(window.localStorage.getItem("ipam-username") ?? "admin");
     const storedRole = window.localStorage.getItem("ipam-role");
-    setSignedInRole(storedRole === "operator" || storedRole === "viewer" ? storedRole : "admin");
+    setSignedInRole(storedRole === "admin" || storedRole === "viewer" ? storedRole : "operator");
   }, []);
 
   useEffect(() => {
