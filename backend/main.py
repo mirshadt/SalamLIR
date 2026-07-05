@@ -13,9 +13,6 @@ import secrets
 import sqlite3
 import time
 import threading
-from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode
-from urllib.request import Request, urlopen
 from uuid import NAMESPACE_URL, uuid4, uuid5
 from zoneinfo import ZoneInfo
 
@@ -25,6 +22,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from backend.ipam_core_services.audit_service import AuditContext, AuditService
+from backend import ripe_integration_service as ripe_service
 
 
 DB_PATH = Path(__file__).with_name("ipam.db")
@@ -686,6 +684,7 @@ SUPPORTED_RESOURCE_STATUSES = {"ASSIGNED_TO_BUSINESS", "RESERVED", "AVAILABLE", 
 SUPPORTED_OWNERSHIP_TYPES = {"BUSINESS", "INDIVIDUAL", "INTERNAL", "INFRASTRUCTURE", "POOL"}
 CST_SYNC_STATUSES = {"NOT_CONFIGURED", "NOT_REQUIRED", "PENDING", "RUNNING", "SUCCESS", "FAILED", "BLOCKED"}
 RIPE_SYNC_STATUSES = {"PENDING", "SUCCESS", "FAILED", "NOT_REQUIRED"}
+RIPE_DISCOVERY_SOURCE_SYSTEM = "RIPE IP Pools Discovery"
 ACTION_FLAGS = {"N", "U", "D", "S", "F"}
 
 
@@ -807,6 +806,10 @@ def network_of(item: Pool | Assignment) -> IPv4Network:
     return normalize_network(item.cidr)
 
 
+def is_ripe_discovered_pool(pool: Pool) -> bool:
+    return str(pool.source_system or "").strip() == RIPE_DISCOVERY_SOURCE_SYSTEM
+
+
 def pool_from_row(row: sqlite3.Row) -> Pool:
     return Pool(**dict(row))
 
@@ -834,6 +837,17 @@ def ripe_config_from_row(row: sqlite3.Row) -> RipeConfigOut:
         read_timeout=data["read_timeout"],
         default_maintainer=data["default_maintainer"],
         updated_at=data["updated_at"],
+    )
+
+
+def ripe_api_config_from_row(row: sqlite3.Row) -> ripe_service.RipeApiConfig:
+    data = dict(row)
+    return ripe_service.RipeApiConfig(
+        base_url=str(data.get("base_url") or "https://rest.db.ripe.net"),
+        username=str(data.get("username") or ""),
+        password=decrypt_secret(str(data.get("encrypted_password") or "")),
+        read_timeout=int(data.get("read_timeout") or 30),
+        default_maintainer=str(data.get("default_maintainer") or "ITC-NOC-MNT"),
     )
 
 
@@ -2418,62 +2432,27 @@ def ripe_allocated_pool_payload_from_row(row: dict[str, str]) -> RipeAllocatedPo
 
 
 def attributes_by_name(ripe_object: dict) -> dict[str, str]:
-    attributes = ripe_object.get("attributes", {}).get("attribute", [])
-    values: dict[str, str] = {}
-    for attribute in attributes:
-        name = str(attribute.get("name", ""))
-        value = str(attribute.get("value", ""))
-        if not name:
-            continue
-        if name in values and value:
-            values[name] = f"{values[name]} | {value}"
-        else:
-            values[name] = value
-    return values
+    return ripe_service.attributes_by_name(ripe_object)
 
 
 def cidrs_for_inetnum(value: str) -> str:
-    if " - " not in value:
-        return ""
-    start_value, end_value = value.split(" - ", 1)
-    try:
-        start_ip = IPv4Address(start_value.strip())
-        end_ip = IPv4Address(end_value.strip())
-    except ValueError:
-        return ""
-    return ", ".join(str(network) for network in summarize_address_range(start_ip, end_ip))
+    return ripe_service.cidrs_for_inetnum(value)
 
 
 def inetnum_range(value: str) -> tuple[IPv4Address, IPv4Address] | None:
-    if " - " not in value:
-        return None
-    start_value, end_value = value.split(" - ", 1)
-    try:
-        return IPv4Address(start_value.strip()), IPv4Address(end_value.strip())
-    except ValueError:
-        return None
+    return ripe_service.inetnum_range(value)
 
 
 def inetnum_in_pool(value: str, pool: RipeAllocatedPool) -> bool:
-    parsed = inetnum_range(value)
-    if parsed is None:
-        return False
-    start_ip, end_ip = parsed
-    try:
-        pool_start = IPv4Address(pool.start_ip)
-        pool_end = IPv4Address(pool.end_ip)
-    except ValueError:
-        return False
-    return int(pool_start) <= int(start_ip) and int(end_ip) <= int(pool_end)
+    return ripe_service.inetnum_in_range(value, pool.start_ip, pool.end_ip)
 
 
 def cidr_for_root_range(start_ip: IPv4Address, end_ip: IPv4Address) -> str:
-    networks = list(summarize_address_range(start_ip, end_ip))
-    return str(networks[0]) if len(networks) == 1 else ", ".join(str(network) for network in networks)
+    return ripe_service.cidr_for_root_range(start_ip, end_ip)
 
 
 def cidr_parts(value: str) -> list[str]:
-    return [part.strip() for part in str(value or "").split(",") if part.strip()]
+    return ripe_service.cidr_parts(value)
 
 
 def update_tag_string(tags: str, updates: dict[str, str]) -> str:
@@ -2490,46 +2469,16 @@ def update_tag_string(tags: str, updates: dict[str, str]) -> str:
 
 
 def ripe_objects_to_rows(objects: list[dict]) -> list[dict[str, str | int]]:
-    rows: list[dict[str, str | int]] = []
-    for ripe_object in objects:
-        values = attributes_by_name(ripe_object)
-        inetnum = values.get("inetnum", "")
-        rows.append(
-            {
-                "cidr": cidrs_for_inetnum(inetnum),
-                "object_type": str(ripe_object.get("type", "inetnum")),
-                "object_source": str(ripe_object.get("source", {}).get("id", "ripe")),
-                "object_href": str(ripe_object.get("link", {}).get("href", "")),
-                **values,
-            }
-        )
-    return rows
+    return ripe_service.objects_to_rows(objects)
 
 
 def query_ripe_objects_by_inverse(config_row: sqlite3.Row, inverse_attribute: str, maintainer: str, include_no_referenced: bool = True) -> tuple[list[dict], str]:
-    base_url = str(config_row["base_url"]).rstrip("/")
-    query_params = {
-        "source": "ripe",
-        "type-filter": "inetnum",
-        "inverse-attribute": inverse_attribute,
-        "query-string": maintainer,
-    }
-    if include_no_referenced:
-        query_params["flags"] = "no-referenced"
-    query = urlencode(query_params)
-    request = Request(f"{base_url}/search.json?{query}", headers={"Accept": "application/json"})
-    username = str(config_row["username"] or "")
-    password = decrypt_secret(str(config_row["encrypted_password"] or ""))
-    if username and password:
-        token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
-        request.add_header("Authorization", f"Basic {token}")
-    try:
-        with urlopen(request, timeout=max(1, int(config_row["read_timeout"]))) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (HTTPError, URLError, TimeoutError, ValueError) as exc:
-        return [], f"{inverse_attribute} query failed: {exc}"
-    return payload.get("objects", {}).get("object", []), f"{inverse_attribute} query returned {len(payload.get('objects', {}).get('object', []))} inetnum objects"
-
+    return ripe_service.query_objects_by_inverse(
+        ripe_api_config_from_row(config_row),
+        inverse_attribute,
+        maintainer,
+        include_no_referenced=include_no_referenced,
+    )
 
 
 
@@ -2570,7 +2519,7 @@ def discovered_root_pools(config_row: sqlite3.Row) -> RipeDiscoveryResponse:
     with connect() as connection:
         pool_rows = connection.execute("SELECT id, cidr, created_at, last_audit_at, source_system, tags FROM pools").fetchall()
         for row in pool_rows:
-            if row["source_system"] != "RIPE IP Pools Discovery":
+            if row["source_system"] != RIPE_DISCOVERY_SOURCE_SYSTEM:
                 continue
             presence = "Current" if row["cidr"] in current_discovery_cidrs else "Stale"
             connection.execute(
@@ -2635,190 +2584,41 @@ def discovered_root_pools(config_row: sqlite3.Row) -> RipeDiscoveryResponse:
 
 
 def query_ripe_inetnum_rows(pool: RipeAllocatedPool, config_row: sqlite3.Row) -> tuple[list[dict[str, str | int]], str]:
-    base_url = str(config_row["base_url"]).rstrip("/")
-    query = urlencode(
-        {
-            "source": "ripe",
-            "type-filter": "inetnum",
-            "flags": ["M", "no-referenced"],
-            "query-string": f"{pool.start_ip} - {pool.end_ip}",
-        },
-        doseq=True,
-    )
-    request = Request(f"{base_url}/search.json?{query}", headers={"Accept": "application/json"})
-    username = str(config_row["username"] or "")
-    password = decrypt_secret(str(config_row["encrypted_password"] or ""))
-    if username and password:
-        token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
-        request.add_header("Authorization", f"Basic {token}")
-    try:
-        with urlopen(request, timeout=max(1, int(config_row["read_timeout"]))) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (HTTPError, URLError, TimeoutError, ValueError) as exc:
-        return [], f"RIPE Database query did not complete: {exc}"
-
-    rows = ripe_objects_to_rows(payload.get("objects", {}).get("object", []))
-    return rows, f"Retrieved {len(rows)} RIPE inetnum rows from {base_url} for {pool.start_ip} - {pool.end_ip}."
+    return ripe_service.query_inetnum_rows_for_range(ripe_api_config_from_row(config_row), pool.start_ip, pool.end_ip)
 
 
 def query_ripe_mnt_lower_rows(pool: RipeAllocatedPool, config_row: sqlite3.Row) -> tuple[list[dict[str, str | int]], str]:
-    base_url = str(config_row["base_url"]).rstrip("/")
-    maintainer = str(config_row["default_maintainer"] or "ITC-NOC-MNT")
-    query = urlencode(
-        {
-            "source": "ripe",
-            "type-filter": "inetnum",
-            "inverse-attribute": "mnt-lower",
-            "query-string": maintainer,
-        }
-    )
-    request = Request(f"{base_url}/search.json?{query}", headers={"Accept": "application/json"})
-    username = str(config_row["username"] or "")
-    password = decrypt_secret(str(config_row["encrypted_password"] or ""))
-    if username and password:
-        token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
-        request.add_header("Authorization", f"Basic {token}")
-    try:
-        with urlopen(request, timeout=max(1, int(config_row["read_timeout"]))) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (HTTPError, URLError, TimeoutError, ValueError) as exc:
-        return [], f"RIPE Database mnt-lower query did not complete: {exc}"
+    return ripe_service.query_mnt_lower_rows_in_range(ripe_api_config_from_row(config_row), pool.start_ip, pool.end_ip)
 
-    all_rows = ripe_objects_to_rows(payload.get("objects", {}).get("object", []))
-    rows = [row for row in all_rows if inetnum_in_pool(str(row.get("inetnum", "")), pool)]
-    return (
-        rows,
-        f"Retrieved {len(rows)} of {len(all_rows)} RIPE inetnum rows for mnt-lower {maintainer} within {pool.start_ip} - {pool.end_ip}.",
-    )
 
 def ripe_inetnum_classification(status: str) -> str:
-    normalized = str(status or "").strip().upper()
-    return "ASSIGNMENT" if normalized.startswith("ASSIGNED") else "ALLOCATION"
+    return ripe_service.inetnum_classification(status)
 
 
 def query_ripe_assignment_rows_by_maintainer(config_row: sqlite3.Row) -> tuple[list[dict[str, str | int]], str]:
-    maintainer = str(config_row["default_maintainer"] or "ITC-NOC-MNT")
-    ripe_objects, message = query_ripe_objects_by_inverse(config_row, "mnt-by", maintainer)
-    source_rows = ripe_objects_to_rows(ripe_objects)
-    assignment_rows: list[dict[str, str | int]] = []
-    for row in source_rows:
-        classification = ripe_inetnum_classification(str(row.get("status", "")))
-        if classification != "ASSIGNMENT":
-            continue
-        row["classification"] = classification
-        row["matched_inverse_attributes"] = "mnt-by"
-        assignment_rows.append(row)
+    return ripe_service.query_assignment_rows_by_maintainer(ripe_api_config_from_row(config_row))
 
-    def row_start(item: dict[str, str | int]) -> int:
-        parsed = inetnum_range(str(item.get("inetnum", "")))
-        return int(parsed[0]) if parsed else 0
-
-    assignment_rows.sort(key=row_start)
-    return (
-        assignment_rows,
-        f"Retrieved {len(assignment_rows)} RIPE inetnum assignment rows for maintainer {maintainer} using inverse-attribute=mnt-by. Source rows scanned: {len(source_rows)}. {message}",
-    )
 
 def ripe_netname_token(value: str) -> str:
-    token = re.sub(r"[^A-Za-z0-9_]+", "_", str(value or "").strip().upper())
-    token = re.sub(r"_+", "_", token).strip("_")
-    return token or "LIR_ASSIGNMENT"
+    return ripe_service.netname_token(value)
 
 
 def ripe_assignment_description(assignment: Assignment) -> str:
-    target_type = str(getattr(assignment, "assignment_target_type", "") or "").lower()
-    if "customer" in target_type:
-        return "Assigned to Customer"
-    return (
-        str(getattr(assignment, "assignment_description", "") or "").strip()
-        or str(getattr(assignment, "service_description", "") or "").strip()
-        or "Assigned to Customer"
-    )
+    return ripe_service.assignment_description(assignment.model_dump())
 
 
 def ripe_assignment_object(assignment: Assignment, maintainer: str) -> dict:
-    organization_name = assignment.organization_name or assignment.customer_name or assignment.assignment_name or assignment.cidr
-    ripe_name = ripe_netname_token(organization_name)
-    ripe_description = ripe_assignment_description(assignment)
-    return {
-        "objects": {
-            "object": [
-                {
-                    "type": "inetnum",
-                    "attributes": {
-                        "attribute": [
-                            {"name": "inetnum", "value": f"{assignment.start} - {assignment.end}"},
-                            {"name": "netname", "value": ripe_name},
-                            {"name": "descr", "value": ripe_description},
-                            {"name": "country", "value": "SA"},
-                            {"name": "admin-c", "value": "IR1052-RIPE"},
-                            {"name": "tech-c", "value": "IR1052-RIPE"},
-                            {"name": "status", "value": "ASSIGNED PA"},
-                            {"name": "mnt-by", "value": maintainer or DEFAULT_SERVICE_PROVIDER_NAME},
-                            {"name": "source", "value": "RIPE"},
-                        ]
-                    },
-                }
-            ]
-        }
-    }
+    return ripe_service.assignment_object(assignment.model_dump(), maintainer)
 
 
 def post_ripe_assignment(assignment: Assignment, config_row: sqlite3.Row) -> tuple[bool, int, str, str, dict]:
-    username = str(config_row["username"] or "")
-    password = decrypt_secret(str(config_row["encrypted_password"] or ""))
-    request_object = ripe_assignment_object(assignment, str(config_row["default_maintainer"] or "ITC-NOC-MNT"))
-    if not username or not password:
-        return False, 0, "RIPE username/password is not configured", "", request_object
-
-    base_url = str(config_row["base_url"]).rstrip("/")
-    request = Request(
-        f"{base_url}/ripe/inetnum",
-        data=json.dumps(request_object).encode("utf-8"),
-        method="POST",
-        headers={"Accept": "application/json", "Content-Type": "application/json"},
-    )
-    token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
-    request.add_header("Authorization", f"Basic {token}")
-    try:
-        with urlopen(request, timeout=max(1, int(config_row["read_timeout"]))) as response:
-            body = response.read().decode("utf-8", errors="replace")
-            status_code = int(response.status)
-            return 200 <= status_code < 300, status_code, "RIPE assignment object created", body, request_object
-    except HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        return False, int(exc.code), f"RIPE push failed with HTTP {exc.code}", body, request_object
-    except (URLError, TimeoutError, ValueError) as exc:
-        return False, 0, f"RIPE push failed: {exc}", "", request_object
+    result = ripe_service.post_assignment(ripe_api_config_from_row(config_row), assignment.model_dump())
+    return result.success, result.status_code, result.message, result.response_body, result.request_object
 
 
 def delete_ripe_assignment(assignment: Assignment, config_row: sqlite3.Row) -> tuple[bool, int, str, str, dict]:
-    username = str(config_row["username"] or "")
-    password = decrypt_secret(str(config_row["encrypted_password"] or ""))
-    inetnum = f"{assignment.start} - {assignment.end}"
-    base_url = str(config_row["base_url"]).rstrip("/")
-    delete_url = f"{base_url}/ripe/inetnum/{quote(inetnum, safe='')}"
-    request_object = {"method": "DELETE", "url": delete_url, "inetnum": inetnum}
-    if not username or not password:
-        return False, 0, "RIPE username/password is not configured", "", request_object
-
-    request = Request(
-        delete_url,
-        method="DELETE",
-        headers={"Accept": "application/json"},
-    )
-    token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
-    request.add_header("Authorization", f"Basic {token}")
-    try:
-        with urlopen(request, timeout=max(1, int(config_row["read_timeout"]))) as response:
-            body = response.read().decode("utf-8", errors="replace")
-            status_code = int(response.status)
-            return 200 <= status_code < 300, status_code, "RIPE assignment object removed", body, request_object
-    except HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        return False, int(exc.code), f"RIPE removal failed with HTTP {exc.code}", body, request_object
-    except (URLError, TimeoutError, ValueError) as exc:
-        return False, 0, f"RIPE removal failed: {exc}", "", request_object
+    result = ripe_service.delete_assignment(ripe_api_config_from_row(config_row), assignment.start, assignment.end)
+    return result.success, result.status_code, result.message, result.response_body, result.request_object
 
 
 def bulk_assignment_networks_from_row(row: dict[str, str]) -> tuple[list[IPv4Network], bool]:
@@ -2930,14 +2730,13 @@ def validate_parent_pool(candidate: IPv4Network, excluded_pool_ids: set[str] | N
 
 
 def validate_assignment(candidate: IPv4Network) -> None:
-    parent = next(
-        (
-            pool
-            for pool in list_pools_from_db()
-            if candidate.subnet_of(network_of(pool)) and candidate.prefixlen >= network_of(pool).prefixlen
-        ),
-        None,
-    )
+    parent_candidates = [
+        pool
+        for pool in list_pools_from_db()
+        if candidate.subnet_of(network_of(pool)) and candidate.prefixlen >= network_of(pool).prefixlen
+    ]
+    parent_candidates.sort(key=lambda pool: network_of(pool).prefixlen, reverse=True)
+    parent = parent_candidates[0] if parent_candidates else None
     if parent is None:
         raise HTTPException(status_code=409, detail=f"{candidate} is outside managed parent pools")
 
@@ -3235,11 +3034,11 @@ def sync_ripe_root_pool(payload: RipeDiscoverySyncRequest) -> list[Pool]:
                     "allocation_policy": "Boundary partitioning",
                     "owner": payload.ripe_maintainer,
                     "provider": "RIPE",
-                    "source_system": "RIPE IP Pools Discovery",
+                    "source_system": RIPE_DISCOVERY_SOURCE_SYSTEM,
                     "external_id": payload.allocation_range or f"{payload.start_ip} - {payload.end_ip}",
                     "href": payload.object_href,
                     "last_audit_at": sync_time,
-                    "tags": f"source=RIPE;pool_type=Public;discovery_method=RIPE IP Pools Discovery;ripe_maintainer={payload.ripe_maintainer};sync_status=Synced;ripe_status={payload.ripe_status};ripe_discovery_presence=Current;ripe_discovery_seen_at={sync_time}",
+                    "tags": f"source=RIPE;pool_type=Allocated Pool;discovery_method=RIPE IP Pools Discovery;ripe_maintainer={payload.ripe_maintainer};sync_status=Synced;ripe_status={payload.ripe_status};ripe_discovery_presence=Current;ripe_discovery_seen_at={sync_time}",
                 }
             )
             pool = Pool(**data)

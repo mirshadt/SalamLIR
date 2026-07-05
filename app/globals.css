@@ -25,6 +25,103 @@
   --radius: 0.5rem;
 }
 
+html[data-theme="white"] {
+  --background: 210 40% 98%;
+  --foreground: 217 33% 17%;
+  --card: 0 0% 100%;
+  --card-foreground: 217 33% 17%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 217 33% 17%;
+  --primary: 172 73% 30%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 210 30% 93%;
+  --secondary-foreground: 217 33% 18%;
+  --muted: 210 32% 94%;
+  --muted-foreground: 215 19% 35%;
+  --accent: 204 72% 38%;
+  --accent-foreground: 0 0% 100%;
+  --destructive: 0 72% 45%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 214 30% 83%;
+  --input: 214 30% 83%;
+  --ring: 172 73% 30%;
+}
+
+html[data-theme="green"] {
+  --background: 138 38% 96%;
+  --foreground: 158 35% 14%;
+  --card: 0 0% 100%;
+  --card-foreground: 158 35% 14%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 158 35% 14%;
+  --primary: 154 66% 28%;
+  --primary-foreground: 0 0% 100%;
+  --secondary: 145 32% 90%;
+  --secondary-foreground: 158 35% 15%;
+  --muted: 145 30% 91%;
+  --muted-foreground: 154 20% 32%;
+  --accent: 173 63% 31%;
+  --accent-foreground: 0 0% 100%;
+  --destructive: 0 72% 45%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 146 24% 78%;
+  --input: 146 24% 78%;
+  --ring: 154 66% 28%;
+}
+
+html[data-theme="white"] .text-cyan-300 {
+  color: rgb(14 116 144);
+}
+
+html[data-theme="green"] .text-cyan-300 {
+  color: rgb(15 118 110);
+}
+
+html[data-theme="white"] .text-sky-100,
+html[data-theme="white"] .text-sky-200,
+html[data-theme="white"] .text-sky-300 {
+  color: rgb(3 105 161);
+}
+
+html[data-theme="green"] .text-sky-100,
+html[data-theme="green"] .text-sky-200,
+html[data-theme="green"] .text-sky-300 {
+  color: rgb(14 116 144);
+}
+
+html[data-theme="white"] .text-emerald-100,
+html[data-theme="white"] .text-emerald-200,
+html[data-theme="white"] .text-emerald-300,
+html[data-theme="green"] .text-emerald-100,
+html[data-theme="green"] .text-emerald-200,
+html[data-theme="green"] .text-emerald-300 {
+  color: rgb(4 120 87);
+}
+
+html[data-theme="white"] .text-amber-200,
+html[data-theme="white"] .text-amber-300,
+html[data-theme="green"] .text-amber-200,
+html[data-theme="green"] .text-amber-300 {
+  color: rgb(180 83 9);
+}
+
+html[data-theme="white"] .text-red-200,
+html[data-theme="white"] .text-red-300,
+html[data-theme="green"] .text-red-200,
+html[data-theme="green"] .text-red-300 {
+  color: rgb(185 28 28);
+}
+
+html[data-theme="white"] .text-violet-200,
+html[data-theme="green"] .text-violet-200 {
+  color: rgb(109 40 217);
+}
+
+html[data-theme="white"] .text-slate-200,
+html[data-theme="green"] .text-slate-200 {
+  color: rgb(51 65 85);
+}
+
 * {
   border-color: hsl(var(--border));
 }

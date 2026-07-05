@@ -9,16 +9,20 @@ import {
   ChevronDown,
   ChevronRight,
   Database,
+  Eye,
+  EyeOff,
   FileDown,
   Gauge,
   GitBranch,
   GitMerge,
   History,
   KeyRound,
+  Leaf,
   Layers3,
   ListTree,
   Loader2,
   Lock,
+  Moon,
   LogOut,
   Network,
   Radar,
@@ -26,6 +30,7 @@ import {
   Search,
   Shield,
   CheckCircle2,
+  Sun,
   Upload,
   Users
 } from "lucide-react";
@@ -142,6 +147,7 @@ type ManagedResource = {
   utilization: number;
   type: ResourceType;
   role: "Allocation" | "Subnet" | "IP Address";
+  allocatedPool: boolean;
   classification: ResourceRole;
   owner: ResourceOwner | string;
   status: AdministrativeStatus;
@@ -210,6 +216,26 @@ type PoolAssignmentDraft = {
   endIp: string;
   prefix: string;
 };
+
+type AppTheme = "default" | "white" | "green";
+
+const themeOptions: Array<{ id: AppTheme; label: string; icon: React.ReactNode }> = [
+  { id: "default", label: "Default", icon: <Moon className="h-4 w-4" /> },
+  { id: "white", label: "White", icon: <Sun className="h-4 w-4" /> },
+  { id: "green", label: "Green", icon: <Leaf className="h-4 w-4" /> }
+];
+
+function storedAppTheme(): AppTheme {
+  if (typeof window === "undefined") {
+    return "default";
+  }
+  const storedTheme = window.localStorage.getItem("ipam-theme");
+  return storedTheme === "white" || storedTheme === "green" || storedTheme === "default" ? storedTheme : "default";
+}
+
+function salamLogoForTheme(theme: AppTheme) {
+  return theme === "default" ? "/salam-logo-white.png" : "/salam-logo.png";
+}
 
 const SEARCH_FILTER_FIELDS: Array<{ value: SearchFilterField; label: string; mode: "select" | "text" }> = [
   { value: "cidr", label: "CIDR", mode: "text" },
@@ -521,6 +547,16 @@ export default function Page() {
   const [password, setPassword] = useState("");
   const [message, setMessage] = useState("");
   const [keycloakEnabled, setKeycloakEnabled] = useState(false);
+  const [theme, setTheme] = useState<AppTheme>(storedAppTheme);
+
+  useEffect(() => {
+    if (theme === "default") {
+      document.documentElement.removeAttribute("data-theme");
+    } else {
+      document.documentElement.dataset.theme = theme;
+    }
+    window.localStorage.setItem("ipam-theme", theme);
+  }, [theme]);
 
   useEffect(() => {
     let cancelled = false;
@@ -572,6 +608,7 @@ export default function Page() {
         password={password}
         message={message}
         keycloakEnabled={keycloakEnabled}
+        theme={theme}
         onUsername={setUsername}
         onPassword={setPassword}
         onKeycloakLogin={() => beginKeycloakLogin().catch((error) => setMessage(`Keycloak login failed: ${errorMessage(error)}`))}
@@ -595,6 +632,8 @@ export default function Page() {
 
   return (
     <RegistryWorkspace
+      theme={theme}
+      onTheme={setTheme}
       onLogout={() => {
         const provider = window.localStorage.getItem("ipam-auth-provider");
         window.localStorage.removeItem("ipam-token");
@@ -637,13 +676,14 @@ function LoginScreen(props: {
   onPassword: (value: string) => void;
   onSubmit: () => void;
   onKeycloakLogin: () => void;
+  theme: AppTheme;
 }) {
+  const [showPassword, setShowPassword] = useState(false);
   return (
     <main className="flex min-h-screen items-center justify-center px-4">
       <Card className="w-full max-w-md">
         <CardHeader className="items-center text-center">
-          <img src="/salam-favicon.png" alt="Salam" className="h-16 w-16 rounded-md object-contain" />
-          <img src="/salam-logo-white.png" alt="Salam" className="h-10 w-44 object-contain" />
+          <img src={salamLogoForTheme(props.theme)} alt="Salam" className="h-10 w-44 object-contain" />
           <CardTitle>LIR Resource Registry</CardTitle>
           <CardDescription>Authoritative IPv4 number resource registry</CardDescription>
         </CardHeader>
@@ -655,7 +695,12 @@ function LoginScreen(props: {
             </Button>
           ) : null}
           <Input name="ipam-application-username" autoComplete="username" value={props.username} onChange={(event) => props.onUsername(event.target.value)} placeholder="Application username" />
-          <Input name="ipam-application-password" autoComplete="current-password" value={props.password} onChange={(event) => props.onPassword(event.target.value)} placeholder="Application password" type="password" />
+          <div className="relative">
+            <Input className="pr-11" name="ipam-application-password" autoComplete="current-password" value={props.password} onChange={(event) => props.onPassword(event.target.value)} placeholder="Application password" type={showPassword ? "text" : "password"} />
+            <button className="absolute inset-y-0 right-0 flex w-10 items-center justify-center text-muted-foreground hover:text-foreground" type="button" onClick={() => setShowPassword((current) => !current)} aria-label={showPassword ? "Hide password" : "Show password"} title={showPassword ? "Hide password" : "Show password"}>
+              {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+            </button>
+          </div>
           <Button onClick={props.onSubmit}>
             <KeyRound className="h-4 w-4" />
             Login
@@ -667,7 +712,7 @@ function LoginScreen(props: {
   );
 }
 
-function RegistryWorkspace({ onLogout }: { onLogout: () => void }) {
+function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTheme: (theme: AppTheme) => void; onLogout: () => void }) {
   const queryClient = useQueryClient();
   const [view, setView] = useState<ViewKey>("executive");
   const [routeReady, setRouteReady] = useState(false);
@@ -875,21 +920,22 @@ function RegistryWorkspace({ onLogout }: { onLogout: () => void }) {
     <main className="min-h-screen px-4 py-4 md:px-6">
       <div className="mx-auto grid max-w-[1500px] gap-4">
         <header className="flex flex-col gap-4 rounded-lg border bg-card p-4 md:flex-row md:items-center md:justify-between">
-          <div className="flex items-center gap-3">
-            <button className="rounded-md text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" type="button" onClick={() => navigateTo("executive")} aria-label="Go to home">
-              <img src="/salam-logo-white.png" alt="Salam" className="h-9 w-36 object-contain" />
+          <div className="flex min-w-0 items-center gap-3">
+            <button className="shrink-0 rounded-md text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" type="button" onClick={() => navigateTo("executive")} aria-label="Go to home">
+              <img src={salamLogoForTheme(theme)} alt="Salam" className="h-9 w-36 object-contain" />
             </button>
-            <div>
+            <div className="min-w-0">
               <p className="text-xs font-semibold uppercase text-muted-foreground">Salam LIR</p>
-              <h1 className="text-2xl font-semibold">Resource Registry & IPAM Platform</h1>
+              <h1 className="truncate text-2xl font-semibold tracking-normal">Salam Local Internet Registry</h1>
             </div>
           </div>
-          <div className="flex flex-wrap items-center gap-2">
+          <div className="flex shrink-0 flex-wrap items-center justify-start gap-2 md:justify-end">
             <Badge variant={registryUnavailable ? "danger" : "success"}>
               <Database className="mr-1 h-3 w-3" />
               SQLite {registryUnavailable ? "unavailable" : "online"}
             </Badge>
             <Badge variant="default">{signedInUser}</Badge>
+            <ThemeSelector theme={theme} onTheme={onTheme} />
             <Button variant="outline" size="sm" onClick={onLogout}>
               <LogOut className="h-4 w-4" />
               Logout
@@ -905,31 +951,30 @@ function RegistryWorkspace({ onLogout }: { onLogout: () => void }) {
           </Card>
         ) : null}
 
-        <div className="grid gap-4 lg:grid-cols-[280px_1fr]">
-          <aside className="rounded-lg border bg-card p-3">
-            <div className="mb-3 px-2">
-              <p className="text-xs font-semibold uppercase text-muted-foreground">Registry Modules</p>
-            </div>
-            <nav className="grid gap-1">
+        <div className={cn("grid gap-4", view === "executive" ? "" : "lg:grid-cols-[18px_1fr]")}>
+          {view !== "executive" ? <aside className="group relative z-20 h-fit w-4 overflow-hidden rounded-lg border border-transparent bg-card/60 p-1 transition-all duration-200 hover:w-16 hover:border-border hover:bg-card hover:p-2 focus-within:w-16 focus-within:border-border focus-within:bg-card focus-within:p-2 lg:sticky lg:top-4">
+            <span className="pointer-events-none absolute inset-y-3 left-1.5 w-1 rounded-full bg-muted-foreground/40 transition-opacity group-hover:opacity-0 group-focus-within:opacity-0" />
+            <nav className="pointer-events-none grid justify-center gap-2 opacity-0 transition-opacity duration-150 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100" aria-label="Registry modules">
               {navigation.map((item) => (
                 <button
                   key={item.id}
                   className={cn(
-                    "flex items-center gap-2 rounded-md px-3 py-2 text-left text-sm font-semibold transition",
-                    view === item.id ? "bg-primary text-primary-foreground" : "text-muted-foreground hover:bg-muted hover:text-foreground"
+                    "flex h-11 w-11 items-center justify-center rounded-md text-muted-foreground transition hover:bg-muted hover:text-foreground [&_svg]:h-5 [&_svg]:w-5",
+                    view === item.id ? "bg-primary text-primary-foreground shadow-sm" : ""
                   )}
                   onClick={() => navigateTo(item.id)}
+                  aria-label={item.label}
+                  title={item.label}
                 >
                   {item.icon}
-                  {item.label}
                 </button>
               ))}
             </nav>
-          </aside>
+          </aside> : null}
 
           <section className="min-w-0">
-            <BreadcrumbNavigation view={view} resource={selectedResource} onNavigate={navigateTo} />
-            {view === "executive" ? <ExecutiveDashboard stats={stats} resources={resources} auditEvents={auditEvents} /> : null}
+            {view !== "executive" ? <BreadcrumbNavigation view={view} resource={selectedResource} onNavigate={navigateTo} /> : null}
+            {view === "executive" ? <ExecutiveDashboard stats={stats} resources={resources} cstSummary={cstSummary} currentRole={signedInRole} onNavigate={navigateTo} /> : null}
             {view === "registry" ? (
               <ResourceRegistry
                 resources={resources}
@@ -946,6 +991,44 @@ function RegistryWorkspace({ onLogout }: { onLogout: () => void }) {
                 ripeDiscoveryStatus={ripeDiscoveryStatus}
                 ripeDiscoveryActionKey={ripeDiscoveryActionKey}
                 ripePushResourceId={ripePushResourceId}
+                cstConfig={cstConfig}
+                cstSummary={cstSummary}
+                cstBatches={cstBatches}
+                cstJobs={cstJobs}
+                cstSchedulerRuns={cstSchedulerRuns}
+                cstTransactions={cstTransactions}
+                cstBusy={cstConfigQuery.isFetching || cstSummaryQuery.isFetching || cstBatchesQuery.isFetching || cstJobsQuery.isFetching || cstSchedulerRunsQuery.isFetching || cstTransactionsQuery.isFetching}
+                onRefreshCst={() => {
+                  void cstConfigQuery.refetch();
+                  void cstSummaryQuery.refetch();
+                  void cstBatchesQuery.refetch();
+                  void cstJobsQuery.refetch();
+                  void cstSchedulerRunsQuery.refetch();
+                  void cstTransactionsQuery.refetch();
+                }}
+                onBootstrapCst={() => run(async () => {
+                  const jobs = await bootstrapCurrentCstResources();
+                  setNotice({ title: "CST Migration Jobs Created", detail: `${jobs.length} local CST transaction job(s) stored. No external CST API call was made.` });
+                })}
+                onReconcileCst={() => run(async () => {
+                  const jobs = await reconcileCstResources();
+                  setNotice({ title: "CST Reconciliation Queued", detail: `${jobs.length} local GET job(s) stored for reconciliation. No external CST API call was made.` });
+                })}
+                onRunCstDayMinusOne={() => run(async () => {
+                  const result = await runCstDayMinusOneSync();
+                  setNotice({ title: "CST Day-1 Sync", detail: `${result.message}\nBatch: ${result.batch_id}` });
+                })}
+                onRetryCstJob={(job) => run(async () => {
+                  await retryCstJob(job.id);
+                  setNotice({ title: "CST Job Retried", detail: `${job.id} was reprocessed in local temporary storage.` });
+                })}
+                onRetryCstBatch={(batch) => run(async () => {
+                  const jobs = await retryFailedCstBatch(batch.id);
+                  setNotice({ title: "CST Batch Retry", detail: `${jobs.length} pending/failed job(s) reprocessed in local temporary storage.` });
+                })}
+                onToggleCstEnabled={(enabled) => run(async () => { await updateCstConfig({ enabled }); })}
+                onToggleCstAutoExecute={(auto_execute) => run(async () => { await updateCstConfig({ auto_execute }); })}
+                onToggleCstSchedule={(scheduled_sync_enabled) => run(async () => { await updateCstConfig({ scheduled_sync_enabled }); })}
                 onDiscoverRipePools={() => {
                   setRipeDiscoveryStatus("running");
                   run(async () => {
@@ -1298,6 +1381,7 @@ function RegistryWorkspace({ onLogout }: { onLogout: () => void }) {
             {view === "administration" ? (
               <Administration
                 users={users}
+                auditEvents={auditEvents}
                 currentRole={signedInRole}
                 newUser={newUser}
                 passwordReset={passwordReset}
@@ -1305,13 +1389,6 @@ function RegistryWorkspace({ onLogout }: { onLogout: () => void }) {
                 ripeConfigForm={ripeConfigForm}
                 ripePoolCsv={ripePoolCsv}
                 ripeAllocatedPools={ripeAllocatedPools}
-                cstConfig={cstConfig}
-                cstSummary={cstSummary}
-                cstBatches={cstBatches}
-                cstJobs={cstJobs}
-                cstSchedulerRuns={cstSchedulerRuns}
-                cstTransactions={cstTransactions}
-                cstBusy={cstConfigQuery.isFetching || cstSummaryQuery.isFetching || cstBatchesQuery.isFetching || cstJobsQuery.isFetching || cstSchedulerRunsQuery.isFetching || cstTransactionsQuery.isFetching}
                 onNewUser={setNewUser}
                 onPasswordReset={setPasswordReset}
                 onRipeConfigForm={setRipeConfigForm}
@@ -1324,37 +1401,6 @@ function RegistryWorkspace({ onLogout }: { onLogout: () => void }) {
                   const { data } = await api.post("/ripe/allocated-pools/bulk", { csv_text: ripePoolCsv, file_name: "ripe-allocated-pools.csv" });
                   setNotice({ title: "RIPE Allocated Pools Imported", detail: `${data.imported} imported, ${data.blocked} blocked.${data.errors?.length ? `\n${data.errors.slice(0, 8).join("\n")}` : ""}` });
                 })}
-                onRefreshCst={() => {
-                  void cstConfigQuery.refetch();
-                  void cstSummaryQuery.refetch();
-                  void cstBatchesQuery.refetch();
-                  void cstJobsQuery.refetch();
-                  void cstSchedulerRunsQuery.refetch();
-                  void cstTransactionsQuery.refetch();
-                }}
-                onBootstrapCst={() => run(async () => {
-                  const jobs = await bootstrapCurrentCstResources();
-                  setNotice({ title: "CST Migration Jobs Created", detail: `${jobs.length} local CST transaction job(s) stored. No external CST API call was made.` });
-                })}
-                onReconcileCst={() => run(async () => {
-                  const jobs = await reconcileCstResources();
-                  setNotice({ title: "CST Reconciliation Queued", detail: `${jobs.length} local GET job(s) stored for reconciliation. No external CST API call was made.` });
-                })}
-                onRunCstDayMinusOne={() => run(async () => {
-                  const result = await runCstDayMinusOneSync();
-                  setNotice({ title: "CST Day-1 Sync", detail: `${result.message}\nBatch: ${result.batch_id}` });
-                })}
-                onRetryCstJob={(job) => run(async () => {
-                  await retryCstJob(job.id);
-                  setNotice({ title: "CST Job Retried", detail: `${job.id} was reprocessed in local temporary storage.` });
-                })}
-                onRetryCstBatch={(batch) => run(async () => {
-                  const jobs = await retryFailedCstBatch(batch.id);
-                  setNotice({ title: "CST Batch Retry", detail: `${jobs.length} pending/failed job(s) reprocessed in local temporary storage.` });
-                })}
-                onToggleCstEnabled={(enabled) => run(async () => { await updateCstConfig({ enabled }); })}
-                onToggleCstAutoExecute={(auto_execute) => run(async () => { await updateCstConfig({ auto_execute }); })}
-                onToggleCstSchedule={(scheduled_sync_enabled) => run(async () => { await updateCstConfig({ scheduled_sync_enabled }); })}
               />
             ) : null}
           </section>
@@ -1398,80 +1444,184 @@ function RegistryWorkspace({ onLogout }: { onLogout: () => void }) {
   );
 }
 
-function ExecutiveDashboard({ stats, resources, auditEvents }: { stats: RegistryStats; resources: ManagedResource[]; auditEvents: AuditEvent[] }) {
-  const typeMix = resourceTypeMix(resources);
-  const lifecycleMix = lifecycleStateMix(resources);
+function ThemeSelector({ theme, onTheme }: { theme: AppTheme; onTheme: (theme: AppTheme) => void }) {
   return (
-    <div className="grid gap-5">
-      <PageTitle title="Home" description="Authoritative Salam LIR IPv4 and IPv6 resource inventory, lifecycle, RIPE synchronization, and compliance status." />
-      <div className="grid gap-4 md:grid-cols-3 xl:grid-cols-5">
-        <Metric label="Total IP Address Resources" value={formatHosts(stats.totalResources)} detail="Total IP addresses in registered subnets" />
-        <Metric label="Registered Subnets" value={String(stats.totalPools)} detail="Authoritative parent subnets loaded in the registry" />
-        <Metric label="Total Assignments" value={String(stats.totalAssignments)} detail="Assigned resources" />
-        <Metric label="Total Reservations" value={String(stats.totalReservations)} detail="Reserved resources" />
-        <Metric label="Utilization" value={`${stats.utilization}%`} detail={`${formatHosts(stats.availableCapacity)} available`} />
-        <Metric label="Largest Free Block" value={stats.largestFreeBlock?.cidr ?? "None"} detail={stats.largestFreeBlock ? formatHosts(stats.largestFreeBlock.totalIps) : "No capacity"} />
-        <Metric label="Fragmentation" value={`${stats.fragmentation}%`} detail="Free block fragmentation" />
-        <Metric label="Integrity Issues" value={String(stats.integrityIssues)} detail="Critical, major, minor" />
-        <Metric label="Pending Operations" value={String(stats.pendingOperations)} detail="Pending registry actions" />
-        <Metric label="RIPE Sync" value="Phase 1 Ready" detail="PENDING / SYNCHRONIZED / EXCLUDED" />
-      </div>
-      <div className="grid gap-4 xl:grid-cols-2">
-        <Card>
-          <CardHeader>
-            <CardTitle>Resource Distribution</CardTitle>
-            <CardDescription>Registry records by resource type</CardDescription>
-          </CardHeader>
-          <CardContent className="h-72">
-            <ResponsiveContainer width="100%" height="100%">
-              <PieChart>
-                <Pie data={typeMix} dataKey="value" nameKey="name" innerRadius={70} outerRadius={100}>
-                  {typeMix.map((entry) => <Cell key={entry.name} fill={entry.color} />)}
-                </Pie>
-                <Tooltip />
-              </PieChart>
-            </ResponsiveContainer>
-          </CardContent>
-        </Card>
-        <Card>
-          <CardHeader>
-            <CardTitle>Lifecycle State</CardTitle>
-            <CardDescription>Operational state of registered resources</CardDescription>
-          </CardHeader>
-          <CardContent className="h-72">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={lifecycleMix}>
-                <CartesianGrid stroke="#24405f" vertical={false} />
-                <XAxis dataKey="name" />
-                <YAxis allowDecimals={false} />
-                <Tooltip />
-                <Bar dataKey="value" fill="#0e9f8f" radius={[4, 4, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          </CardContent>
-        </Card>
-      </div>
-      <Card>
-        <CardHeader>
-          <CardTitle>Recent Registry Operations</CardTitle>
-          <CardDescription>Latest transaction history captured by the registry audit trail</CardDescription>
-        </CardHeader>
-        <CardContent className="grid gap-2">
-          {auditEvents.slice(0, 6).map((event) => (
-            <div key={event.id} className="flex flex-wrap items-center justify-between gap-2 rounded-md border bg-muted/20 p-3">
-              <div>
-                <p className="font-semibold">{event.action}</p>
-                <p className="text-sm text-muted-foreground">{event.entity_type} / {event.entity_id}</p>
-              </div>
-              <span className="text-sm text-muted-foreground">{event.timestamp}</span>
-            </div>
-          ))}
-          {!auditEvents.length ? <p className="text-sm text-muted-foreground">No audit events captured yet.</p> : null}
-        </CardContent>
-      </Card>
+    <div className="flex rounded-md border bg-muted/30 p-1" aria-label="Theme selector">
+      {themeOptions.map((option) => (
+        <button
+          key={option.id}
+          className={cn(
+            "flex h-8 items-center gap-1.5 rounded px-2 text-xs font-semibold transition hover:bg-background hover:text-foreground",
+            theme === option.id ? "bg-primary text-primary-foreground shadow-sm" : "text-muted-foreground"
+          )}
+          type="button"
+          onClick={() => onTheme(option.id)}
+          aria-pressed={theme === option.id}
+          title={`${option.label} theme`}
+        >
+          {option.icon}
+          <span>{option.label}</span>
+        </button>
+      ))}
     </div>
   );
 }
+
+function ExecutiveDashboard({
+  stats,
+  resources,
+  cstSummary,
+  currentRole,
+  onNavigate
+}: {
+  stats: RegistryStats;
+  resources: ManagedResource[];
+  cstSummary: CstSyncSummary | null;
+  currentRole: User["role"];
+  onNavigate: (view: ViewKey) => void;
+}) {
+  const assignedIps = resources
+    .filter((resource) => resource.administrativeStatus === "ASSIGNED")
+    .reduce((sum, resource) => sum + resource.totalIps, 0);
+  const ripePending = resources.filter((resource) => ["PENDING", "FAILED", "DECOMMISSION_PENDING"].includes(resource.ripeSyncStatus)).length;
+  const cstPending = cstSummary?.pending_jobs ?? resources.filter((resource) => resource.cstSyncStatus === "PENDING").length;
+  const criticalConflicts = stats.integrityIssues;
+  const workflowTileDefinitions: Array<{
+    title: string;
+    detail: string;
+    status: string;
+    accent: string;
+    icon: React.ReactNode;
+    view: ViewKey;
+    adminOnly?: boolean;
+  }> = [
+    { title: "Resource Registry", detail: "Browse allocated pools, child pools, available blocks, assignments, and RIPE-discovered roots.", status: `${stats.totalPools} registered subnets`, accent: "cyan", icon: <Database className="h-5 w-5" />, view: "registry" },
+    { title: "Assignment Management", detail: "Assign, reserve, release, and retire customer or internal subnet resources.", status: `${stats.totalAssignments} active assignments`, accent: "green", icon: <Users className="h-5 w-5" />, view: "assignments" },
+    { title: "Global Search", detail: "Find resources by CIDR, UUID, transaction ID, owner, netname, or status.", status: "CIDR and transaction lookup", accent: "slate", icon: <Search className="h-5 w-5" />, view: "search" },
+    { title: "RIPE Discovery", detail: "Discover RIPE root pools maintained by Salam and sync them into the local LIR registry.", status: "Maintainer discovery", accent: "blue", icon: <Radar className="h-5 w-5" />, view: "registry" },
+    { title: "RIPE Sync Worklist", detail: "Review pending RIPE create/delete work items, failures, and retry actions.", status: `${ripePending} pending or failed`, accent: ripePending ? "amber" : "green", icon: <ListTree className="h-5 w-5" />, view: "registry" },
+    { title: "Reporting", detail: "Run RIPE Assignment, CST/LIR registry, utilization, and subnet summary exports.", status: "CSV and XLSX exports", accent: "cyan", icon: <FileDown className="h-5 w-5" />, view: "reports" },
+    { title: "CST Sync Monitor", detail: "Monitor transaction jobs, daily schedule, retries, batches, and ledger status.", status: `${cstPending} pending jobs`, accent: cstPending ? "violet" : "green", icon: <Network className="h-5 w-5" />, view: "registry" },
+    { title: "Integrity & Conflicts", detail: "Investigate overlaps, orphan resources, duplicates, and registry consistency issues.", status: `${criticalConflicts} issues`, accent: criticalConflicts ? "red" : "green", icon: <AlertTriangle className="h-5 w-5" />, view: "integrity" },
+    { title: "Administration", detail: "Manage users, RIPE settings, CST controls, policies, and integration configuration.", status: "Admin controls", accent: "slate", icon: <Shield className="h-5 w-5" />, view: "administration", adminOnly: true }
+  ];
+  const workflowTiles = workflowTileDefinitions.filter((tile) => !tile.adminOnly || currentRole === "admin");
+
+  return (
+    <div className="grid gap-5">
+      <section className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+        <HomeMetric label="Total Pools" value={String(stats.totalPools)} detail={`${formatHosts(stats.totalResources)} total IPs`} tone="cyan" />
+        <HomeMetric label="Assigned IPs" value={formatHosts(assignedIps)} detail={`${stats.totalAssignments} assignment records`} tone="green" />
+        <HomeMetric label="RIPE Pending" value={String(ripePending)} detail="Push, retry, or removal worklist" tone={ripePending ? "amber" : "green"} />
+        <HomeMetric label="CST Pending" value={String(cstPending)} detail="Local transaction jobs" tone={cstPending ? "violet" : "green"} />
+      </section>
+
+      <section className="grid gap-3">
+        <div className="flex flex-wrap items-end justify-between gap-3">
+          <div>
+            <h3 className="text-xl font-semibold">Main Workflows</h3>
+          </div>
+          <Badge variant={stats.integrityIssues ? "warning" : "success"}>{stats.integrityIssues ? `${stats.integrityIssues} integrity items` : "Registry healthy"}</Badge>
+        </div>
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+          {workflowTiles.map((tile) => (
+            <HomeWorkflowTile key={tile.title} {...tile} onOpen={() => onNavigate(tile.view)} />
+          ))}
+        </div>
+      </section>
+
+      <section className="grid gap-4">
+        <Card>
+          <CardHeader>
+            <CardTitle>Registry Health</CardTitle>
+            <CardDescription>Capacity and exception signals.</CardDescription>
+          </CardHeader>
+          <CardContent className="grid gap-3">
+            <HealthRow label="Utilization" value={`${stats.utilization}%`} status={`${formatHosts(stats.availableCapacity)} available`} />
+            <HealthRow label="Largest Free Block" value={stats.largestFreeBlock?.cidr ?? "None"} status={stats.largestFreeBlock ? formatHosts(stats.largestFreeBlock.totalIps) : "No capacity"} />
+            <HealthRow label="Fragmentation" value={`${stats.fragmentation}%`} status="Free block fragmentation" />
+            <HealthRow label="Pending Ops" value={String(stats.pendingOperations)} status="Registry actions" />
+          </CardContent>
+        </Card>
+      </section>
+    </div>
+  );
+}
+
+function HomeMetric({ label, value, detail, tone }: { label: string; value: string; detail: string; tone: "cyan" | "green" | "amber" | "violet" }) {
+  const toneClass = {
+    cyan: "border-cyan-400/50 bg-cyan-400/10 text-cyan-300",
+    green: "border-emerald-400/40 bg-emerald-400/10 text-emerald-200",
+    amber: "border-amber-400/40 bg-amber-400/10 text-amber-200",
+    violet: "border-violet-400/40 bg-violet-400/10 text-violet-200"
+  }[tone];
+  return (
+    <Card className={cn("border", toneClass)}>
+      <CardContent className="pt-5">
+        <p className="text-sm text-muted-foreground">{label}</p>
+        <p className="mt-2 text-3xl font-semibold text-foreground">{value}</p>
+        <p className="mt-1 text-sm">{detail}</p>
+      </CardContent>
+    </Card>
+  );
+}
+
+function HomeWorkflowTile({ title, status, accent, icon, onOpen }: { title: string; detail: string; status: string; accent: string; icon: React.ReactNode; onOpen: () => void }) {
+  const accentClass = {
+    cyan: "border-cyan-400/50 text-cyan-300",
+    blue: "border-sky-400/50 text-sky-200",
+    green: "border-emerald-400/50 text-emerald-200",
+    amber: "border-amber-400/50 text-amber-200",
+    red: "border-red-400/50 text-red-200",
+    violet: "border-violet-400/50 text-violet-200",
+    slate: "border-slate-400/40 text-slate-200"
+  }[accent] ?? "border-slate-400/40 text-slate-200";
+  return (
+    <button className="group min-h-[122px] rounded-lg border bg-card p-3 text-left transition hover:-translate-y-0.5 hover:border-primary/70 hover:bg-muted/20" type="button" onClick={onOpen}>
+      <div className="flex h-full flex-col justify-between gap-3">
+        <div className="flex items-start justify-between gap-3">
+          <span className={cn("flex h-14 w-14 shrink-0 items-center justify-center rounded-md border bg-muted/30 [&_svg]:h-8 [&_svg]:w-8", accentClass)}>{icon}</span>
+          <ChevronRight className="mt-1 h-5 w-5 text-muted-foreground transition group-hover:translate-x-1 group-hover:text-foreground" />
+        </div>
+        <div className="grid gap-2">
+          <h4 className="text-base font-semibold leading-tight text-foreground">{title}</h4>
+          <span className={cn("w-fit rounded-md border px-2 py-1 text-xs font-semibold", accentClass)}>{status}</span>
+        </div>
+      </div>
+    </button>
+  );
+}
+
+function HealthRow({ label, value, status }: { label: string; value: string; status: string }) {
+  return (
+    <div className="rounded-md border bg-muted/20 p-3">
+      <p className="text-xs text-muted-foreground">{label}</p>
+      <p className="mt-1 break-words text-base font-semibold">{value}</p>
+      <p className="mt-1 text-xs text-muted-foreground">{status}</p>
+    </div>
+  );
+}
+
+type CstMonitorProps = {
+  cstConfig: CstConfig | null;
+  cstSummary: CstSyncSummary | null;
+  cstBatches: CstSyncBatch[];
+  cstJobs: CstSyncJob[];
+  cstSchedulerRuns: CstSchedulerRun[];
+  cstTransactions: CstTransactionLedger[];
+  cstBusy: boolean;
+  onRefreshCst: () => void;
+  onBootstrapCst: () => void;
+  onReconcileCst: () => void;
+  onRunCstDayMinusOne: () => void;
+  onRetryCstJob: (job: CstSyncJob) => void;
+  onRetryCstBatch: (batch: CstSyncBatch) => void;
+  onToggleCstEnabled: (enabled: boolean) => void;
+  onToggleCstAutoExecute: (autoExecute: boolean) => void;
+  onToggleCstSchedule: (scheduled: boolean) => void;
+};
+
+type RegistryPanelId = "register" | "lir-discovery" | "ripe-worklist" | "cst-sync-monitor" | "subnet-navigator";
 
 function ResourceRegistry(props: {
   resources: ManagedResource[];
@@ -1492,42 +1642,89 @@ function ResourceRegistry(props: {
   onSyncRipePool: (pool: RipeDiscoveredRootPool) => void;
   onSyncCstLir: (pool: RipeDiscoveredRootPool) => void;
   onPushToRipe: (resource: ManagedResource) => void;
-}) {
+} & CstMonitorProps) {
   const visible = filterResources(presentationResources(props.resources), props.globalSearch);
+  const [activeRegistryPanel, setActiveRegistryPanel] = useState<RegistryPanelId>("subnet-navigator");
+  const registryPanels: Array<{ id: RegistryPanelId; label: string; icon: React.ReactNode }> = [
+    { id: "register", label: "Register Subnet", icon: <Database className="h-6 w-6" /> },
+    { id: "lir-discovery", label: "RIPE Discovery", icon: <Radar className="h-6 w-6" /> },
+    { id: "ripe-worklist", label: "RIPE Worklist", icon: <ListTree className="h-6 w-6" /> },
+    { id: "cst-sync-monitor", label: "CST Sync Monitor", icon: <Network className="h-6 w-6" /> },
+    { id: "subnet-navigator", label: "Subnet Navigator", icon: <Layers3 className="h-6 w-6" /> }
+  ];
 
   return (
-    <div className="grid gap-5">
-      <PageTitle title="Resource Registry" description="System of record for IPv4 subnets across available, assigned, reserved, retired, and historical lifecycle states." />
-      <Card>
-        <CardHeader>
-          <CardTitle>Register Subnet</CardTitle>
-          <CardDescription>Register an authoritative IPv4 subnet in the LIR registry.</CardDescription>
-        </CardHeader>
-      <CardContent className="grid gap-3 md:grid-cols-4">
-          <Input value={props.poolForm.cidr} onChange={(event) => props.onPoolForm({ ...props.poolForm, cidr: event.target.value })} placeholder="CIDR" />
-          <Input value={props.poolForm.name} onChange={(event) => props.onPoolForm({ ...props.poolForm, name: event.target.value })} placeholder="Netname / subnet name" />
-          <Input value={props.poolForm.region} onChange={(event) => props.onPoolForm({ ...props.poolForm, region: event.target.value })} placeholder="Country / region" />
-          <Button onClick={props.onCreatePool}>
-            <Database className="h-4 w-4" />
-            Register Subnet
-          </Button>
-          <Textarea className="md:col-span-4" value={props.poolForm.description} onChange={(event) => props.onPoolForm({ ...props.poolForm, description: event.target.value })} placeholder="Description" />
-        </CardContent>
-      </Card>
-      <RipePoolsDiscovery
-        result={props.ripeDiscoveryResult}
-        status={props.ripeDiscoveryStatus}
-        actionKey={props.ripeDiscoveryActionKey}
-        onDiscover={props.onDiscoverRipePools}
-        onSync={props.onSyncRipePool}
-        onSyncCstLir={props.onSyncCstLir}
-      />
-      <RipeSyncWorklist resources={props.resources} activeResourceId={props.ripePushResourceId} onOpen={props.onOpen} onPushToRipe={props.onPushToRipe} onRefresh={props.onRefresh} />
-      <SubnetNavigator resources={visible} query={props.globalSearch} onQuery={props.onGlobalSearch} onOpen={props.onOpen} />
+    <div className="grid gap-4">
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+        {registryPanels.map((panel) => (
+          <RegistryPanelButton
+            key={panel.id}
+            active={activeRegistryPanel === panel.id}
+            icon={panel.icon}
+            label={panel.label}
+            onClick={() => setActiveRegistryPanel(panel.id)}
+          />
+        ))}
+      </div>
+
+      {activeRegistryPanel === "register" ? (
+        <Card>
+          <CardHeader>
+            <CardTitle>Register Subnet</CardTitle>
+            <CardDescription>Register an authoritative IPv4 subnet in the LIR registry.</CardDescription>
+          </CardHeader>
+          <CardContent className="grid gap-3 md:grid-cols-4">
+            <Input value={props.poolForm.cidr} onChange={(event) => props.onPoolForm({ ...props.poolForm, cidr: event.target.value })} placeholder="CIDR" />
+            <Input value={props.poolForm.name} onChange={(event) => props.onPoolForm({ ...props.poolForm, name: event.target.value })} placeholder="Netname / subnet name" />
+            <Input value={props.poolForm.region} onChange={(event) => props.onPoolForm({ ...props.poolForm, region: event.target.value })} placeholder="Country / region" />
+            <Button onClick={props.onCreatePool}>
+              <Database className="h-4 w-4" />
+              Register Subnet
+            </Button>
+            <Textarea className="md:col-span-4" value={props.poolForm.description} onChange={(event) => props.onPoolForm({ ...props.poolForm, description: event.target.value })} placeholder="Description" />
+          </CardContent>
+        </Card>
+      ) : null}
+
+      {activeRegistryPanel === "lir-discovery" ? (
+        <RipePoolsDiscovery
+          result={props.ripeDiscoveryResult}
+          status={props.ripeDiscoveryStatus}
+          actionKey={props.ripeDiscoveryActionKey}
+          onDiscover={props.onDiscoverRipePools}
+          onSync={props.onSyncRipePool}
+          onSyncCstLir={props.onSyncCstLir}
+        />
+      ) : null}
+
+      {activeRegistryPanel === "ripe-worklist" ? (
+        <RipeSyncWorklist resources={props.resources} activeResourceId={props.ripePushResourceId} onOpen={props.onOpen} onPushToRipe={props.onPushToRipe} onRefresh={props.onRefresh} />
+      ) : null}
+
+      {activeRegistryPanel === "cst-sync-monitor" ? <CstIntegrationMonitor {...props} /> : null}
+
+      {activeRegistryPanel === "subnet-navigator" ? <SubnetNavigator resources={visible} query={props.globalSearch} onQuery={props.onGlobalSearch} onOpen={props.onOpen} /> : null}
     </div>
   );
 }
 
+function RegistryPanelButton({ active, icon, label, onClick }: { active: boolean; icon: React.ReactNode; label: string; onClick: () => void }) {
+  return (
+    <button
+      className={cn(
+        "flex min-h-[94px] flex-col items-center justify-center gap-2 rounded-lg border bg-card px-3 py-4 text-center transition hover:border-primary/70 hover:bg-muted/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+        active ? "border-primary bg-primary/10 text-primary" : "text-muted-foreground"
+      )}
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      title={label}
+    >
+      <span className="flex h-11 w-11 items-center justify-center rounded-md border bg-background/60 text-current">{icon}</span>
+      <span className="text-sm font-semibold leading-tight text-foreground">{label}</span>
+    </button>
+  );
+}
 function RipePoolsDiscovery({
   result,
   status,
@@ -1563,7 +1760,7 @@ function RipePoolsDiscovery({
         <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <div>
             <div className="flex flex-wrap items-center gap-2">
-              <CardTitle>RIPE IP Pools Discovery</CardTitle>
+              <CardTitle>RIPE Discovery</CardTitle>
               {running ? (
                 <span className="inline-flex items-center gap-1 rounded-md border border-sky-500/40 bg-sky-500/10 px-2 py-1 text-xs font-semibold text-sky-100">
                   <Loader2 className="h-3.5 w-3.5 animate-spin" />
@@ -1817,6 +2014,7 @@ function SubnetNavigator({
                     <TableCell>
                       <p className="font-semibold text-sky-300">{subnet.cidr}</p>
                       <p className="text-xs text-muted-foreground">{subnet.netname}</p>
+                      {isRipeAllocatedPoolResource(subnet) ? <AllocatedPoolBadge /> : null}
                       <p className="text-xs text-muted-foreground">{subnet.uuid}</p>
                     </TableCell>
                     <TableCell>
@@ -1905,7 +2103,9 @@ function ResourceSummary({
   }
 
   const parent = resources.find((item) => item.id === resource.parentId);
-  const children = resources.filter((item) => item.parentId === resource.id);
+  const children = resources
+    .filter((item) => item.parentId === resource.id)
+    .sort((left, right) => left.startNumber - right.startNumber || left.prefix - right.prefix || resourceTypeLabel(left).localeCompare(resourceTypeLabel(right)));
   const history = auditEvents.filter((event) => event.entity_id === resource.id || event.new_value.includes(resource.cidr) || event.old_value.includes(resource.cidr)).slice(0, 10);
   const actions = resourceActions(resource, children);
 
@@ -1917,7 +2117,7 @@ function ResourceSummary({
           <div className="flex flex-wrap items-start justify-between gap-3">
             <div>
               <CardTitle className="text-2xl">{resource.cidr}</CardTitle>
-              <CardDescription>{resource.type} / {resource.classification} / {resource.owner} / RIPE {resource.ripeSyncStatus}</CardDescription>
+              <CardDescription>{resourceTypeLabel(resource)} / {resource.classification} / {resource.owner} / RIPE {resource.ripeSyncStatus}</CardDescription>
             </div>
             <div className="flex flex-col items-start gap-2 sm:items-end">
               <Badge variant={badgeForResource(resource)}>{resource.status}</Badge>
@@ -1951,7 +2151,7 @@ function ResourceSummary({
           ["CIDR", resource.cidr],
           ["Assignment Status ID", resource.assignmentStatusId],
           ["Parent Resource", parent ? `${parent.cidr} (${parent.id})` : "Root"],
-          ["Resource Type", resource.type],
+          ["Resource Type", resourceTypeLabel(resource)],
           ["Classification", resource.classification],
           ["Administrative Status", resource.administrativeStatus],
           ["RIPE Sync Status", resource.ripeSyncStatus],
@@ -2013,12 +2213,15 @@ function ResourceSummary({
         </CardHeader>
         <CardContent className="grid gap-2">
           {children.map((child, childIndex) => (
-            <button key={resourceKey(child, childIndex, "summary-child")} className="flex flex-wrap items-center justify-between gap-2 rounded-md border bg-muted/20 p-3 text-left hover:border-primary/70" onClick={() => onOpen(child)}>
+            <button key={resourceKey(child, childIndex, "summary-child")} className="flex cursor-pointer flex-wrap items-center justify-between gap-2 rounded-md border bg-muted/20 p-3 text-left hover:border-primary/70" type="button" title="Open resource summary" onClick={() => onOpen(child)}>
               <span>
                 <span className="block font-semibold">{child.cidr}</span>
-                <span className="text-sm text-muted-foreground">{child.type} / {child.owner}</span>
+                <span className="text-sm text-muted-foreground">{resourceTypeLabel(child)} / {child.owner}</span>
               </span>
-              <Badge variant={badgeForResource(child)}>{child.status}</Badge>
+              <span className="flex flex-wrap items-center justify-end gap-2">
+                {isRipeAllocatedPoolResource(child) ? <AllocatedPoolBadge /> : null}
+                <Badge variant={badgeForResource(child)}>{child.status}</Badge>
+              </span>
             </button>
           ))}
           {!children.length ? <p className="text-sm text-muted-foreground">No direct child resources.</p> : null}
@@ -2323,7 +2526,7 @@ function DynamicResourceList({ resources, selectedId, onSelect }: { resources: M
             <span className="block font-semibold">{resource.cidr}</span>
             <span className="text-sm text-muted-foreground">{resource.uuid} / {resource.classification} / {resource.administrativeStatus}</span>
           </span>
-          <Badge variant={badgeForResource(resource)}>{resource.type}</Badge>
+          <ResourceTypeBadge resource={resource} />
         </button>
       ))}
     </div>
@@ -2511,7 +2714,7 @@ function SubnetOperations(props: {
   onSplit: () => void;
   onMerge: () => void;
 }) {
-  const searchablePools = presentationResources(props.resources).filter((resource) => resource.type === "Subnet");
+  const searchablePools = presentationResources(props.resources).filter((resource) => resource.type === "Subnet" && !isRipeAllocatedPoolResource(resource));
   const splitMatches = filterResources(searchablePools, props.splitForm.search).slice(0, 8);
   const leftMatches = filterResources(searchablePools, props.mergeForm.leftSearch).slice(0, 6);
   const rightMatches = filterResources(searchablePools, props.mergeForm.rightSearch).slice(0, 6);
@@ -3057,7 +3260,7 @@ function GlobalSearch({
   onOpen: (resource: ManagedResource) => void;
 }) {
   const [draftFilter, setDraftFilter] = useState<{ field: SearchFilterField; value: string }>({ field: "administrativeStatus", value: "" });
-  const results = filterResources(presentationResources(resources), query, filters);
+  const results = filterResources(resources, query, filters).sort((left, right) => left.startNumber - right.startNumber || left.prefix - right.prefix || resourceTypeLabel(left).localeCompare(resourceTypeLabel(right)));
   const selectedField = SEARCH_FILTER_FIELDS.find((field) => field.value === draftFilter.field) ?? SEARCH_FILTER_FIELDS[0];
   const draftOptions = filterOptionsForField(draftFilter.field, resources);
   const hasCriteria = query.trim() || filters.length > 0;
@@ -3573,8 +3776,186 @@ function shouldLoadNextReportBatch(event: UIEvent<HTMLDivElement>, visibleRows: 
   return target.scrollHeight - target.scrollTop - target.clientHeight < 180;
 }
 
+function CstIntegrationMonitor(props: CstMonitorProps) {
+  return (
+    <Card>
+      <CardHeader>
+        <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+          <div>
+            <CardTitle>CST Integration Monitor</CardTitle>
+            <CardDescription>Local controlled transaction store for CST SEND, UPDATE, DELETE, and GET workflows. External CST API calls are not enabled yet.</CardDescription>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Button variant="outline" onClick={props.onRefreshCst} disabled={props.cstBusy}>
+              {props.cstBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCcw className="h-4 w-4" />}
+              Refresh
+            </Button>
+            <Button variant="secondary" onClick={props.onBootstrapCst}>
+              <Database className="h-4 w-4" />
+              Create Migration Jobs
+            </Button>
+            <Button variant="outline" onClick={props.onReconcileCst}>
+              <Search className="h-4 w-4" />
+              Reconcile
+            </Button>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="grid gap-5">
+        <div className="grid gap-3 md:grid-cols-4">
+          <ReportMetric label="Transactions" value={String(props.cstSummary?.total_transactions ?? 0)} detail="Globally unique CST IDs" />
+          <ReportMetric label="Jobs" value={String(props.cstSummary?.total_jobs ?? 0)} detail={`${props.cstSummary?.success_jobs ?? 0} success / ${props.cstSummary?.pending_jobs ?? 0} pending`} />
+          <ReportMetric label="Failed" value={String((props.cstSummary?.failed_jobs ?? 0) + (props.cstSummary?.blocked_jobs ?? 0))} detail="Failed or blocked local jobs" />
+          <ReportMetric label="Last Batch" value={props.cstSummary?.last_batch_at ? props.cstSummary.last_batch_at.slice(0, 10) : "-"} detail="Latest CST transaction batch" />
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge variant={props.cstConfig?.enabled ? "success" : "warning"}>{props.cstConfig?.enabled ? "CST enabled" : "CST disabled"}</Badge>
+          <Badge variant={props.cstConfig?.scheduled_sync_enabled ? "success" : "default"}>{props.cstConfig?.scheduled_sync_enabled ? `Daily ${props.cstConfig?.schedule_time ?? "00:30"} ${props.cstConfig?.schedule_timezone ?? "Asia/Riyadh"}` : "Schedule off"}</Badge>
+          <Badge variant={props.cstConfig?.auto_execute ? "success" : "default"}>{props.cstConfig?.auto_execute ? "Auto local execution" : "Manual queue"}</Badge>
+          <Badge variant="default">Service provider {props.cstConfig?.service_provider_id ?? "5"}</Badge>
+          <Button size="sm" variant="outline" onClick={() => props.onToggleCstEnabled(!props.cstConfig?.enabled)}>
+            {props.cstConfig?.enabled ? "Disable" : "Enable"}
+          </Button>
+          <Button size="sm" variant="outline" onClick={() => props.onToggleCstSchedule(!props.cstConfig?.scheduled_sync_enabled)}>
+            {props.cstConfig?.scheduled_sync_enabled ? "Disable Schedule" : "Enable Schedule"}
+          </Button>
+          <Button size="sm" variant="outline" onClick={props.onRunCstDayMinusOne}>
+            Run Day-1 Now
+          </Button>
+          <Button size="sm" variant="outline" onClick={() => props.onToggleCstAutoExecute(!props.cstConfig?.auto_execute)}>
+            {props.cstConfig?.auto_execute ? "Use Manual Queue" : "Use Auto Local Execution"}
+          </Button>
+        </div>
+        <div className="rounded-md border bg-muted/20 p-3">
+          <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+            <div>
+              <p className="text-sm font-semibold">Daily CST Schedule</p>
+              <p className="text-xs text-muted-foreground">Runs once per day at {props.cstConfig?.schedule_time ?? "00:30"} {props.cstConfig?.schedule_timezone ?? "Asia/Riyadh"} for the previous local day. Last run: {props.cstConfig?.last_scheduled_run_at || "not yet"}</p>
+            </div>
+            <Badge variant={props.cstConfig?.scheduled_sync_enabled ? "success" : "warning"}>{props.cstConfig?.scheduled_sync_enabled ? "Scheduled" : "Paused"}</Badge>
+          </div>
+          <div className="mt-3 max-h-[180px] overflow-auto rounded-md border bg-background/40">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Target Day</TableHead>
+                  <TableHead>Status</TableHead>
+                  <TableHead>Jobs</TableHead>
+                  <TableHead>Message</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {props.cstSchedulerRuns.slice(0, 8).map((run) => (
+                  <TableRow key={run.id}>
+                    <TableCell>{run.target_date}</TableCell>
+                    <TableCell><Badge variant={run.status === "SUCCESS" ? "success" : run.status === "FAILED" ? "danger" : "warning"}>{run.status}</Badge></TableCell>
+                    <TableCell>{run.total_jobs}</TableCell>
+                    <TableCell className="text-xs text-muted-foreground">{run.message || run.scheduled_for}</TableCell>
+                  </TableRow>
+                ))}
+                {!props.cstSchedulerRuns.length ? <TableRow><TableCell colSpan={4} className="py-4 text-center text-muted-foreground">No scheduled CST runs yet.</TableCell></TableRow> : null}
+              </TableBody>
+            </Table>
+          </div>
+        </div>          <div className="grid gap-4 xl:grid-cols-2">
+          <div className="grid gap-2">
+            <div className="flex items-center justify-between gap-2">
+              <h3 className="text-sm font-semibold">Recent Batches</h3>
+              {props.cstBatches[0] ? <Button size="sm" variant="outline" onClick={() => props.onRetryCstBatch(props.cstBatches[0])}>Retry Latest</Button> : null}
+            </div>
+            <div className="max-h-[300px] overflow-auto rounded-md border">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Batch</TableHead>
+                    <TableHead>Workflow</TableHead>
+                    <TableHead>Status</TableHead>
+                    <TableHead>Jobs</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {props.cstBatches.slice(0, 40).map((batch) => (
+                    <TableRow key={batch.id}>
+                      <TableCell className="font-mono text-xs">{batch.id}</TableCell>
+                      <TableCell>{batch.workflow_type}</TableCell>
+                      <TableCell><Badge variant={batch.status === "SUCCESS" ? "success" : batch.status === "FAILED" || batch.status === "BLOCKED" ? "danger" : "warning"}>{batch.status}</Badge></TableCell>
+                      <TableCell>{batch.completed_jobs}/{batch.total_jobs}</TableCell>
+                    </TableRow>
+                  ))}
+                  {!props.cstBatches.length ? <TableRow><TableCell colSpan={4} className="py-6 text-center text-muted-foreground">No CST batches yet.</TableCell></TableRow> : null}
+                </TableBody>
+              </Table>
+            </div>
+          </div>
+          <div className="grid gap-2">
+            <h3 className="text-sm font-semibold">Recent Jobs</h3>
+            <div className="max-h-[300px] overflow-auto rounded-md border">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>CIDR</TableHead>
+                    <TableHead>Operation</TableHead>
+                    <TableHead>Status</TableHead>
+                    <TableHead />
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {props.cstJobs.slice(0, 60).map((job) => (
+                    <TableRow key={job.id}>
+                      <TableCell>
+                        <p className="font-semibold">{job.cidr}</p>
+                        <p className="font-mono text-xs text-muted-foreground">{job.transaction_id}</p>
+                      </TableCell>
+                      <TableCell>{job.operation}</TableCell>
+                      <TableCell><Badge variant={job.status === "SUCCESS" ? "success" : job.status === "FAILED" || job.status === "BLOCKED" ? "danger" : job.status === "PENDING" ? "warning" : "default"}>{job.status}</Badge></TableCell>
+                      <TableCell>
+                        {job.status === "FAILED" || job.status === "BLOCKED" || job.status === "PENDING" ? <Button size="sm" variant="outline" onClick={() => props.onRetryCstJob(job)}>Retry</Button> : null}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                  {!props.cstJobs.length ? <TableRow><TableCell colSpan={4} className="py-6 text-center text-muted-foreground">No CST jobs yet.</TableCell></TableRow> : null}
+                </TableBody>
+              </Table>
+            </div>
+          </div>
+        </div>
+        <div className="grid gap-2">
+          <h3 className="text-sm font-semibold">Transaction Ledger</h3>
+          <div className="max-h-[300px] overflow-auto rounded-md border">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Transaction ID</TableHead>
+                  <TableHead>CIDR</TableHead>
+                  <TableHead>Status</TableHead>
+                  <TableHead>Timestamp</TableHead>
+                  <TableHead>Batch</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {props.cstTransactions.slice(0, 80).map((item) => (
+                  <TableRow key={item.transaction_id}>
+                    <TableCell className="font-mono text-xs">{item.transaction_id}</TableCell>
+                    <TableCell className="font-semibold">{item.cidr}</TableCell>
+                    <TableCell><Badge variant={item.last_status === "SUCCESS" ? "success" : item.last_status === "FAILED" || item.last_status === "BLOCKED" ? "danger" : "warning"}>{item.last_status}</Badge></TableCell>
+                    <TableCell>{formatDateTime(item.first_used_at)}</TableCell>
+                    <TableCell className="font-mono text-xs">{item.batch_id}</TableCell>
+                  </TableRow>
+                ))}
+                {!props.cstTransactions.length ? <TableRow><TableCell colSpan={5} className="py-6 text-center text-muted-foreground">No CST transaction IDs have been generated.</TableCell></TableRow> : null}
+              </TableBody>
+            </Table>
+          </div>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+
 function Administration(props: {
   users: User[];
+  auditEvents: AuditEvent[];
   currentRole: User["role"];
   newUser: { username: string; password: string; role: User["role"] };
   passwordReset: { userId: string; password: string };
@@ -3582,13 +3963,6 @@ function Administration(props: {
   ripeConfigForm: RipeConfigPayload;
   ripePoolCsv: string;
   ripeAllocatedPools: RipeAllocatedPool[];
-  cstConfig: CstConfig | null;
-  cstSummary: CstSyncSummary | null;
-  cstBatches: CstSyncBatch[];
-  cstJobs: CstSyncJob[];
-  cstSchedulerRuns: CstSchedulerRun[];
-  cstTransactions: CstTransactionLedger[];
-  cstBusy: boolean;
   onNewUser: (value: { username: string; password: string; role: User["role"] }) => void;
   onPasswordReset: (value: { userId: string; password: string }) => void;
   onRipeConfigForm: (value: RipeConfigPayload) => void;
@@ -3598,22 +3972,32 @@ function Administration(props: {
   onToggleUser: (user: User) => void;
   onSaveRipeConfig: () => void;
   onImportRipePools: () => void;
-  onRefreshCst: () => void;
-  onBootstrapCst: () => void;
-  onReconcileCst: () => void;
-  onRunCstDayMinusOne: () => void;
-  onRetryCstJob: (job: CstSyncJob) => void;
-  onRetryCstBatch: (batch: CstSyncBatch) => void;
-  onToggleCstEnabled: (enabled: boolean) => void;
-  onToggleCstAutoExecute: (autoExecute: boolean) => void;
-  onToggleCstSchedule: (scheduled: boolean) => void;
 }) {
   const roles = ["admin", "operator", "viewer"];
   const canManageUsers = props.currentRole === "admin";
   const policyRows = ["Allocation Rules", "Reservation Rules", "Retention Rules"];
+  const recentTransactions = props.auditEvents.slice(0, 6);
   return (
     <div className="grid gap-5">
       <PageTitle title="Administration" description="Users, roles, and registry policies for LIR operations." />
+      <Card>
+        <CardHeader>
+          <CardTitle>Recent Transactions</CardTitle>
+          <CardDescription>Latest registry transaction history captured by the audit trail.</CardDescription>
+        </CardHeader>
+        <CardContent className="grid gap-2">
+          {recentTransactions.map((event) => (
+            <div key={event.id} className="flex flex-wrap items-center justify-between gap-2 rounded-md border bg-muted/20 p-3">
+              <div>
+                <p className="font-semibold">{event.action}</p>
+                <p className="text-sm text-muted-foreground">{event.entity_type} / {event.entity_id}</p>
+              </div>
+              <span className="text-xs text-muted-foreground">{formatDateTime(event.timestamp)}</span>
+            </div>
+          ))}
+          {!recentTransactions.length ? <p className="text-sm text-muted-foreground">No audit events captured yet.</p> : null}
+        </CardContent>
+      </Card>
       {canManageUsers ? <Card>
         <CardHeader>
           <CardTitle>Users & Roles</CardTitle>
@@ -3719,176 +4103,6 @@ function Administration(props: {
       </Card>
       <Card>
         <CardHeader>
-          <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-            <div>
-              <CardTitle>CST Integration Monitor</CardTitle>
-              <CardDescription>Local controlled transaction store for CST SEND, UPDATE, DELETE, and GET workflows. External CST API calls are not enabled yet.</CardDescription>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              <Button variant="outline" onClick={props.onRefreshCst} disabled={props.cstBusy}>
-                {props.cstBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCcw className="h-4 w-4" />}
-                Refresh
-              </Button>
-              <Button variant="secondary" onClick={props.onBootstrapCst}>
-                <Database className="h-4 w-4" />
-                Create Migration Jobs
-              </Button>
-              <Button variant="outline" onClick={props.onReconcileCst}>
-                <Search className="h-4 w-4" />
-                Reconcile
-              </Button>
-            </div>
-          </div>
-        </CardHeader>
-        <CardContent className="grid gap-5">
-          <div className="grid gap-3 md:grid-cols-4">
-            <ReportMetric label="Transactions" value={String(props.cstSummary?.total_transactions ?? 0)} detail="Globally unique CST IDs" />
-            <ReportMetric label="Jobs" value={String(props.cstSummary?.total_jobs ?? 0)} detail={`${props.cstSummary?.success_jobs ?? 0} success / ${props.cstSummary?.pending_jobs ?? 0} pending`} />
-            <ReportMetric label="Failed" value={String((props.cstSummary?.failed_jobs ?? 0) + (props.cstSummary?.blocked_jobs ?? 0))} detail="Failed or blocked local jobs" />
-            <ReportMetric label="Last Batch" value={props.cstSummary?.last_batch_at ? props.cstSummary.last_batch_at.slice(0, 10) : "-"} detail="Latest CST transaction batch" />
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <Badge variant={props.cstConfig?.enabled ? "success" : "warning"}>{props.cstConfig?.enabled ? "CST enabled" : "CST disabled"}</Badge>
-            <Badge variant={props.cstConfig?.scheduled_sync_enabled ? "success" : "default"}>{props.cstConfig?.scheduled_sync_enabled ? `Daily ${props.cstConfig?.schedule_time ?? "00:30"} ${props.cstConfig?.schedule_timezone ?? "Asia/Riyadh"}` : "Schedule off"}</Badge>
-            <Badge variant={props.cstConfig?.auto_execute ? "success" : "default"}>{props.cstConfig?.auto_execute ? "Auto local execution" : "Manual queue"}</Badge>
-            <Badge variant="default">Service provider {props.cstConfig?.service_provider_id ?? "5"}</Badge>
-            <Button size="sm" variant="outline" onClick={() => props.onToggleCstEnabled(!props.cstConfig?.enabled)}>
-              {props.cstConfig?.enabled ? "Disable" : "Enable"}
-            </Button>
-            <Button size="sm" variant="outline" onClick={() => props.onToggleCstSchedule(!props.cstConfig?.scheduled_sync_enabled)}>
-              {props.cstConfig?.scheduled_sync_enabled ? "Disable Schedule" : "Enable Schedule"}
-            </Button>
-            <Button size="sm" variant="outline" onClick={props.onRunCstDayMinusOne}>
-              Run Day-1 Now
-            </Button>
-            <Button size="sm" variant="outline" onClick={() => props.onToggleCstAutoExecute(!props.cstConfig?.auto_execute)}>
-              {props.cstConfig?.auto_execute ? "Use Manual Queue" : "Use Auto Local Execution"}
-            </Button>
-          </div>
-          <div className="rounded-md border bg-muted/20 p-3">
-            <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
-              <div>
-                <p className="text-sm font-semibold">Daily CST Schedule</p>
-                <p className="text-xs text-muted-foreground">Runs once per day at {props.cstConfig?.schedule_time ?? "00:30"} {props.cstConfig?.schedule_timezone ?? "Asia/Riyadh"} for the previous local day. Last run: {props.cstConfig?.last_scheduled_run_at || "not yet"}</p>
-              </div>
-              <Badge variant={props.cstConfig?.scheduled_sync_enabled ? "success" : "warning"}>{props.cstConfig?.scheduled_sync_enabled ? "Scheduled" : "Paused"}</Badge>
-            </div>
-            <div className="mt-3 max-h-[180px] overflow-auto rounded-md border bg-background/40">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Target Day</TableHead>
-                    <TableHead>Status</TableHead>
-                    <TableHead>Jobs</TableHead>
-                    <TableHead>Message</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {props.cstSchedulerRuns.slice(0, 8).map((run) => (
-                    <TableRow key={run.id}>
-                      <TableCell>{run.target_date}</TableCell>
-                      <TableCell><Badge variant={run.status === "SUCCESS" ? "success" : run.status === "FAILED" ? "danger" : "warning"}>{run.status}</Badge></TableCell>
-                      <TableCell>{run.total_jobs}</TableCell>
-                      <TableCell className="text-xs text-muted-foreground">{run.message || run.scheduled_for}</TableCell>
-                    </TableRow>
-                  ))}
-                  {!props.cstSchedulerRuns.length ? <TableRow><TableCell colSpan={4} className="py-4 text-center text-muted-foreground">No scheduled CST runs yet.</TableCell></TableRow> : null}
-                </TableBody>
-              </Table>
-            </div>
-          </div>          <div className="grid gap-4 xl:grid-cols-2">
-            <div className="grid gap-2">
-              <div className="flex items-center justify-between gap-2">
-                <h3 className="text-sm font-semibold">Recent Batches</h3>
-                {props.cstBatches[0] ? <Button size="sm" variant="outline" onClick={() => props.onRetryCstBatch(props.cstBatches[0])}>Retry Latest</Button> : null}
-              </div>
-              <div className="max-h-[300px] overflow-auto rounded-md border">
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>Batch</TableHead>
-                      <TableHead>Workflow</TableHead>
-                      <TableHead>Status</TableHead>
-                      <TableHead>Jobs</TableHead>
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {props.cstBatches.slice(0, 40).map((batch) => (
-                      <TableRow key={batch.id}>
-                        <TableCell className="font-mono text-xs">{batch.id}</TableCell>
-                        <TableCell>{batch.workflow_type}</TableCell>
-                        <TableCell><Badge variant={batch.status === "SUCCESS" ? "success" : batch.status === "FAILED" || batch.status === "BLOCKED" ? "danger" : "warning"}>{batch.status}</Badge></TableCell>
-                        <TableCell>{batch.completed_jobs}/{batch.total_jobs}</TableCell>
-                      </TableRow>
-                    ))}
-                    {!props.cstBatches.length ? <TableRow><TableCell colSpan={4} className="py-6 text-center text-muted-foreground">No CST batches yet.</TableCell></TableRow> : null}
-                  </TableBody>
-                </Table>
-              </div>
-            </div>
-            <div className="grid gap-2">
-              <h3 className="text-sm font-semibold">Recent Jobs</h3>
-              <div className="max-h-[300px] overflow-auto rounded-md border">
-                <Table>
-                  <TableHeader>
-                    <TableRow>
-                      <TableHead>CIDR</TableHead>
-                      <TableHead>Operation</TableHead>
-                      <TableHead>Status</TableHead>
-                      <TableHead />
-                    </TableRow>
-                  </TableHeader>
-                  <TableBody>
-                    {props.cstJobs.slice(0, 60).map((job) => (
-                      <TableRow key={job.id}>
-                        <TableCell>
-                          <p className="font-semibold">{job.cidr}</p>
-                          <p className="font-mono text-xs text-muted-foreground">{job.transaction_id}</p>
-                        </TableCell>
-                        <TableCell>{job.operation}</TableCell>
-                        <TableCell><Badge variant={job.status === "SUCCESS" ? "success" : job.status === "FAILED" || job.status === "BLOCKED" ? "danger" : job.status === "PENDING" ? "warning" : "default"}>{job.status}</Badge></TableCell>
-                        <TableCell>
-                          {job.status === "FAILED" || job.status === "BLOCKED" || job.status === "PENDING" ? <Button size="sm" variant="outline" onClick={() => props.onRetryCstJob(job)}>Retry</Button> : null}
-                        </TableCell>
-                      </TableRow>
-                    ))}
-                    {!props.cstJobs.length ? <TableRow><TableCell colSpan={4} className="py-6 text-center text-muted-foreground">No CST jobs yet.</TableCell></TableRow> : null}
-                  </TableBody>
-                </Table>
-              </div>
-            </div>
-          </div>
-          <div className="grid gap-2">
-            <h3 className="text-sm font-semibold">Transaction Ledger</h3>
-            <div className="max-h-[300px] overflow-auto rounded-md border">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Transaction ID</TableHead>
-                    <TableHead>CIDR</TableHead>
-                    <TableHead>Status</TableHead>
-                    <TableHead>Timestamp</TableHead>
-                    <TableHead>Batch</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {props.cstTransactions.slice(0, 80).map((item) => (
-                    <TableRow key={item.transaction_id}>
-                      <TableCell className="font-mono text-xs">{item.transaction_id}</TableCell>
-                      <TableCell className="font-semibold">{item.cidr}</TableCell>
-                      <TableCell><Badge variant={item.last_status === "SUCCESS" ? "success" : item.last_status === "FAILED" || item.last_status === "BLOCKED" ? "danger" : "warning"}>{item.last_status}</Badge></TableCell>
-                      <TableCell>{formatDateTime(item.first_used_at)}</TableCell>
-                      <TableCell className="font-mono text-xs">{item.batch_id}</TableCell>
-                    </TableRow>
-                  ))}
-                  {!props.cstTransactions.length ? <TableRow><TableCell colSpan={5} className="py-6 text-center text-muted-foreground">No CST transaction IDs have been generated.</TableCell></TableRow> : null}
-                </TableBody>
-              </Table>
-            </div>
-          </div>
-        </CardContent>
-      </Card>      <Card>
-        <CardHeader>
           <CardTitle>Policies</CardTitle>
           <CardDescription>Registry governance policy areas.</CardDescription>
         </CardHeader>
@@ -3928,7 +4142,7 @@ function ResourceTable({ resources, empty, onRelease }: { resources: ManagedReso
                     <p className="font-semibold">{resource.cidr}</p>
                     <p className="text-xs text-muted-foreground">{resource.uuid}</p>
                   </TableCell>
-                  <TableCell>{resource.type}</TableCell>
+                  <TableCell><ResourceTypeBadge resource={resource} /></TableCell>
                   <TableCell>{resource.owner}</TableCell>
                   <TableCell><Badge variant={badgeForResource(resource)}>{resource.status}</Badge></TableCell>
                   <TableCell>{formatHosts(resource.totalIps)}</TableCell>
@@ -4080,6 +4294,26 @@ function resourceKey(resource: ManagedResource, index: number, scope: string) {
     resource.operationType,
     index
   ].join("|");
+}
+
+function isRipeDiscoveryPool(pool: Pool) {
+  return String(pool.source_system || "").trim() === "RIPE IP Pools Discovery";
+}
+
+function isRipeAllocatedPoolResource(resource: ManagedResource) {
+  return resource.allocatedPool || String(resource.sourceRegistry || "").trim() === "RIPE IP Pools Discovery";
+}
+
+function resourceTypeLabel(resource: ManagedResource) {
+  return isRipeAllocatedPoolResource(resource) ? "Allocated Pool" : resource.type;
+}
+
+function AllocatedPoolBadge() {
+  return <span className="inline-flex items-center rounded-md border border-cyan-400/70 bg-cyan-400/15 px-2 py-1 text-xs font-semibold text-cyan-300">Allocated Pool</span>;
+}
+
+function ResourceTypeBadge({ resource }: { resource: ManagedResource }) {
+  return isRipeAllocatedPoolResource(resource) ? <AllocatedPoolBadge /> : <Badge variant="default">{resource.type}</Badge>;
 }
 
 function resourceActions(resource: ManagedResource, children: ManagedResource[]) {
@@ -4330,12 +4564,55 @@ function cidrFromPoolDraft(poolDraft: PoolAssignmentDraft, pool: ManagedResource
   return candidate.cidr;
 }
 
+function sameRange(left: Range, right: Range) {
+  return left.start === right.start && left.end === right.end;
+}
+
+function poolHierarchyEntries(pools: Pool[]) {
+  return pools.map((pool) => ({ pool, range: toRange(pool) }));
+}
+
+function nearestParentPoolIdForPool(pool: Pool, range: Range, entries: Array<{ pool: Pool; range: Range }>) {
+  const candidates = entries.filter(({ pool: candidate, range: candidateRange }) => {
+    if (candidate.id === pool.id || !contains(candidateRange, range)) {
+      return false;
+    }
+    if (!sameRange(candidateRange, range)) {
+      return true;
+    }
+    return isRipeDiscoveryPool(candidate) && !isRipeDiscoveryPool(pool);
+  });
+  candidates.sort((left, right) => {
+    const prefixDelta = right.pool.prefix - left.pool.prefix;
+    if (prefixDelta) {
+      return prefixDelta;
+    }
+    return Number(isRipeDiscoveryPool(right.pool)) - Number(isRipeDiscoveryPool(left.pool));
+  });
+  return candidates[0]?.pool.id ?? "";
+}
+
+function nearestParentPoolIdForAssignment(range: Range, entries: Array<{ pool: Pool; range: Range }>) {
+  const candidates = entries.filter(({ range: poolRange }) => contains(poolRange, range));
+  candidates.sort((left, right) => {
+    const prefixDelta = right.pool.prefix - left.pool.prefix;
+    if (prefixDelta) {
+      return prefixDelta;
+    }
+    return Number(isRipeDiscoveryPool(left.pool)) - Number(isRipeDiscoveryPool(right.pool));
+  });
+  return candidates[0]?.pool.id ?? "";
+}
 function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
   const resources: ManagedResource[] = [];
+  const poolEntries = poolHierarchyEntries(pools);
+  const occupyingAssignments = assignments.filter((assignment) => !assignmentReleasedAfterRipeRemoval(assignment));
+  const poolParentById = new Map(poolEntries.map(({ pool, range }) => [pool.id, nearestParentPoolIdForPool(pool, range, poolEntries)]));
+  const assignmentParentById = new Map(occupyingAssignments.map((assignment) => [assignment.id, nearestParentPoolIdForAssignment(toRange(assignment), poolEntries)]));
   for (const pool of pools) {
     const poolRange = toRange(pool);
-    const occupyingAssignments = assignments.filter((assignment) => !assignmentReleasedAfterRipeRemoval(assignment));
     const childAssignments = occupyingAssignments.filter((assignment) => contains(poolRange, toRange(assignment)));
+    const directAssignments = childAssignments.filter((assignment) => assignmentParentById.get(assignment.id) === pool.id);
     const usedIps = childAssignments.filter((assignment) => assignment.status !== "Reserved").reduce((sum, assignment) => sum + assignment.size, 0);
     const reservedIps = childAssignments.filter((assignment) => assignment.status === "Reserved").reduce((sum, assignment) => sum + assignment.size, 0);
     const freeIps = Math.max(0, pool.size - usedIps - reservedIps);
@@ -4343,7 +4620,7 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
     resources.push({
       id: pool.id,
       uuid: resourceUuid("pool", pool.id, pool.cidr),
-      parentId: "",
+      parentId: poolParentById.get(pool.id) || "",
       cidr: pool.cidr,
       serviceProviderId: "5",
       serviceProviderName: "Salam",
@@ -4393,10 +4670,11 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
       sourceUuid: "",
       successorUuid: "",
       operationType: "CREATE",
-      source: pool
+      source: pool,
+      allocatedPool: isRipeDiscoveryPool(pool)
     });
 
-    for (const assignment of childAssignments) {
+    for (const assignment of directAssignments) {
       const assignmentRange = toRange(assignment);
       const reserved = assignment.status === "Reserved";
       const hideIndividualIdentity = assignmentIsIndividual(assignment);
@@ -4453,7 +4731,8 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
         sourceUuid: "",
         successorUuid: "",
         operationType: reserved ? "RESERVE" : assignment.status === "Retiring" ? "RETIRE" : "ASSIGN",
-        source: assignment
+        source: assignment,
+        allocatedPool: false
       });
     }
 
@@ -4517,7 +4796,8 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
             sourceUuid: resourceUuid("pool", pool.id, pool.cidr),
             successorUuid: "",
             operationType: "CALCULATED_FREE_SPACE",
-            source: null
+            source: null,
+            allocatedPool: false
           });
         }
       }
@@ -5326,12 +5606,11 @@ function crc32(data: Uint8Array) {
 }
 
 function resourceUuid(kind: string, id: string, cidr: string) {
-  if (isUuid(id)) {
+  if (kind !== "free" && isUuid(id)) {
     return id;
   }
   return stableUuid(`${kind}:${id}:${cidr}`);
 }
-
 function isUuid(value: string) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
 }
