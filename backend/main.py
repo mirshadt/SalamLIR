@@ -2729,6 +2729,14 @@ def validate_parent_pool(candidate: IPv4Network, excluded_pool_ids: set[str] | N
             raise HTTPException(status_code=409, detail=f"{candidate} overlaps parent pool {pool.cidr}")
 
 
+def validate_private_pool_registration(candidate: IPv4Network) -> None:
+    if not candidate.is_private:
+        raise HTTPException(
+            status_code=400,
+            detail="Register Subnet supports private pools only. Public allocated pools must be synchronized from RIPE.",
+        )
+
+
 def validate_assignment(candidate: IPv4Network) -> None:
     parent_candidates = [
         pool
@@ -3328,6 +3336,7 @@ def list_pool_ranges(pool_id: str) -> PoolRanges:
 @app.post("/pools", response_model=Pool, status_code=201)
 def add_pool(payload: PoolCreate) -> Pool:
     network = normalize_network(payload.cidr)
+    validate_private_pool_registration(network)
     validate_parent_pool(network)
     pool = pool_from_network(network, payload.name, payload.region)
     pool_data = pool.model_dump()
@@ -3483,6 +3492,7 @@ def process_pool_bulk(csv_text: str) -> BulkImportResult:
         try:
             networks, name, region = pool_networks_from_bulk_row(row)
             for network in networks:
+                validate_private_pool_registration(network)
                 validate_parent_pool(network)
             with connect() as connection:
                 for network in networks:

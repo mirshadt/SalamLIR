@@ -785,6 +785,9 @@ video {
 .cursor-pointer {
   cursor: pointer;
 }
+.cursor-not-allowed {
+  cursor: not-allowed;
+}
 .grid-cols-2 {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
@@ -1127,9 +1130,6 @@ video {
 .pt-5 {
   padding-top: 1.25rem;
 }
-.pt-1 {
-  padding-top: 0.25rem;
-}
 .text-left {
   text-align: left;
 }
@@ -1283,6 +1283,9 @@ video {
 .opacity-0 {
   opacity: 0;
 }
+.opacity-50 {
+  opacity: 0.5;
+}
 .shadow-sm {
   --tw-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.05);
   --tw-shadow-colored: 0 1px 2px 0 var(--tw-shadow-color);
@@ -1426,8 +1429,10 @@ html[data-theme="green"] .text-emerald-300 {
   color: rgb(4 120 87);
 }
 
+html[data-theme="white"] .text-amber-100,
 html[data-theme="white"] .text-amber-200,
 html[data-theme="white"] .text-amber-300,
+html[data-theme="green"] .text-amber-100,
 html[data-theme="green"] .text-amber-200,
 html[data-theme="green"] .text-amber-300 {
   color: rgb(180 83 9);

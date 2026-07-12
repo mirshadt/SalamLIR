@@ -722,13 +722,13 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [globalSearch, setGlobalSearch] = useState("");
   const [globalSearchFilters, setGlobalSearchFilters] = useState<SearchFilterCriterion[]>([]);
-  const [poolForm, setPoolForm] = useState({ cidr: "5.42.224.0/19", name: "Salam IPv4 Allocation", region: "Riyadh", description: "Authoritative LIR parent allocation" });
+  const [poolForm, setPoolForm] = useState({ cidr: "10.24.0.0/16", name: "Private IPv4 Allocation", region: "Riyadh", description: "Private allocation registered locally. Public allocations are synchronized from RIPE." });
   const [assignmentForm, setAssignmentForm] = useState<AssignmentPayload>({ ...emptyAssignment, cidr: "", customer_name: "", assignment_date: today() });
   const [poolAssignmentDraft, setPoolAssignmentDraft] = useState<PoolAssignmentDraft>({ selectionMode: "subnet", parentPoolId: "", poolSearch: "", startIp: "", endIp: "", prefix: "24" });
   const [reservationForm, setReservationForm] = useState({ cidr: "5.42.225.0/24", purpose: "Enterprise Expansion", requestedBy: "", expiryDate: "", notes: "" });
   const [splitForm, setSplitForm] = useState({ poolId: "", search: "", prefix: "24", direction: "start" as PartitionDirection });
   const [mergeForm, setMergeForm] = useState({ leftPoolId: "", rightPoolId: "", leftSearch: "", rightSearch: "" });
-  const [bulkPoolCsv, setBulkPoolCsv] = useState("StartIP,EndIP,Total\n5.42.224.0,5.42.255.255,8192");
+  const [bulkPoolCsv, setBulkPoolCsv] = useState("StartIP,EndIP,Total\n10.24.0.0,10.24.255.255,65536");
   const [bulkAssignmentCsv, setBulkAssignmentCsv] = useState("cidr,size,status,assignmentDate,customerName,serviceId,serviceDescription\n5.42.224.0/24,256,3,2026-06-03,Example Enterprise,SVC-10001,Enterprise L3 service");
   const [ripeConfigForm, setRipeConfigForm] = useState<RipeConfigPayload>({ base_url: "https://rest.db.ripe.net", auth_type: "Basic Authentication", username: "", password: "", connection_timeout: 10, read_timeout: 30, default_maintainer: "ITC-NOC-MNT" });
   const [ripePoolCsv, setRipePoolCsv] = useState("pool_name,cidr,allocation_type,source,created_date\nRIPE Allocation 5.42.224.0,5.42.224.0/19,RIPE Allocated Pool,RIPE Database,2026-06-01");
@@ -1380,6 +1380,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
             ) : null}
             {view === "administration" ? (
               <Administration
+                stats={stats}
                 users={users}
                 auditEvents={auditEvents}
                 currentRole={signedInRole}
@@ -1529,21 +1530,6 @@ function ExecutiveDashboard({
           ))}
         </div>
       </section>
-
-      <section className="grid gap-4">
-        <Card>
-          <CardHeader>
-            <CardTitle>Registry Health</CardTitle>
-            <CardDescription>Capacity and exception signals.</CardDescription>
-          </CardHeader>
-          <CardContent className="grid gap-3">
-            <HealthRow label="Utilization" value={`${stats.utilization}%`} status={`${formatHosts(stats.availableCapacity)} available`} />
-            <HealthRow label="Largest Free Block" value={stats.largestFreeBlock?.cidr ?? "None"} status={stats.largestFreeBlock ? formatHosts(stats.largestFreeBlock.totalIps) : "No capacity"} />
-            <HealthRow label="Fragmentation" value={`${stats.fragmentation}%`} status="Free block fragmentation" />
-            <HealthRow label="Pending Ops" value={String(stats.pendingOperations)} status="Registry actions" />
-          </CardContent>
-        </Card>
-      </section>
     </div>
   );
 }
@@ -1645,12 +1631,12 @@ function ResourceRegistry(props: {
 } & CstMonitorProps) {
   const visible = filterResources(presentationResources(props.resources), props.globalSearch);
   const [activeRegistryPanel, setActiveRegistryPanel] = useState<RegistryPanelId>("subnet-navigator");
-  const registryPanels: Array<{ id: RegistryPanelId; label: string; icon: React.ReactNode }> = [
-    { id: "register", label: "Register Subnet", icon: <Database className="h-6 w-6" /> },
+  const registryPanels: Array<{ id: RegistryPanelId; label: string; icon: React.ReactNode; disabled?: boolean }> = [
     { id: "lir-discovery", label: "RIPE Discovery", icon: <Radar className="h-6 w-6" /> },
     { id: "ripe-worklist", label: "RIPE Worklist", icon: <ListTree className="h-6 w-6" /> },
     { id: "cst-sync-monitor", label: "CST Sync Monitor", icon: <Network className="h-6 w-6" /> },
-    { id: "subnet-navigator", label: "Subnet Navigator", icon: <Layers3 className="h-6 w-6" /> }
+    { id: "subnet-navigator", label: "Subnet Navigator", icon: <Layers3 className="h-6 w-6" /> },
+    { id: "register", label: "Register Subnet", icon: <Database className="h-6 w-6" />, disabled: true }
   ];
 
   return (
@@ -1660,6 +1646,7 @@ function ResourceRegistry(props: {
           <RegistryPanelButton
             key={panel.id}
             active={activeRegistryPanel === panel.id}
+            disabled={panel.disabled}
             icon={panel.icon}
             label={panel.label}
             onClick={() => setActiveRegistryPanel(panel.id)}
@@ -1671,7 +1658,7 @@ function ResourceRegistry(props: {
         <Card>
           <CardHeader>
             <CardTitle>Register Subnet</CardTitle>
-            <CardDescription>Register an authoritative IPv4 subnet in the LIR registry.</CardDescription>
+            <CardDescription>Register private IPv4 subnets only. Public allocated pools are synchronized from RIPE.</CardDescription>
           </CardHeader>
           <CardContent className="grid gap-3 md:grid-cols-4">
             <Input value={props.poolForm.cidr} onChange={(event) => props.onPoolForm({ ...props.poolForm, cidr: event.target.value })} placeholder="CIDR" />
@@ -1708,17 +1695,19 @@ function ResourceRegistry(props: {
   );
 }
 
-function RegistryPanelButton({ active, icon, label, onClick }: { active: boolean; icon: React.ReactNode; label: string; onClick: () => void }) {
+function RegistryPanelButton({ active, disabled = false, icon, label, onClick }: { active: boolean; disabled?: boolean; icon: React.ReactNode; label: string; onClick: () => void }) {
   return (
     <button
       className={cn(
-        "flex min-h-[94px] flex-col items-center justify-center gap-2 rounded-lg border bg-card px-3 py-4 text-center transition hover:border-primary/70 hover:bg-muted/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+        "flex min-h-[94px] flex-col items-center justify-center gap-2 rounded-lg border bg-card px-3 py-4 text-center transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+        disabled ? "cursor-not-allowed border-border/60 opacity-50" : "hover:border-primary/70 hover:bg-muted/20",
         active ? "border-primary bg-primary/10 text-primary" : "text-muted-foreground"
       )}
       type="button"
       onClick={onClick}
+      disabled={disabled}
       aria-pressed={active}
-      title={label}
+      title={disabled ? `${label} is disabled for now` : label}
     >
       <span className="flex h-11 w-11 items-center justify-center rounded-md border bg-background/60 text-current">{icon}</span>
       <span className="text-sm font-semibold leading-tight text-foreground">{label}</span>
@@ -3954,6 +3943,7 @@ function CstIntegrationMonitor(props: CstMonitorProps) {
 
 
 function Administration(props: {
+  stats: RegistryStats;
   users: User[];
   auditEvents: AuditEvent[];
   currentRole: User["role"];
@@ -3980,6 +3970,18 @@ function Administration(props: {
   return (
     <div className="grid gap-5">
       <PageTitle title="Administration" description="Users, roles, and registry policies for LIR operations." />
+      <Card>
+        <CardHeader>
+          <CardTitle>Registry Health</CardTitle>
+          <CardDescription>Capacity and exception signals for administrator review.</CardDescription>
+        </CardHeader>
+        <CardContent className="grid gap-3">
+          <HealthRow label="Utilization" value={`${props.stats.utilization}%`} status={`${formatHosts(props.stats.availableCapacity)} available`} />
+          <HealthRow label="Largest Free Block" value={props.stats.largestFreeBlock?.cidr ?? "None"} status={props.stats.largestFreeBlock ? formatHosts(props.stats.largestFreeBlock.totalIps) : "No capacity"} />
+          <HealthRow label="Fragmentation" value={`${props.stats.fragmentation}%`} status="Free block fragmentation" />
+          <HealthRow label="Pending Ops" value={String(props.stats.pendingOperations)} status="Registry actions" />
+        </CardContent>
+      </Card>
       <Card>
         <CardHeader>
           <CardTitle>Recent Transactions</CardTitle>
