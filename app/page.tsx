@@ -65,6 +65,7 @@ import {
   getPools,
   getRipeAllocatedPools,
   getRipeConfig,
+  getSiebelConfig,
   getUsers,
   login,
   PartitionDirection,
@@ -77,6 +78,9 @@ import {
   RipeDiscoveryResponse,
   RipePushResponse,
   RipeReportResponse,
+  SiebelConfig,
+  SiebelConfigPayload,
+  SiebelLookupResponse,
   retryCstJob,
   retryFailedCstBatch,
   runCstDayMinusOneSync,
@@ -474,10 +478,16 @@ const emptyAssignment: AssignmentPayload = {
   service_instance_name: "",
   service_type: "ResourceFacingService",
   service_category: "IP Address Resource",
+  service_order_id: "",
+  siebel_order_number: "",
+  siebel_last_sync_at: "",
+  siebel_payload_json: "",
+  service_characteristics: "",
   product_specification_id: "",
   product_specification_name: "",
   product_offering_id: "",
   product_offering_name: "",
+  product_instance_id: "",
   customer_id: "",
   customer_name: "",
   customer_type: "Enterprise",
@@ -731,6 +741,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   const [bulkPoolCsv, setBulkPoolCsv] = useState("StartIP,EndIP,Total\n10.24.0.0,10.24.255.255,65536");
   const [bulkAssignmentCsv, setBulkAssignmentCsv] = useState("cidr,size,status,assignmentDate,customerName,serviceId,serviceDescription\n5.42.224.0/24,256,3,2026-06-03,Example Enterprise,SVC-10001,Enterprise L3 service");
   const [ripeConfigForm, setRipeConfigForm] = useState<RipeConfigPayload>({ base_url: "https://rest.db.ripe.net", auth_type: "Basic Authentication", username: "", password: "", connection_timeout: 10, read_timeout: 30, default_maintainer: "ITC-NOC-MNT" });
+  const [siebelConfigForm, setSiebelConfigForm] = useState<SiebelConfigPayload>({ username: "LIR_USER", password: "", dsn: "172.31.23.101:1525/SIDB", connection_timeout: 10, query_sql: "" });
   const [ripePoolCsv, setRipePoolCsv] = useState("pool_name,cidr,allocation_type,source,created_date\nRIPE Allocation 5.42.224.0,5.42.224.0/19,RIPE Allocated Pool,RIPE Database,2026-06-01");
   const [ripeReportForm, setRipeReportForm] = useState({ dateFrom: "", dateTo: "", reportType: "RIPE Assignment Report" });
   const [ripeReportResult, setRipeReportResult] = useState<RipeReportResponse | null>(null);
@@ -753,6 +764,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   const auditQuery = useQuery({ queryKey: ["audit"], queryFn: getAuditEvents, ...liveQueryOptions });
   const usersQuery = useQuery({ queryKey: ["users"], queryFn: getUsers, ...liveQueryOptions });
   const ripeConfigQuery = useQuery({ queryKey: ["ripe-config"], queryFn: getRipeConfig, ...liveQueryOptions });
+  const siebelConfigQuery = useQuery({ queryKey: ["siebel-config"], queryFn: getSiebelConfig, ...liveQueryOptions });
   const ripeAllocatedPoolsQuery = useQuery({ queryKey: ["ripe-allocated-pools"], queryFn: getRipeAllocatedPools, ...liveQueryOptions });
   const cstConfigQuery = useQuery({ queryKey: ["cst-config"], queryFn: getCstConfig, ...liveQueryOptions });
   const cstSummaryQuery = useQuery({ queryKey: ["cst-summary"], queryFn: getCstSummary, ...liveQueryOptions });
@@ -778,6 +790,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   const auditEvents = auditQuery.data ?? [];
   const users = usersQuery.data ?? [];
   const ripeConfig = ripeConfigQuery.data ?? null;
+  const siebelConfig = siebelConfigQuery.data ?? null;
   const ripeAllocatedPools = ripeAllocatedPoolsQuery.data ?? [];
   const cstConfig = cstConfigQuery.data ?? null;
   const cstSummary = cstSummaryQuery.data ?? null;
@@ -807,6 +820,19 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
       default_maintainer: ripeConfig.default_maintainer
     });
   }, [ripeConfig]);
+
+  useEffect(() => {
+    if (!siebelConfig) {
+      return;
+    }
+    setSiebelConfigForm({
+      username: siebelConfig.username,
+      password: "",
+      dsn: siebelConfig.dsn,
+      connection_timeout: siebelConfig.connection_timeout,
+      query_sql: siebelConfig.query_sql
+    });
+  }, [siebelConfig]);
 
   useEffect(() => {
     const applyRoute = () => {
@@ -842,6 +868,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
     void queryClient.invalidateQueries({ queryKey: ["conflicts"] });
     void queryClient.invalidateQueries({ queryKey: ["audit"] });
     void queryClient.invalidateQueries({ queryKey: ["users"] });
+    void queryClient.invalidateQueries({ queryKey: ["siebel-config"] });
     void queryClient.invalidateQueries({ queryKey: ["bulk-batches"] });
     void queryClient.invalidateQueries({ queryKey: ["ripe-config"] });
     void queryClient.invalidateQueries({ queryKey: ["ripe-allocated-pools"] });
@@ -1275,6 +1302,20 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                   action: () => run(async () => { await api.patch(`/assignments/${assignment.id}/status`, { status: "Retiring" }); })
                 })}
                 onStatus={(assignment, status) => run(async () => { await api.patch(`/assignments/${assignment.id}/status`, { status }); })}
+                onLookupSiebelOrder={(orderNumber) => run(async () => {
+                  const { data } = await api.post<SiebelLookupResponse>("/siebel/business-customer", { order_number: orderNumber });
+                  if (!data.found) {
+                    setNotice({ title: "Siebel Lookup", detail: data.message || `No details found for order ${orderNumber}.` });
+                    return;
+                  }
+                  setAssignmentForm((current) => ({
+                    ...current,
+                    ...data.assignment,
+                    assignment_target_type: "business_customer",
+                    service_order_id: data.assignment.service_order_id || orderNumber
+                  }));
+                  setNotice({ title: "Siebel Details Loaded", detail: `Business customer details were populated for order ${orderNumber}.` });
+                })}
               />
             ) : null}
             {view === "capacity" ? <CapacityManagement resources={resources} /> : null}
@@ -1388,16 +1429,20 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                 passwordReset={passwordReset}
                 ripeConfig={ripeConfig}
                 ripeConfigForm={ripeConfigForm}
+                siebelConfig={siebelConfig}
+                siebelConfigForm={siebelConfigForm}
                 ripePoolCsv={ripePoolCsv}
                 ripeAllocatedPools={ripeAllocatedPools}
                 onNewUser={setNewUser}
                 onPasswordReset={setPasswordReset}
                 onRipeConfigForm={setRipeConfigForm}
+                onSiebelConfigForm={setSiebelConfigForm}
                 onRipePoolCsv={setRipePoolCsv}
                 onAddUser={() => run(async () => { await api.post("/users", newUser); setNewUser({ username: "", password: "", role: "operator" }); })}
                 onSetPassword={() => run(async () => { await api.patch(`/users/${passwordReset.userId}/password`, { password: passwordReset.password }); setPasswordReset((current) => ({ ...current, password: "" })); })}
                 onToggleUser={(user) => run(async () => { await api.patch(`/users/${user.id}/status`, { status: user.status === "Active" ? "Disabled" : "Active" }); })}
                 onSaveRipeConfig={() => run(async () => { await api.put("/ripe/config", ripeConfigForm); })}
+                onSaveSiebelConfig={() => run(async () => { await api.put("/siebel/config", siebelConfigForm); void siebelConfigQuery.refetch(); })}
                 onImportRipePools={() => run(async () => {
                   const { data } = await api.post("/ripe/allocated-pools/bulk", { csv_text: ripePoolCsv, file_name: "ripe-allocated-pools.csv" });
                   setNotice({ title: "RIPE Allocated Pools Imported", detail: `${data.imported} imported, ${data.blocked} blocked.${data.errors?.length ? `\n${data.errors.slice(0, 8).join("\n")}` : ""}` });
@@ -2336,6 +2381,7 @@ function AssignmentManagement(props: {
   onAssign: () => void;
   onRelease: (assignment: Assignment) => void;
   onStatus: (assignment: Assignment, status: AssignmentStatus) => void;
+  onLookupSiebelOrder: (orderNumber: string) => void;
 }) {
   const available = presentationResources(props.resources).filter((resource) => resource.administrativeStatus === "AVAILABLE" && resource.type === "Subnet");
   const parentPoolMatches = filterResources(available, props.poolDraft.poolSearch);
@@ -2438,6 +2484,19 @@ function AssignmentManagement(props: {
                     <Badge variant={props.form.status === "Blocked" ? "danger" : "success"}>Operational: {operationalStatuses.includes(props.form.status) ? props.form.status : "Active"}</Badge>
                   </div>
                 </div>
+                {targetType === "business_customer" ? (
+                  <div className="grid gap-3 rounded-md border bg-background/40 p-3 md:grid-cols-[minmax(0,1fr)_auto]">
+                    <label className="grid gap-1">
+                      <span className="text-xs font-medium text-muted-foreground">Siebel order number</span>
+                      <Input value={props.form.service_order_id} onChange={(event) => update("service_order_id", event.target.value)} placeholder="Order number" />
+                    </label>
+                    <Button variant="secondary" onClick={() => props.onLookupSiebelOrder(props.form.service_order_id)} disabled={!props.form.service_order_id.trim()}>
+                      <Search className="h-4 w-4" />
+                      Query Siebel
+                    </Button>
+                    <p className="text-xs text-muted-foreground md:col-span-2">Fetch business customer details from Siebel by order number and populate the fields below.</p>
+                  </div>
+                ) : null}
                 <AssignmentFieldGroup title={detailTitle} fields={dynamicOwnerFields} form={props.form} onChange={update} />
               </div>
 
@@ -3951,16 +4010,20 @@ function Administration(props: {
   passwordReset: { userId: string; password: string };
   ripeConfig: RipeConfig | null;
   ripeConfigForm: RipeConfigPayload;
+  siebelConfig: SiebelConfig | null;
+  siebelConfigForm: SiebelConfigPayload;
   ripePoolCsv: string;
   ripeAllocatedPools: RipeAllocatedPool[];
   onNewUser: (value: { username: string; password: string; role: User["role"] }) => void;
   onPasswordReset: (value: { userId: string; password: string }) => void;
   onRipeConfigForm: (value: RipeConfigPayload) => void;
+  onSiebelConfigForm: (value: SiebelConfigPayload) => void;
   onRipePoolCsv: (value: string) => void;
   onAddUser: () => void;
   onSetPassword: () => void;
   onToggleUser: (user: User) => void;
   onSaveRipeConfig: () => void;
+  onSaveSiebelConfig: () => void;
   onImportRipePools: () => void;
 }) {
   const roles = ["admin", "operator", "viewer"];
@@ -4100,6 +4163,29 @@ function Administration(props: {
                 ) : null}
               </TableBody>
             </Table>
+          </div>
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader>
+          <CardTitle>Siebel Integration</CardTitle>
+          <CardDescription>Oracle connection and query used to populate business customer assignment details by order number.</CardDescription>
+        </CardHeader>
+        <CardContent className="grid gap-5">
+          <div className="grid gap-3 md:grid-cols-3">
+            <Input value={props.siebelConfigForm.username} onChange={(event) => props.onSiebelConfigForm({ ...props.siebelConfigForm, username: event.target.value })} placeholder="Siebel DB username" />
+            <Input name="siebel-db-password" autoComplete="new-password" value={props.siebelConfigForm.password ?? ""} onChange={(event) => props.onSiebelConfigForm({ ...props.siebelConfigForm, password: event.target.value })} placeholder={props.siebelConfig?.password_configured ? "Siebel password configured" : "Siebel DB password"} type="password" />
+            <Input value={props.siebelConfigForm.dsn} onChange={(event) => props.onSiebelConfigForm({ ...props.siebelConfigForm, dsn: event.target.value })} placeholder="172.31.23.101:1525/SIDB" />
+            <Input value={String(props.siebelConfigForm.connection_timeout)} onChange={(event) => props.onSiebelConfigForm({ ...props.siebelConfigForm, connection_timeout: Number(event.target.value) || 10 })} placeholder="Connection timeout seconds" />
+          </div>
+          <Textarea value={props.siebelConfigForm.query_sql} onChange={(event) => props.onSiebelConfigForm({ ...props.siebelConfigForm, query_sql: event.target.value })} placeholder="SELECT * FROM SIEBEL_VIEW WHERE ORDER_NUM = :order_number" />
+          <div className="flex flex-wrap items-center gap-2">
+            <Button onClick={props.onSaveSiebelConfig}>
+              <Database className="h-4 w-4" />
+              Save Siebel Settings
+            </Button>
+            <Badge variant={props.siebelConfig?.password_configured ? "success" : "warning"}>{props.siebelConfig?.password_configured ? "Password stored" : "Password missing"}</Badge>
+            <span className="text-sm text-muted-foreground">Updated {props.siebelConfig?.updated_at ? props.siebelConfig.updated_at.slice(0, 19) : "not yet"}</span>
           </div>
         </CardContent>
       </Card>

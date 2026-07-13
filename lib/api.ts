@@ -130,6 +130,9 @@ export type Assignment = {
   service_type: string;
   service_category: string;
   service_order_id: string;
+  siebel_order_number: string;
+  siebel_last_sync_at: string;
+  siebel_payload_json: string;
   service_characteristics: string;
   product_specification_id: string;
   product_specification_name: string;
@@ -276,6 +279,31 @@ export type RipeConfigPayload = {
   connection_timeout: number;
   read_timeout: number;
   default_maintainer: string;
+};
+
+export type SiebelConfig = {
+  username: string;
+  dsn: string;
+  password_configured: boolean;
+  connection_timeout: number;
+  query_sql: string;
+  updated_at: string;
+};
+
+export type SiebelConfigPayload = {
+  username: string;
+  password?: string;
+  dsn: string;
+  connection_timeout: number;
+  query_sql: string;
+};
+
+export type SiebelLookupResponse = {
+  order_number: string;
+  found: boolean;
+  assignment: Partial<AssignmentPayload>;
+  raw: Record<string, string>;
+  message: string;
 };
 
 export type RipeAllocatedPool = {
@@ -565,10 +593,16 @@ export type AssignmentPayload = {
   service_instance_name: string;
   service_type: string;
   service_category: string;
+  service_order_id: string;
+  siebel_order_number: string;
+  siebel_last_sync_at: string;
+  siebel_payload_json: string;
+  service_characteristics: string;
   product_specification_id: string;
   product_specification_name: string;
   product_offering_id: string;
   product_offering_name: string;
+  product_instance_id: string;
   customer_id: string;
   customer_name: string;
   customer_type: string;
@@ -672,6 +706,11 @@ export async function getBulkBatches() {
 
 export async function getRipeConfig() {
   const { data } = await api.get<RipeConfig>("/ripe/config");
+  return data;
+}
+
+export async function getSiebelConfig() {
+  const { data } = await api.get<SiebelConfig>("/siebel/config");
   return data;
 }
 

@@ -1693,6 +1693,10 @@ textarea {
     grid-template-columns: 220px 1fr auto;
   }
 
+  .md\:grid-cols-\[minmax\(0\2c 1fr\)_auto\] {
+    grid-template-columns: minmax(0,1fr) auto;
+  }
+
   .md\:flex-row {
     flex-direction: row;
   }

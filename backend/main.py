@@ -11,6 +11,10 @@ from pathlib import Path
 import re
 import secrets
 import sqlite3
+try:
+    import oracledb
+except ImportError:  # Optional until Siebel lookup is enabled on the server.
+    oracledb = None
 import time
 import threading
 from uuid import NAMESPACE_URL, uuid4, uuid5
@@ -145,6 +149,9 @@ class AssignmentCreate(BaseModel):
     service_type: str = "CustomerFacingService"
     service_category: str = "L3 Service"
     service_order_id: str = ""
+    siebel_order_number: str = ""
+    siebel_last_sync_at: str = ""
+    siebel_payload_json: str = ""
     service_characteristics: str = ""
     product_specification_id: str = ""
     product_specification_name: str = ""
@@ -393,6 +400,35 @@ class RipeConfigOut(BaseModel):
     updated_at: str
 
 
+class SiebelConfigUpdate(BaseModel):
+    username: str = "LIR_USER"
+    password: str = ""
+    dsn: str = "172.31.23.101:1525/SIDB"
+    connection_timeout: int = 10
+    query_sql: str = ""
+
+
+class SiebelConfigOut(BaseModel):
+    username: str
+    dsn: str
+    password_configured: bool
+    connection_timeout: int
+    query_sql: str
+    updated_at: str
+
+
+class SiebelLookupRequest(BaseModel):
+    order_number: str
+
+
+class SiebelLookupResponse(BaseModel):
+    order_number: str
+    found: bool
+    assignment: dict[str, str] = {}
+    raw: dict[str, str] = {}
+    message: str = ""
+
+
 class RipeAllocatedPool(BaseModel):
     id: str
     pool_name: str
@@ -542,6 +578,10 @@ class AssignmentDetailRecord(BaseModel):
     assignment_status_id: int = 3
     assignment_date: str
     service_id: str = ""
+    service_order_id: str = ""
+    siebel_order_number: str = ""
+    siebel_last_sync_at: str = ""
+    siebel_payload_json: str = ""
     customer_name: str = ""
     organization_name: str = ""
     organization_id: str = ""
@@ -840,6 +880,18 @@ def ripe_config_from_row(row: sqlite3.Row) -> RipeConfigOut:
     )
 
 
+def siebel_config_from_row(row: sqlite3.Row) -> SiebelConfigOut:
+    data = dict(row)
+    return SiebelConfigOut(
+        username=str(data.get("username") or "LIR_USER"),
+        dsn=str(data.get("dsn") or "172.31.23.101:1525/SIDB"),
+        password_configured=bool(data.get("encrypted_password")),
+        connection_timeout=int(data.get("connection_timeout") or 10),
+        query_sql=str(data.get("query_sql") or ""),
+        updated_at=str(data.get("updated_at") or ""),
+    )
+
+
 def ripe_api_config_from_row(row: sqlite3.Row) -> ripe_service.RipeApiConfig:
     data = dict(row)
     return ripe_service.RipeApiConfig(
@@ -1101,6 +1153,10 @@ def assignment_detail_record_for_assignment(assignment: Assignment, resource: Re
         assignment_status_id=normalize_assignment_status_id(assignment.assignment_status_id, assignment),
         assignment_date=assignment.assignment_date,
         service_id=assignment.service_id or assignment.service_instance_id,
+        service_order_id=assignment.service_order_id,
+        siebel_order_number=assignment.siebel_order_number,
+        siebel_last_sync_at=assignment.siebel_last_sync_at,
+        siebel_payload_json=assignment.siebel_payload_json,
         customer_name=assignment.customer_name,
         organization_name=assignment.organization_name or assignment.customer_name,
         organization_id=assignment.organization_id or assignment.customer_id,
@@ -1213,6 +1269,102 @@ def normalized_inventory_needs_sync(connection: sqlite3.Connection) -> bool:
         "SELECT COUNT(*) FROM ip_resources WHERE source_entity_type IN ('pool', 'assignment')"
     ).fetchone()[0]
     return source_count != resource_count
+
+
+SIEBEL_ASSIGNMENT_ALIASES: dict[str, list[str]] = {
+    "service_order_id": ["ORDER_NUM", "ORDER_NUMBER", "ORDER_ID", "SERVICE_ORDER_ID", "ORDER_REF"],
+    "logical_resource_id": ["LOGICAL_RESOURCE_ID", "RESOURCE_ID", "ASSET_INTEG_ID"],
+    "service_id": ["SERVICE_ID", "SRV_ID", "ASSET_ID", "ASSET_INTEG_ID"],
+    "service_instance_id": ["SERVICE_INSTANCE_ID", "SERVICE_ID", "ASSET_ID", "ORDER_NUM"],
+    "service_instance_name": ["SERVICE_INSTANCE_NAME", "SERVICE_NAME", "PRODUCT_NAME", "ASSET_NAME"],
+    "service_type": ["SERVICE_TYPE", "PRODUCT_TYPE"],
+    "service_category": ["SERVICE_CATEGORY", "PRODUCT_CATEGORY"],
+    "service_description": ["SERVICE_DESCRIPTION", "SERVICE_DESC", "PRODUCT_DESCRIPTION", "PRODUCT_NAME"],
+    "product_specification_id": ["PRODUCT_SPECIFICATION_ID", "PROD_SPEC_ID", "PRODUCT_ID"],
+    "product_specification_name": ["PRODUCT_SPECIFICATION_NAME", "PRODUCT_NAME", "PROD_NAME"],
+    "product_offering_id": ["PRODUCT_OFFERING_ID", "OFFER_ID"],
+    "product_offering_name": ["PRODUCT_OFFERING_NAME", "OFFER_NAME"],
+    "product_instance_id": ["PRODUCT_INSTANCE_ID", "ASSET_ID", "INSTANCE_ID"],
+    "customer_id": ["CUSTOMER_ID", "CUST_ID", "ACCOUNT_ID", "PARTY_ID"],
+    "customer_name": ["CUSTOMER_NAME", "ACCOUNT_NAME", "ORGANIZATION_NAME", "ORG_NAME", "NAME"],
+    "organization_name": ["ORGANIZATION_NAME", "ORG_NAME", "ACCOUNT_NAME", "CUSTOMER_NAME"],
+    "organization_id": ["ORGANIZATION_ID", "ORG_ID", "ACCOUNT_ID", "CUSTOMER_ID"],
+    "customer_type": ["CUSTOMER_TYPE", "ACCOUNT_TYPE"],
+    "customer_type_id": ["CUSTOMER_TYPE_ID", "CUST_TYPE_ID"],
+    "customer_account_id": ["CUSTOMER_ACCOUNT_ID", "ACCOUNT_ID", "BILL_ACCNT_ID"],
+    "customer_segment": ["CUSTOMER_SEGMENT", "SEGMENT", "MARKET_SEGMENT"],
+    "commercial_reg_id": ["COMMERCIAL_REG_ID", "CR_NUMBER", "CR_NUM", "COMM_REG_ID"],
+    "unified_number": ["UNIFIED_NUMBER", "UNIFIED_NUM", "700_NUMBER"],
+    "contact_name": ["CONTACT_NAME", "PRIMARY_CONTACT", "FULL_NAME"],
+    "contact_number": ["CONTACT_NUMBER", "CONTACT_PHONE", "MOBILE_NUMBER", "PHONE_NUMBER"],
+    "contact_email": ["CONTACT_EMAIL", "EMAIL", "EMAIL_ADDRESS"],
+    "full_name": ["FULL_NAME", "CONTACT_NAME", "PRIMARY_CONTACT"],
+    "mobile_number": ["MOBILE_NUMBER", "CONTACT_NUMBER", "CONTACT_PHONE", "PHONE_NUMBER"],
+    "id_number": ["ID_NUMBER", "NATIONAL_ID", "IQAMA_ID"],
+    "email": ["EMAIL", "EMAIL_ADDRESS", "CONTACT_EMAIL"],
+    "region": ["REGION", "REGION_NAME", "PROVINCE"],
+    "region_id": ["REGION_ID", "PROVINCE_ID"],
+    "city": ["CITY", "CITY_NAME"],
+    "city_id": ["CITY_ID"],
+    "site": ["SITE", "SITE_NAME", "LOCATION_NAME"],
+    "site_id": ["SITE_ID"],
+    "location_name": ["LOCATION_NAME", "ADDRESS", "SITE_NAME"],
+    "access_technology": ["ACCESS_TECHNOLOGY", "ACCESS_TECH", "TECHNOLOGY"],
+    "access_technology_id": ["ACCESS_TECHNOLOGY_ID", "ACCESS_TECH_ID"],
+}
+
+
+def normalized_siebel_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def serialize_siebel_value(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
+
+
+def first_siebel_value(row: dict[str, str], aliases: list[str]) -> str:
+    normalized = {normalized_siebel_key(key): value for key, value in row.items()}
+    for alias in aliases:
+        value = normalized.get(normalized_siebel_key(alias))
+        if value:
+            return value
+    return ""
+
+
+def assignment_patch_from_siebel_row(row: dict[str, str], order_number: str) -> dict[str, str]:
+    patch: dict[str, str] = {}
+    for field, aliases in SIEBEL_ASSIGNMENT_ALIASES.items():
+        value = first_siebel_value(row, aliases)
+        if value:
+            patch[field] = value
+    patch["assignment_target_type"] = "business_customer"
+    patch["service_order_id"] = patch.get("service_order_id") or order_number
+    patch["siebel_order_number"] = order_number
+    patch["siebel_last_sync_at"] = now_iso()
+    patch["siebel_payload_json"] = json.dumps(row, ensure_ascii=False)
+    patch["customer_type"] = patch.get("customer_type") or "Enterprise"
+    patch["customer_segment"] = patch.get("customer_segment") or "Enterprise"
+    patch["service_type"] = patch.get("service_type") or "CustomerFacingService"
+    patch["service_category"] = patch.get("service_category") or "L3 Service"
+    patch["l3_service"] = patch.get("l3_service") or "MPLS L3VPN"
+    patch["service"] = patch.get("service") or patch.get("service_description") or "Business IP assignment"
+    patch["owner"] = "Business Customer"
+    return patch
+
+
+def validate_siebel_query(query_sql: str) -> str:
+    query = query_sql.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Siebel query SQL is not configured")
+    if not query.lower().startswith("select"):
+        raise HTTPException(status_code=400, detail="Siebel query must be a SELECT statement")
+    if ":order_number" not in query.lower():
+        raise HTTPException(status_code=400, detail="Siebel query must include :order_number bind variable")
+    return query
 
 
 def add_missing_columns(connection: sqlite3.Connection, table: str, model: type[BaseModel]) -> None:
@@ -2035,6 +2187,16 @@ def init_db() -> None:
               updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS siebel_config (
+              id TEXT PRIMARY KEY,
+              username TEXT NOT NULL,
+              encrypted_password TEXT NOT NULL,
+              dsn TEXT NOT NULL,
+              connection_timeout INTEGER NOT NULL,
+              query_sql TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS ripe_allocated_pools (
               id TEXT PRIMARY KEY,
               pool_name TEXT NOT NULL,
@@ -2134,8 +2296,20 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_cst_scheduler_runs_started ON cst_scheduler_runs (started_at);
                     """
                 )
+        add_missing_columns(connection, "assignments", Assignment)
+        add_missing_columns(connection, "assignment_details", AssignmentDetailRecord)
         add_missing_columns(connection, "cst_config", CstConfig)
         migrate_legacy_cst_transaction_ids(connection)
+
+        siebel_config_count = connection.execute("SELECT COUNT(*) FROM siebel_config").fetchone()[0]
+        if siebel_config_count == 0:
+            connection.execute(
+                """
+                INSERT INTO siebel_config (id, username, encrypted_password, dsn, connection_timeout, query_sql, updated_at)
+                VALUES ('default', 'LIR_USER', '', '172.31.23.101:1525/SIDB', 10, '', ?)
+                """,
+                (now_iso(),),
+            )
 
         cst_config_count = connection.execute("SELECT COUNT(*) FROM cst_config").fetchone()[0]
         if cst_config_count == 0:
@@ -2868,6 +3042,80 @@ def update_user_password(user_id: str, payload: PasswordUpdate) -> UserOut:
             raise HTTPException(status_code=404, detail="User not found")
         row = connection.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
     return user_from_row(row)
+
+
+@app.get("/siebel/config", response_model=SiebelConfigOut)
+def get_siebel_config() -> SiebelConfigOut:
+    with connect() as connection:
+        row = connection.execute("SELECT * FROM siebel_config WHERE id = 'default'").fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Siebel configuration not initialized")
+    return siebel_config_from_row(row)
+
+
+@app.put("/siebel/config", response_model=SiebelConfigOut)
+def update_siebel_config(payload: SiebelConfigUpdate) -> SiebelConfigOut:
+    if payload.connection_timeout <= 0:
+        raise HTTPException(status_code=400, detail="Connection timeout must be greater than zero")
+    if payload.query_sql.strip():
+        validate_siebel_query(payload.query_sql)
+    with connect() as connection:
+        existing = connection.execute("SELECT * FROM siebel_config WHERE id = 'default'").fetchone()
+        encrypted_password = encrypt_secret(payload.password) if payload.password else (existing["encrypted_password"] if existing else "")
+        connection.execute(
+            """
+            INSERT INTO siebel_config (id, username, encrypted_password, dsn, connection_timeout, query_sql, updated_at)
+            VALUES ('default', ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              username = excluded.username,
+              encrypted_password = excluded.encrypted_password,
+              dsn = excluded.dsn,
+              connection_timeout = excluded.connection_timeout,
+              query_sql = excluded.query_sql,
+              updated_at = excluded.updated_at
+            """,
+            (payload.username, encrypted_password, payload.dsn, payload.connection_timeout, payload.query_sql.strip(), now_iso()),
+        )
+        row = connection.execute("SELECT * FROM siebel_config WHERE id = 'default'").fetchone()
+        record_audit(connection, "Siebel Configuration Updated", "siebel_config", "default", "", siebel_config_from_row(row).model_dump_json())
+    return siebel_config_from_row(row)
+
+
+@app.post("/siebel/business-customer", response_model=SiebelLookupResponse)
+def lookup_siebel_business_customer(payload: SiebelLookupRequest) -> SiebelLookupResponse:
+    order_number = payload.order_number.strip()
+    if not order_number:
+        raise HTTPException(status_code=400, detail="Order number is required")
+    if oracledb is None:
+        raise HTTPException(status_code=503, detail="Python package oracledb is not installed on the API server")
+    with connect() as connection:
+        config = connection.execute("SELECT * FROM siebel_config WHERE id = 'default'").fetchone()
+    if config is None:
+        raise HTTPException(status_code=404, detail="Siebel configuration not initialized")
+    encrypted_password = str(config["encrypted_password"] or "")
+    if not encrypted_password:
+        raise HTTPException(status_code=400, detail="Siebel password is not configured")
+    query = validate_siebel_query(str(config["query_sql"] or ""))
+    try:
+        siebel_connection = oracledb.connect(
+            user=str(config["username"] or "LIR_USER"),
+            password=decrypt_secret(encrypted_password),
+            dsn=str(config["dsn"] or "172.31.23.101:1525/SIDB"),
+        )
+        siebel_connection.call_timeout = int(config["connection_timeout"] or 10) * 1000
+        with siebel_connection:
+            cursor = siebel_connection.cursor()
+            cursor.execute(query, order_number=order_number)
+            row = cursor.fetchone()
+            if row is None:
+                return SiebelLookupResponse(order_number=order_number, found=False, message="No Siebel customer details found for this order number")
+            columns = [str(column[0]) for column in cursor.description]
+            raw = {column: serialize_siebel_value(value) for column, value in zip(columns, row)}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Siebel lookup failed: {exc}") from exc
+    return SiebelLookupResponse(order_number=order_number, found=True, assignment=assignment_patch_from_siebel_row(raw, order_number), raw=raw, message="Siebel customer details fetched")
 
 
 @app.get("/ripe/config", response_model=RipeConfigOut)
