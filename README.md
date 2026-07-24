@@ -1,4 +1,8 @@
-# NetAtlas IPAM
+﻿# NetAtlas IPAM
+
+## Full Salam LIR Documentation
+
+See [docs/SALAM_LIR_DOCUMENTATION.md](docs/SALAM_LIR_DOCUMENTATION.md) for the full system documentation, including architecture, BSS/Siebel delta sync, CST sync, RIPE workflows, database notes, deployment, and operations runbooks.
 
 Next.js / React application for IP address management, backed by FastAPI and SQLite.
 
@@ -384,3 +388,4 @@ sudo systemctl start ipam-api
 ```
 
 For redeployment, copy the new code to `/opt/netatlas-ipam`, keep `backend/ipam.db`, run `npm ci`, rebuild with `NEXT_PUBLIC_API_URL=/api`, run `m.init_db()` once, then restart both services.
+

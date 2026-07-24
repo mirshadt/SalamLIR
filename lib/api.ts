@@ -131,7 +131,10 @@ export type Assignment = {
   service_category: string;
   service_order_id: string;
   siebel_order_number: string;
+  bss_customer_id: string;
   siebel_last_sync_at: string;
+  siebel_last_checked_at: string;
+  siebel_payload_hash: string;
   siebel_payload_json: string;
   service_characteristics: string;
   product_specification_id: string;
@@ -298,11 +301,39 @@ export type SiebelConfigPayload = {
   query_sql: string;
 };
 
+export type SiebelConnectionTestResponse = {
+  success: boolean;
+  message: string;
+  dsn: string;
+  tested_at: string;
+};
 export type SiebelLookupResponse = {
+  service_id: string;
   order_number: string;
   found: boolean;
   assignment: Partial<AssignmentPayload>;
   raw: Record<string, string>;
+  message: string;
+};
+
+export type BssSyncAuditRecord = {
+  id: string;
+  assignment_id: string;
+  service_id: string;
+  siebel_order_number: string;
+  changed_field: string;
+  old_value: string;
+  new_value: string;
+  synced_at: string;
+  status: string;
+};
+
+export type BssDeltaSyncResponse = {
+  checked: number;
+  updated: number;
+  unchanged: number;
+  failed: number;
+  audit: BssSyncAuditRecord[];
   message: string;
 };
 
@@ -374,6 +405,26 @@ export type CstConfig = {
   service_provider_id: string;
   auto_execute: boolean;
   scheduled_sync_enabled: boolean;
+  integration_mode: "Real API";
+  host: string;
+  port: number;
+  base_url: string;
+  token_path: string;
+  send_path: string;
+  update_path: string;
+  delete_path: string;
+  get_path: string;
+  auth_username: string;
+  accept_language: "EN" | "AR" | string;
+  auth_password_configured: boolean;
+  api_access_key_configured: boolean;
+  user_key_configured: boolean;
+  verify_ssl: boolean;
+  connection_timeout: number;
+  read_timeout: number;
+  token_refresh_buffer_seconds: number;
+  token_expires_at: string;
+  token_cached: boolean;
   schedule_time: string;
   schedule_timezone: string;
   last_scheduled_run_date: string;
@@ -383,7 +434,19 @@ export type CstConfig = {
   updated_at: string;
 };
 
-export type CstConfigPayload = Partial<Pick<CstConfig, "enabled" | "service_provider_id" | "auto_execute" | "scheduled_sync_enabled" | "schedule_time" | "schedule_timezone" | "batch_size_limit" | "hourly_request_limit">>;
+export type CstConfigPayload = Partial<Pick<CstConfig, "enabled" | "service_provider_id" | "auto_execute" | "scheduled_sync_enabled" | "integration_mode" | "host" | "port" | "base_url" | "token_path" | "send_path" | "update_path" | "delete_path" | "get_path" | "auth_username" | "accept_language" | "verify_ssl" | "connection_timeout" | "read_timeout" | "token_refresh_buffer_seconds" | "schedule_time" | "schedule_timezone" | "batch_size_limit" | "hourly_request_limit">> & {
+  auth_password?: string;
+  api_access_key?: string;
+  user_key?: string;
+};
+
+export type CstConnectionTestResponse = {
+  success: boolean;
+  message: string;
+  token_path: string;
+  token_expires_at: string;
+  tested_at: string;
+};
 
 export type CstSyncSummary = {
   enabled: boolean;
@@ -497,6 +560,8 @@ export type ResourceRecord = {
   customer_type_id: string;
   region_id: string;
   city_id: string;
+  city: string;
+  region: string;
   full_name: string;
   mobile_number: string;
   id_number: string;
@@ -595,7 +660,10 @@ export type AssignmentPayload = {
   service_category: string;
   service_order_id: string;
   siebel_order_number: string;
+  bss_customer_id: string;
   siebel_last_sync_at: string;
+  siebel_last_checked_at: string;
+  siebel_payload_hash: string;
   siebel_payload_json: string;
   service_characteristics: string;
   product_specification_id: string;
@@ -714,6 +782,10 @@ export async function getSiebelConfig() {
   return data;
 }
 
+export async function testSiebelConnection() {
+  const { data } = await api.post<SiebelConnectionTestResponse>("/siebel/config/test-connection");
+  return data;
+}
 export async function getRipeAllocatedPools() {
   const { data } = await api.get<RipeAllocatedPool[]>("/ripe/allocated-pools");
   return data;
@@ -726,6 +798,11 @@ export async function getCstConfig() {
 
 export async function updateCstConfig(payload: CstConfigPayload) {
   const { data } = await api.put<CstConfig>("/cst/config", payload);
+  return data;
+}
+
+export async function testCstConnection() {
+  const { data } = await api.post<CstConnectionTestResponse>("/cst/config/test-token");
   return data;
 }
 
@@ -778,7 +855,3 @@ export async function retryFailedCstBatch(batchId: string) {
   const { data } = await api.post<CstSyncJob[]>(`/cst/batches/${batchId}/retry-failed`);
   return data;
 }
-
-
-
-

@@ -43,10 +43,12 @@ import {
   AssignmentStatus,
   AuditEvent,
   bootstrapCurrentCstResources,
+  BssDeltaSyncResponse,
   BulkBatch,
   BulkResult,
   Conflict,
   CstConfig,
+  CstConfigPayload,
   CstSyncBatch,
   CstSyncJob,
   CstSyncSummary,
@@ -85,6 +87,8 @@ import {
   retryFailedCstBatch,
   runCstDayMinusOneSync,
   updateCstConfig,
+  testCstConnection,
+  testSiebelConnection,
   reconcileCstResources,
   User
 } from "@/lib/api";
@@ -99,6 +103,47 @@ import { Input } from "@/components/ui/input";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Textarea } from "@/components/ui/textarea";
 
+const DEFAULT_SIEBEL_QUERY = `SELECT
+  sa.serial_num,
+  sa.*,
+  sa.status_cd sid_status,
+  sp.name product_name,
+  org.division_count account_number,
+  org.name account_name,
+  org.main_email_addr,
+  org.main_ph_num,
+  org.x_itc_b2b_arabic_name,
+  org.x_itc_b2b_commercial_regis_num,
+  org.x_itc_b2b_unified_number,
+  org.x_itc_b2b_ap_identity_id,
+  org.x_itc_b2b_ap_name,
+  org.ou_type_cd,
+  org.x_itc_acnt_sector,
+  org.region account_region,
+  con.cell_ph_num con_phone_num,
+  con.email_addr con_email,
+  con.per_title,
+  con.fst_name,
+  con.last_name,
+  conx.attrib_36 contact_id_type,
+  conx.attrib_37 contact_id_num,
+  addr.addr_name,
+  addr.city,
+  addr.country
+FROM
+  siebel.s_asset sa,
+  siebel.s_prod_int sp,
+  siebel.s_org_ext org,
+  siebel.s_contact con,
+  siebel.s_contact_x conx,
+  siebel.s_addr_per addr
+WHERE 1 = 1
+  AND org.pr_addr_id = addr.row_id
+  AND con.row_id = conx.row_id
+  AND org.pr_con_id = con.row_id
+  AND sa.prod_id = sp.row_id
+  AND sa.serv_acct_id = org.row_id
+  AND sa.serial_num LIKE :service_id`;
 type ViewKey =
   | "executive"
   | "registry"
@@ -408,7 +453,7 @@ const pendingBssBusinessDefaults: Partial<AssignmentPayload> = {
 };
 
 const businessBssFields: AssignmentFieldDefinition[] = [
-  { key: "service_id", label: "serviceId", placeholder: "BSS service identifier", required: true },
+  { key: "bss_customer_id", label: "bssCustomerId", placeholder: "Auto sync from BSS after assignment", disabled: true },
   { key: "customer_type_id", label: "customerTypeId", placeholder: "Select customer type", required: true, options: customerTypeOptions },
   { key: "service_description", label: "serviceDescription", placeholder: "Auto-populated based on Assigned to" },
   { key: "organization_name", label: "organizationName", placeholder: "Auto sync from BSS after assignment", disabled: true },
@@ -480,7 +525,10 @@ const emptyAssignment: AssignmentPayload = {
   service_category: "IP Address Resource",
   service_order_id: "",
   siebel_order_number: "",
+  bss_customer_id: "",
   siebel_last_sync_at: "",
+  siebel_last_checked_at: "",
+  siebel_payload_hash: "",
   siebel_payload_json: "",
   service_characteristics: "",
   product_specification_id: "",
@@ -732,6 +780,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [globalSearch, setGlobalSearch] = useState("");
   const [globalSearchFilters, setGlobalSearchFilters] = useState<SearchFilterCriterion[]>([]);
+  const [activeRegistryPanel, setActiveRegistryPanel] = useState<RegistryPanelId>("subnet-navigator");
   const [poolForm, setPoolForm] = useState({ cidr: "10.24.0.0/16", name: "Private IPv4 Allocation", region: "Riyadh", description: "Private allocation registered locally. Public allocations are synchronized from RIPE." });
   const [assignmentForm, setAssignmentForm] = useState<AssignmentPayload>({ ...emptyAssignment, cidr: "", customer_name: "", assignment_date: today() });
   const [poolAssignmentDraft, setPoolAssignmentDraft] = useState<PoolAssignmentDraft>({ selectionMode: "subnet", parentPoolId: "", poolSearch: "", startIp: "", endIp: "", prefix: "24" });
@@ -741,7 +790,27 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   const [bulkPoolCsv, setBulkPoolCsv] = useState("StartIP,EndIP,Total\n10.24.0.0,10.24.255.255,65536");
   const [bulkAssignmentCsv, setBulkAssignmentCsv] = useState("cidr,size,status,assignmentDate,customerName,serviceId,serviceDescription\n5.42.224.0/24,256,3,2026-06-03,Example Enterprise,SVC-10001,Enterprise L3 service");
   const [ripeConfigForm, setRipeConfigForm] = useState<RipeConfigPayload>({ base_url: "https://rest.db.ripe.net", auth_type: "Basic Authentication", username: "", password: "", connection_timeout: 10, read_timeout: 30, default_maintainer: "ITC-NOC-MNT" });
-  const [siebelConfigForm, setSiebelConfigForm] = useState<SiebelConfigPayload>({ username: "LIR_USER", password: "", dsn: "172.31.23.101:1525/SIDB", connection_timeout: 10, query_sql: "" });
+  const [siebelConfigForm, setSiebelConfigForm] = useState<SiebelConfigPayload>({ username: "LIR_USER", password: "", dsn: "172.31.23.101:1525/SIDB", connection_timeout: 10, query_sql: DEFAULT_SIEBEL_QUERY });
+  const [cstConfigForm, setCstConfigForm] = useState<CstConfigPayload>({
+    integration_mode: "Real API",
+    host: "cst-oa-unified-gw-stg-fop.apps.apldev-sit-opshift.itc.local",
+    port: 443,
+    base_url: "https://cst-oa-unified-gw-stg-fop.apps.apldev-sit-opshift.itc.local:443",
+    token_path: "/api/rest/v1.0/OAuthToken",
+    send_path: "/api/rest/v1.0/LIRDataService/SendLIRData",
+    update_path: "/api/rest/v1.0/LIRDataService/UpdateLIRData",
+    delete_path: "/api/rest/v1.0/LIRDataService/DeleteLIRData",
+    get_path: "/api/rest/v1.0/LIRDataService/GetLIRData",
+    auth_username: "",
+    accept_language: "EN",
+    auth_password: "",
+    api_access_key: "",
+    user_key: "",
+    verify_ssl: false,
+    connection_timeout: 10,
+    read_timeout: 30,
+    token_refresh_buffer_seconds: 300
+  });
   const [ripePoolCsv, setRipePoolCsv] = useState("pool_name,cidr,allocation_type,source,created_date\nRIPE Allocation 5.42.224.0,5.42.224.0/19,RIPE Allocated Pool,RIPE Database,2026-06-01");
   const [ripeReportForm, setRipeReportForm] = useState({ dateFrom: "", dateTo: "", reportType: "RIPE Assignment Report" });
   const [ripeReportResult, setRipeReportResult] = useState<RipeReportResponse | null>(null);
@@ -830,9 +899,35 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
       password: "",
       dsn: siebelConfig.dsn,
       connection_timeout: siebelConfig.connection_timeout,
-      query_sql: siebelConfig.query_sql
+      query_sql: siebelConfig.query_sql || DEFAULT_SIEBEL_QUERY
     });
   }, [siebelConfig]);
+
+  useEffect(() => {
+    if (!cstConfig) {
+      return;
+    }
+    setCstConfigForm({
+      integration_mode: cstConfig.integration_mode,
+      host: cstConfig.host,
+      port: cstConfig.port,
+      base_url: cstConfig.base_url,
+      token_path: cstConfig.token_path,
+      send_path: cstConfig.send_path,
+      update_path: cstConfig.update_path,
+      delete_path: cstConfig.delete_path,
+      get_path: cstConfig.get_path,
+      auth_username: cstConfig.auth_username,
+      accept_language: cstConfig.accept_language,
+      auth_password: "",
+      api_access_key: "",
+      user_key: "",
+      verify_ssl: false,
+      connection_timeout: cstConfig.connection_timeout,
+      read_timeout: cstConfig.read_timeout,
+      token_refresh_buffer_seconds: cstConfig.token_refresh_buffer_seconds
+    });
+  }, [cstConfig]);
 
   useEffect(() => {
     const applyRoute = () => {
@@ -920,7 +1015,12 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   });
 
   const run = (operation: () => Promise<unknown>) => mutation.mutate(operation);
-  const navigateTo = (nextView: ViewKey) => setView(nextView);
+  const navigateTo = (nextView: ViewKey, registryPanel?: RegistryPanelId) => {
+    if (registryPanel) {
+      setActiveRegistryPanel(registryPanel);
+    }
+    setView(nextView);
+  };
   const openResource = (resource: ManagedResource) => {
     setSelectedResourceId(resource.id);
     setView("summary");
@@ -1006,8 +1106,10 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
               <ResourceRegistry
                 resources={resources}
                 expanded={expanded}
+                activePanel={activeRegistryPanel}
                 globalSearch={globalSearch}
                 poolForm={poolForm}
+                onActivePanel={setActiveRegistryPanel}
                 onExpanded={setExpanded}
                 onGlobalSearch={setGlobalSearch}
                 onPoolForm={setPoolForm}
@@ -1035,11 +1137,11 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                 }}
                 onBootstrapCst={() => run(async () => {
                   const jobs = await bootstrapCurrentCstResources();
-                  setNotice({ title: "CST Migration Jobs Created", detail: `${jobs.length} local CST transaction job(s) stored. No external CST API call was made.` });
+                  setNotice({ title: "CST Migration Sent to CST", detail: `${jobs.length} CST transaction job(s) created and sent to the real CST API where data quality passed.` });
                 })}
                 onReconcileCst={() => run(async () => {
                   const jobs = await reconcileCstResources();
-                  setNotice({ title: "CST Reconciliation Queued", detail: `${jobs.length} local GET job(s) stored for reconciliation. No external CST API call was made.` });
+                  setNotice({ title: "CST GetLIR Sent", detail: `${jobs.length} provider-wide GetLIR API job(s) created. GetLIR pulls CST data using pageNumber/pageSize, not per-subnet filtering.` });
                 })}
                 onRunCstDayMinusOne={() => run(async () => {
                   const result = await runCstDayMinusOneSync();
@@ -1047,11 +1149,11 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                 })}
                 onRetryCstJob={(job) => run(async () => {
                   await retryCstJob(job.id);
-                  setNotice({ title: "CST Job Retried", detail: `${job.id} was reprocessed in local temporary storage.` });
+                  setNotice({ title: "CST Job Retried", detail: `${job.id} was retried against the real CST API.` });
                 })}
                 onRetryCstBatch={(batch) => run(async () => {
                   const jobs = await retryFailedCstBatch(batch.id);
-                  setNotice({ title: "CST Batch Retry", detail: `${jobs.length} pending/failed job(s) reprocessed in local temporary storage.` });
+                  setNotice({ title: "CST Batch Retry", detail: `${jobs.length} pending/failed job(s) retried against the real CST API.` });
                 })}
                 onToggleCstEnabled={(enabled) => run(async () => { await updateCstConfig({ enabled }); })}
                 onToggleCstAutoExecute={(auto_execute) => run(async () => { await updateCstConfig({ auto_execute }); })}
@@ -1151,13 +1253,17 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                     title: resource.administrativeStatus === "RESERVED" ? "Remove reservation" : "Release assignment",
                     detail: resource.administrativeStatus === "RESERVED"
                       ? `Move ${resource.cidr} back to AVAILABLE?`
-                      : ["SUCCESS", "SYNCHRONIZED", "DECOMMISSION_PENDING"].includes(resource.ripeSyncStatus) ? `Move ${resource.cidr} to RIPE removal pending? The subnet can be deleted after the RIPE unassignment is completed.` : `Retire ${resource.cidr} locally? This assignment was not synced to RIPE, so no RIPE removal is required.`,
+                      : ["SUCCESS", "SYNCHRONIZED", "DECOMMISSION_PENDING"].includes(resource.ripeSyncStatus) ? `Move ${resource.cidr} to RIPE removal pending? CST DeleteLIRData will be sent now if this assignment was reported to CST.` : `Unassign ${resource.cidr} locally? If it was reported to CST, DeleteLIRData will be sent first; if never reported, no CST delete is required.`,
                     destructive: true,
                     action: () => run(async () => {
                       if (resource.administrativeStatus === "RESERVED") {
                         await api.delete(`/assignments/${source.id}`);
                       } else {
-                        await api.patch(`/assignments/${source.id}/status`, { status: "Retiring" });
+                        if (["SUCCESS", "SYNCHRONIZED", "DECOMMISSION_PENDING"].includes(resource.ripeSyncStatus)) {
+                          await api.patch(`/assignments/${source.id}/status`, { status: "Retiring" });
+                        } else {
+                          await api.delete(`/assignments/${source.id}`);
+                        }
                       }
                     })
                   });
@@ -1297,24 +1403,36 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                 })}
                 onRelease={(assignment) => setConfirm({
                   title: "Release assignment",
-                  detail: ["SUCCESS", "SYNCHRONIZED", "DECOMMISSION_PENDING"].includes(String(assignment.ripe_sync_status || "").toUpperCase()) ? `Move ${assignment.cidr} to RIPE removal pending? The subnet can be deleted after the RIPE unassignment is completed.` : `Retire ${assignment.cidr} locally? This assignment was not synced to RIPE, so no RIPE removal is required.`,
+                  detail: ["SUCCESS", "SYNCHRONIZED", "DECOMMISSION_PENDING"].includes(String(assignment.ripe_sync_status || "").toUpperCase()) ? `Move ${assignment.cidr} to RIPE removal pending? CST DeleteLIRData will be sent now if this assignment was reported to CST.` : `Unassign ${assignment.cidr} locally? If it was reported to CST, DeleteLIRData will be sent first; if never reported, no CST delete is required.`,
                   destructive: true,
-                  action: () => run(async () => { await api.patch(`/assignments/${assignment.id}/status`, { status: "Retiring" }); })
+                  action: () => run(async () => {
+                    if (["SUCCESS", "SYNCHRONIZED", "DECOMMISSION_PENDING"].includes(String(assignment.ripe_sync_status || "").toUpperCase())) {
+                      await api.patch(`/assignments/${assignment.id}/status`, { status: "Retiring" });
+                    } else {
+                      await api.delete(`/assignments/${assignment.id}`);
+                    }
+                  })
                 })}
                 onStatus={(assignment, status) => run(async () => { await api.patch(`/assignments/${assignment.id}/status`, { status }); })}
-                onLookupSiebelOrder={(orderNumber) => run(async () => {
-                  const { data } = await api.post<SiebelLookupResponse>("/siebel/business-customer", { order_number: orderNumber });
+                onRefreshSiebelAssignment={(assignment) => run(async () => {
+                  const { data } = await api.post<BssDeltaSyncResponse>(`/assignments/${assignment.id}/siebel-refresh`);
+                  void assignmentsQuery.refetch();
+                  void poolsQuery.refetch();
+                  setNotice({ title: "BSS Delta Sync", detail: `${data.message}: ${data.updated} updated, ${data.unchanged} unchanged, ${data.failed} failed.` });
+                })}
+                onLookupSiebelService={(serviceId) => run(async () => {
+                  const { data } = await api.post<SiebelLookupResponse>("/siebel/business-customer", { service_id: serviceId });
                   if (!data.found) {
-                    setNotice({ title: "Siebel Lookup", detail: data.message || `No details found for order ${orderNumber}.` });
+                    setNotice({ title: "Siebel Lookup", detail: data.message || `No details found for service ID ${serviceId}.` });
                     return;
                   }
                   setAssignmentForm((current) => ({
                     ...current,
                     ...data.assignment,
                     assignment_target_type: "business_customer",
-                    service_order_id: data.assignment.service_order_id || orderNumber
+                    service_id: data.assignment.service_id || serviceId
                   }));
-                  setNotice({ title: "Siebel Details Loaded", detail: `Business customer details were populated for order ${orderNumber}.` });
+                  setNotice({ title: "Siebel Details Loaded", detail: `Business customer details were populated for service ID ${serviceId}.` });
                 })}
               />
             ) : null}
@@ -1431,18 +1549,41 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                 ripeConfigForm={ripeConfigForm}
                 siebelConfig={siebelConfig}
                 siebelConfigForm={siebelConfigForm}
+                cstConfig={cstConfig}
+                cstConfigForm={cstConfigForm}
                 ripePoolCsv={ripePoolCsv}
                 ripeAllocatedPools={ripeAllocatedPools}
                 onNewUser={setNewUser}
                 onPasswordReset={setPasswordReset}
                 onRipeConfigForm={setRipeConfigForm}
                 onSiebelConfigForm={setSiebelConfigForm}
+                onCstConfigForm={setCstConfigForm}
                 onRipePoolCsv={setRipePoolCsv}
                 onAddUser={() => run(async () => { await api.post("/users", newUser); setNewUser({ username: "", password: "", role: "operator" }); })}
                 onSetPassword={() => run(async () => { await api.patch(`/users/${passwordReset.userId}/password`, { password: passwordReset.password }); setPasswordReset((current) => ({ ...current, password: "" })); })}
                 onToggleUser={(user) => run(async () => { await api.patch(`/users/${user.id}/status`, { status: user.status === "Active" ? "Disabled" : "Active" }); })}
                 onSaveRipeConfig={() => run(async () => { await api.put("/ripe/config", ripeConfigForm); })}
                 onSaveSiebelConfig={() => run(async () => { await api.put("/siebel/config", siebelConfigForm); void siebelConfigQuery.refetch(); })}
+                onTestSiebelConnection={() => run(async () => {
+                  await api.put("/siebel/config", siebelConfigForm);
+                  const result = await testSiebelConnection();
+                  void siebelConfigQuery.refetch();
+                  setNotice({ title: "Siebel Test Succeeded", detail: `${result.message}\nDSN: ${result.dsn}\nTested: ${result.tested_at.slice(0, 19)}` });
+                })}
+                onSaveCstConfig={() => run(async () => { await updateCstConfig(cstConfigForm); void cstConfigQuery.refetch(); })}
+                onTestCstConnection={() => run(async () => {
+                  await updateCstConfig(cstConfigForm);
+                  const result = await testCstConnection();
+                  void cstConfigQuery.refetch();
+                  setNotice({ title: "CST Token Test Succeeded", detail: `${result.message}\nPath: ${result.token_path}\nToken expires: ${result.token_expires_at ? result.token_expires_at.slice(0, 19) : "not returned"}` });
+                })}
+                onRunSiebelDeltaSync={() => run(async () => {
+                  const { data } = await api.post<BssDeltaSyncResponse>("/siebel/delta-sync");
+                  void assignmentsQuery.refetch();
+                  void poolsQuery.refetch();
+                  void auditQuery.refetch();
+                  setNotice({ title: "BSS Delta Sync", detail: `Checked ${data.checked}. Updated ${data.updated}, unchanged ${data.unchanged}, failed ${data.failed}.` });
+                })}
                 onImportRipePools={() => run(async () => {
                   const { data } = await api.post("/ripe/allocated-pools/bulk", { csv_text: ripePoolCsv, file_name: "ripe-allocated-pools.csv" });
                   setNotice({ title: "RIPE Allocated Pools Imported", detail: `${data.imported} imported, ${data.blocked} blocked.${data.errors?.length ? `\n${data.errors.slice(0, 8).join("\n")}` : ""}` });
@@ -1524,7 +1665,7 @@ function ExecutiveDashboard({
   resources: ManagedResource[];
   cstSummary: CstSyncSummary | null;
   currentRole: User["role"];
-  onNavigate: (view: ViewKey) => void;
+  onNavigate: (view: ViewKey, registryPanel?: RegistryPanelId) => void;
 }) {
   const assignedIps = resources
     .filter((resource) => resource.administrativeStatus === "ASSIGNED")
@@ -1539,15 +1680,16 @@ function ExecutiveDashboard({
     accent: string;
     icon: React.ReactNode;
     view: ViewKey;
+    registryPanel?: RegistryPanelId;
     adminOnly?: boolean;
   }> = [
-    { title: "Resource Registry", detail: "Browse allocated pools, child pools, available blocks, assignments, and RIPE-discovered roots.", status: `${stats.totalPools} registered subnets`, accent: "cyan", icon: <Database className="h-5 w-5" />, view: "registry" },
+    { title: "Resource Registry", detail: "Browse allocated pools, child pools, available blocks, assignments, and RIPE-discovered roots.", status: `${stats.totalPools} registered subnets`, accent: "cyan", icon: <Database className="h-5 w-5" />, view: "registry", registryPanel: "subnet-navigator" },
     { title: "Assignment Management", detail: "Assign, reserve, release, and retire customer or internal subnet resources.", status: `${stats.totalAssignments} active assignments`, accent: "green", icon: <Users className="h-5 w-5" />, view: "assignments" },
     { title: "Global Search", detail: "Find resources by CIDR, UUID, transaction ID, owner, netname, or status.", status: "CIDR and transaction lookup", accent: "slate", icon: <Search className="h-5 w-5" />, view: "search" },
-    { title: "RIPE Discovery", detail: "Discover RIPE root pools maintained by Salam and sync them into the local LIR registry.", status: "Maintainer discovery", accent: "blue", icon: <Radar className="h-5 w-5" />, view: "registry" },
-    { title: "RIPE Sync Worklist", detail: "Review pending RIPE create/delete work items, failures, and retry actions.", status: `${ripePending} pending or failed`, accent: ripePending ? "amber" : "green", icon: <ListTree className="h-5 w-5" />, view: "registry" },
+    { title: "RIPE Discovery", detail: "Discover RIPE root pools maintained by Salam and sync them into the local LIR registry.", status: "Maintainer discovery", accent: "blue", icon: <Radar className="h-5 w-5" />, view: "registry", registryPanel: "lir-discovery" },
+    { title: "RIPE Sync Worklist", detail: "Review pending RIPE create/delete work items, failures, and retry actions.", status: `${ripePending} pending or failed`, accent: ripePending ? "amber" : "green", icon: <ListTree className="h-5 w-5" />, view: "registry", registryPanel: "ripe-worklist" },
     { title: "Reporting", detail: "Run RIPE Assignment, CST/LIR registry, utilization, and subnet summary exports.", status: "CSV and XLSX exports", accent: "cyan", icon: <FileDown className="h-5 w-5" />, view: "reports" },
-    { title: "CST Sync Monitor", detail: "Monitor transaction jobs, daily schedule, retries, batches, and ledger status.", status: `${cstPending} pending jobs`, accent: cstPending ? "violet" : "green", icon: <Network className="h-5 w-5" />, view: "registry" },
+    { title: "CST Sync Monitor", detail: "Monitor transaction jobs, daily schedule, retries, batches, and ledger status.", status: `${cstPending} pending jobs`, accent: cstPending ? "violet" : "green", icon: <Network className="h-5 w-5" />, view: "registry", registryPanel: "cst-sync-monitor" },
     { title: "Integrity & Conflicts", detail: "Investigate overlaps, orphan resources, duplicates, and registry consistency issues.", status: `${criticalConflicts} issues`, accent: criticalConflicts ? "red" : "green", icon: <AlertTriangle className="h-5 w-5" />, view: "integrity" },
     { title: "Administration", detail: "Manage users, RIPE settings, CST controls, policies, and integration configuration.", status: "Admin controls", accent: "slate", icon: <Shield className="h-5 w-5" />, view: "administration", adminOnly: true }
   ];
@@ -1571,7 +1713,7 @@ function ExecutiveDashboard({
         </div>
         <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
           {workflowTiles.map((tile) => (
-            <HomeWorkflowTile key={tile.title} {...tile} onOpen={() => onNavigate(tile.view)} />
+            <HomeWorkflowTile key={tile.title} {...tile} onOpen={() => onNavigate(tile.view, tile.registryPanel)} />
           ))}
         </div>
       </section>
@@ -1656,6 +1798,7 @@ type RegistryPanelId = "register" | "lir-discovery" | "ripe-worklist" | "cst-syn
 
 function ResourceRegistry(props: {
   resources: ManagedResource[];
+  activePanel: RegistryPanelId;
   expanded: Record<string, boolean>;
   globalSearch: string;
   poolForm: { cidr: string; name: string; region: string; description: string };
@@ -1663,6 +1806,7 @@ function ResourceRegistry(props: {
   ripeDiscoveryStatus: "idle" | "running" | "complete";
   ripeDiscoveryActionKey: string;
   ripePushResourceId: string;
+  onActivePanel: (panel: RegistryPanelId) => void;
   onExpanded: (value: Record<string, boolean>) => void;
   onGlobalSearch: (value: string) => void;
   onPoolForm: (value: { cidr: string; name: string; region: string; description: string }) => void;
@@ -1675,7 +1819,7 @@ function ResourceRegistry(props: {
   onPushToRipe: (resource: ManagedResource) => void;
 } & CstMonitorProps) {
   const visible = filterResources(presentationResources(props.resources), props.globalSearch);
-  const [activeRegistryPanel, setActiveRegistryPanel] = useState<RegistryPanelId>("subnet-navigator");
+  const activeRegistryPanel = props.activePanel;
   const registryPanels: Array<{ id: RegistryPanelId; label: string; icon: React.ReactNode; disabled?: boolean }> = [
     { id: "lir-discovery", label: "RIPE Discovery", icon: <Radar className="h-6 w-6" /> },
     { id: "ripe-worklist", label: "RIPE Worklist", icon: <ListTree className="h-6 w-6" /> },
@@ -1694,7 +1838,7 @@ function ResourceRegistry(props: {
             disabled={panel.disabled}
             icon={panel.icon}
             label={panel.label}
-            onClick={() => setActiveRegistryPanel(panel.id)}
+            onClick={() => props.onActivePanel(panel.id)}
           />
         ))}
       </div>
@@ -2381,7 +2525,8 @@ function AssignmentManagement(props: {
   onAssign: () => void;
   onRelease: (assignment: Assignment) => void;
   onStatus: (assignment: Assignment, status: AssignmentStatus) => void;
-  onLookupSiebelOrder: (orderNumber: string) => void;
+  onRefreshSiebelAssignment: (assignment: Assignment) => void;
+  onLookupSiebelService: (serviceId: string) => void;
 }) {
   const available = presentationResources(props.resources).filter((resource) => resource.administrativeStatus === "AVAILABLE" && resource.type === "Subnet");
   const parentPoolMatches = filterResources(available, props.poolDraft.poolSearch);
@@ -2487,14 +2632,14 @@ function AssignmentManagement(props: {
                 {targetType === "business_customer" ? (
                   <div className="grid gap-3 rounded-md border bg-background/40 p-3 md:grid-cols-[minmax(0,1fr)_auto]">
                     <label className="grid gap-1">
-                      <span className="text-xs font-medium text-muted-foreground">Siebel order number</span>
-                      <Input value={props.form.service_order_id} onChange={(event) => update("service_order_id", event.target.value)} placeholder="Order number" />
+                      <span className="text-xs font-medium text-muted-foreground">BSS service ID</span>
+                      <Input value={props.form.service_id} onChange={(event) => update("service_id", event.target.value)} placeholder="Service ID" />
                     </label>
-                    <Button variant="secondary" onClick={() => props.onLookupSiebelOrder(props.form.service_order_id)} disabled={!props.form.service_order_id.trim()}>
+                    <Button variant="secondary" onClick={() => props.onLookupSiebelService(props.form.service_id)} disabled={!props.form.service_id.trim()}>
                       <Search className="h-4 w-4" />
                       Query Siebel
                     </Button>
-                    <p className="text-xs text-muted-foreground md:col-span-2">Fetch business customer details from Siebel by order number and populate the fields below.</p>
+                    <p className="text-xs text-muted-foreground md:col-span-2">Fetch business customer details from Siebel by service ID and populate the fields below. Customer ID is synced as data, not used as the key.</p>
                   </div>
                 ) : null}
                 <AssignmentFieldGroup title={detailTitle} fields={dynamicOwnerFields} form={props.form} onChange={update} />
@@ -2526,6 +2671,7 @@ function AssignmentManagement(props: {
                   <TableHead>Owner</TableHead>
                   <TableHead>Status</TableHead>
                   <TableHead>Transaction</TableHead>
+                  <TableHead>BSS Sync</TableHead>
                   <TableHead />
                 </TableRow>
               </TableHeader>
@@ -2536,10 +2682,14 @@ function AssignmentManagement(props: {
                     <TableCell>{assignment.customer_name || assignment.internal_application_name}</TableCell>
                     <TableCell><Badge variant={assignment.status === "Blocked" ? "danger" : assignment.status === "Reserved" ? "warning" : "success"}>{assignment.status}</Badge></TableCell>
                     <TableCell>{assignment.service_instance_id || assignment.id}</TableCell>
+                    <TableCell className="text-xs text-muted-foreground">{assignment.siebel_last_sync_at ? formatDateTime(assignment.siebel_last_sync_at) : assignment.siebel_last_checked_at ? `Checked ${formatDateTime(assignment.siebel_last_checked_at)}` : "Not synced"}</TableCell>
                     <TableCell>
                       <div className="flex flex-wrap gap-2">
+                        {assignment.assignment_target_type === "business_customer" && assignment.service_id ? (
+                          <Button size="sm" variant="secondary" onClick={() => props.onRefreshSiebelAssignment(assignment)}>Refresh BSS</Button>
+                        ) : null}
                         <Button size="sm" variant="outline" onClick={() => props.onStatus(assignment, assignment.status === "Blocked" ? "Active" : "Blocked")}>{assignment.status === "Blocked" ? "Resume" : "Suspend"}</Button>
-                        <Button size="sm" variant="destructive" onClick={() => props.onRelease(assignment)}>Release</Button>
+                        <Button size="sm" variant="destructive" onClick={() => props.onRelease(assignment)}>Unassign</Button>
                       </div>
                     </TableCell>
                   </TableRow>
@@ -3824,6 +3974,130 @@ function shouldLoadNextReportBatch(event: UIEvent<HTMLDivElement>, visibleRows: 
   return target.scrollHeight - target.scrollTop - target.clientHeight < 180;
 }
 
+
+type CstLirApiSettingsProps = {
+  cstConfig: CstConfig | null;
+  cstConfigForm: CstConfigPayload;
+  onCstConfigForm: (value: CstConfigPayload) => void;
+  onSaveCstConfig: () => void;
+  onTestCstConnection: () => void;
+};
+
+function CstLirApiSettings(props: CstLirApiSettingsProps) {
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>CST LIR API Settings</CardTitle>
+        <CardDescription>Configure OAuth token retrieval, gateway headers, and LIRDataService functional endpoint paths.</CardDescription>
+      </CardHeader>
+      <CardContent className="grid gap-5">
+      <div className="grid gap-3 rounded-md border bg-muted/20 p-3">
+        <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+          <div>
+            <p className="text-xs text-muted-foreground">Configure OAuth token retrieval and functional API endpoint mapping. Token is cached and refreshed before expiry. SSL certificate verification is bypassed for all CST API calls.</p>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Badge variant={props.cstConfig?.auth_password_configured ? "success" : "warning"}>{props.cstConfig?.auth_password_configured ? "Password stored" : "Password missing"}</Badge>
+            <Badge variant={props.cstConfig?.api_access_key_configured ? "success" : "warning"}>{props.cstConfig?.api_access_key_configured ? "Gateway API key stored" : "Gateway API key missing"}</Badge>
+            <Badge variant={props.cstConfig?.user_key_configured ? "success" : "warning"}>{props.cstConfig?.user_key_configured ? "User Key stored" : "User Key missing"}</Badge>
+            <Badge variant={props.cstConfig?.token_cached ? "success" : "default"}>{props.cstConfig?.token_cached ? `Token cached until ${props.cstConfig.token_expires_at.slice(0, 19)}` : "No cached token"}</Badge>
+          </div>
+        </div>
+        <div className="grid gap-3 md:grid-cols-4">
+          <label className="grid gap-1">
+            <span className="text-xs font-medium text-muted-foreground">Integration mode</span>
+            <Input value="Real API" readOnly />
+          </label>
+          <label className="grid gap-1 md:col-span-2">
+            <span className="text-xs font-medium text-muted-foreground">Host</span>
+            <Input value={props.cstConfigForm.host ?? ""} onChange={(event) => props.onCstConfigForm({ ...props.cstConfigForm, host: event.target.value, base_url: `https://${event.target.value}:${props.cstConfigForm.port ?? 443}` })} placeholder="cst-oa-unified-gw-stg-fop.apps.apldev-sit-opshift.itc.local" />
+          </label>
+          <label className="grid gap-1">
+            <span className="text-xs font-medium text-muted-foreground">Port</span>
+            <Input value={String(props.cstConfigForm.port ?? 443)} onChange={(event) => { const port = Number(event.target.value) || 443; props.onCstConfigForm({ ...props.cstConfigForm, port, base_url: `https://${props.cstConfigForm.host ?? ""}:${port}` }); }} placeholder="443" />
+          </label>
+          <label className="grid gap-1 md:col-span-4">
+            <span className="text-xs font-medium text-muted-foreground">Base URL</span>
+            <Input value={props.cstConfigForm.base_url ?? ""} onChange={(event) => props.onCstConfigForm({ ...props.cstConfigForm, base_url: event.target.value })} placeholder="https://host:443" />
+          </label>
+          <label className="grid gap-1 md:col-span-2">
+            <span className="text-xs font-medium text-muted-foreground">Authorization username</span>
+            <Input value={props.cstConfigForm.auth_username ?? ""} onChange={(event) => props.onCstConfigForm({ ...props.cstConfigForm, auth_username: event.target.value })} placeholder="CST auth username" />
+          </label>
+          <label className="grid gap-1 md:col-span-2">
+            <span className="text-xs font-medium text-muted-foreground">Authorization password</span>
+            <Input name="cst-auth-password" autoComplete="new-password" value={props.cstConfigForm.auth_password ?? ""} onChange={(event) => props.onCstConfigForm({ ...props.cstConfigForm, auth_password: event.target.value })} placeholder={props.cstConfig?.auth_password_configured ? "Password configured" : "CST auth password"} type="password" />
+          </label>
+          <label className="grid gap-1 md:col-span-2">
+            <span className="text-xs font-medium text-muted-foreground">Gateway API key</span>
+            <Input name="cst-api-key" autoComplete="new-password" value={props.cstConfigForm.api_access_key ?? ""} onChange={(event) => props.onCstConfigForm({ ...props.cstConfigForm, api_access_key: event.target.value })} placeholder={props.cstConfig?.api_access_key_configured ? "Gateway API key configured" : "x-Gateway-APIKey value"} type="password" />
+          </label>
+          <label className="grid gap-1 md:col-span-2">
+            <span className="text-xs font-medium text-muted-foreground">User Key</span>
+            <Input name="cst-user-key" autoComplete="new-password" value={props.cstConfigForm.user_key ?? ""} onChange={(event) => props.onCstConfigForm({ ...props.cstConfigForm, user_key: event.target.value })} placeholder={props.cstConfig?.user_key_configured ? "User Key configured" : "user_key value"} type="password" />
+          </label>
+          <label className="grid gap-1">
+            <span className="text-xs font-medium text-muted-foreground">Accept language</span>
+            <Select value={props.cstConfigForm.accept_language ?? "EN"} values={["EN", "AR"]} onChange={(accept_language) => props.onCstConfigForm({ ...props.cstConfigForm, accept_language })} />
+          </label>
+          <label className="grid gap-1">
+            <span className="text-xs font-medium text-muted-foreground">SSL verification</span>
+            <Select value="Disabled" values={["Disabled"]} onChange={() => props.onCstConfigForm({ ...props.cstConfigForm, verify_ssl: false })} />
+          </label>
+          <label className="grid gap-1">
+            <span className="text-xs font-medium text-muted-foreground">Token refresh buffer</span>
+            <Input value={String(props.cstConfigForm.token_refresh_buffer_seconds ?? 300)} onChange={(event) => props.onCstConfigForm({ ...props.cstConfigForm, token_refresh_buffer_seconds: Number(event.target.value) || 300 })} placeholder="300" />
+          </label>
+        </div>
+        <div className="grid gap-3 md:grid-cols-2">
+          <label className="grid gap-1">
+            <span className="text-xs font-medium text-muted-foreground">Token path</span>
+            <Input value={props.cstConfigForm.token_path ?? ""} onChange={(event) => props.onCstConfigForm({ ...props.cstConfigForm, token_path: event.target.value })} placeholder="/api/rest/v1.0/OAuthToken" />
+          </label>
+          <label className="grid gap-1">
+            <span className="text-xs font-medium text-muted-foreground">Send LIR data path</span>
+            <Input value={props.cstConfigForm.send_path ?? ""} onChange={(event) => props.onCstConfigForm({ ...props.cstConfigForm, send_path: event.target.value })} placeholder="/api/rest/v1.0/LIRDataService/SendLIRData" />
+          </label>
+          <label className="grid gap-1">
+            <span className="text-xs font-medium text-muted-foreground">Update LIR data path</span>
+            <Input value={props.cstConfigForm.update_path ?? ""} onChange={(event) => props.onCstConfigForm({ ...props.cstConfigForm, update_path: event.target.value })} placeholder="/api/rest/v1.0/LIRDataService/UpdateLIRData" />
+          </label>
+          <label className="grid gap-1">
+            <span className="text-xs font-medium text-muted-foreground">Delete LIR data path</span>
+            <Input value={props.cstConfigForm.delete_path ?? ""} onChange={(event) => props.onCstConfigForm({ ...props.cstConfigForm, delete_path: event.target.value })} placeholder="/api/rest/v1.0/LIRDataService/DeleteLIRData" />
+          </label>
+          <label className="grid gap-1">
+            <span className="text-xs font-medium text-muted-foreground">Get LIR data path</span>
+            <Input value={props.cstConfigForm.get_path ?? ""} onChange={(event) => props.onCstConfigForm({ ...props.cstConfigForm, get_path: event.target.value })} placeholder="/api/rest/v1.0/LIRDataService/GetLIRData" />
+          </label>
+          <div className="grid grid-cols-2 gap-3">
+            <label className="grid gap-1">
+              <span className="text-xs font-medium text-muted-foreground">Connect timeout</span>
+              <Input value={String(props.cstConfigForm.connection_timeout ?? 10)} onChange={(event) => props.onCstConfigForm({ ...props.cstConfigForm, connection_timeout: Number(event.target.value) || 10 })} placeholder="Seconds" />
+            </label>
+            <label className="grid gap-1">
+              <span className="text-xs font-medium text-muted-foreground">Read timeout</span>
+              <Input value={String(props.cstConfigForm.read_timeout ?? 30)} onChange={(event) => props.onCstConfigForm({ ...props.cstConfigForm, read_timeout: Number(event.target.value) || 30 })} placeholder="Seconds" />
+            </label>
+          </div>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button variant="secondary" onClick={props.onSaveCstConfig}>
+            <Shield className="h-4 w-4" />
+            Save CST LIR API Settings
+          </Button>
+          <Button variant="outline" onClick={props.onTestCstConnection}>
+            <CheckCircle2 className="h-4 w-4" />
+            Test connection
+          </Button>
+          <span className="text-xs text-muted-foreground">Functional calls inject the cached Bearer token automatically. Leave secret fields blank to keep existing stored values.</span>
+        </div>
+      </div>
+      </CardContent>
+    </Card>
+  );
+}
+
 function CstIntegrationMonitor(props: CstMonitorProps) {
   return (
     <Card>
@@ -3831,7 +4105,7 @@ function CstIntegrationMonitor(props: CstMonitorProps) {
         <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <div>
             <CardTitle>CST Integration Monitor</CardTitle>
-            <CardDescription>Local controlled transaction store for CST SEND, UPDATE, DELETE, and GET workflows. External CST API calls are not enabled yet.</CardDescription>
+            <CardDescription>CST SEND, UPDATE, DELETE, and GET workflows execute against the real CST API using cached OAuth tokens.</CardDescription>
           </div>
           <div className="flex flex-wrap gap-2">
             <Button variant="outline" onClick={props.onRefreshCst} disabled={props.cstBusy}>
@@ -3859,7 +4133,8 @@ function CstIntegrationMonitor(props: CstMonitorProps) {
         <div className="flex flex-wrap items-center gap-2">
           <Badge variant={props.cstConfig?.enabled ? "success" : "warning"}>{props.cstConfig?.enabled ? "CST enabled" : "CST disabled"}</Badge>
           <Badge variant={props.cstConfig?.scheduled_sync_enabled ? "success" : "default"}>{props.cstConfig?.scheduled_sync_enabled ? `Daily ${props.cstConfig?.schedule_time ?? "00:30"} ${props.cstConfig?.schedule_timezone ?? "Asia/Riyadh"}` : "Schedule off"}</Badge>
-          <Badge variant={props.cstConfig?.auto_execute ? "success" : "default"}>{props.cstConfig?.auto_execute ? "Auto local execution" : "Manual queue"}</Badge>
+          <Badge variant="success">Auto execution</Badge>
+          <Badge variant="success">Real API only</Badge>
           <Badge variant="default">Service provider {props.cstConfig?.service_provider_id ?? "5"}</Badge>
           <Button size="sm" variant="outline" onClick={() => props.onToggleCstEnabled(!props.cstConfig?.enabled)}>
             {props.cstConfig?.enabled ? "Disable" : "Enable"}
@@ -3869,9 +4144,6 @@ function CstIntegrationMonitor(props: CstMonitorProps) {
           </Button>
           <Button size="sm" variant="outline" onClick={props.onRunCstDayMinusOne}>
             Run Day-1 Now
-          </Button>
-          <Button size="sm" variant="outline" onClick={() => props.onToggleCstAutoExecute(!props.cstConfig?.auto_execute)}>
-            {props.cstConfig?.auto_execute ? "Use Manual Queue" : "Use Auto Local Execution"}
           </Button>
         </div>
         <div className="rounded-md border bg-muted/20 p-3">
@@ -3944,6 +4216,7 @@ function CstIntegrationMonitor(props: CstMonitorProps) {
                     <TableHead>CIDR</TableHead>
                     <TableHead>Operation</TableHead>
                     <TableHead>Status</TableHead>
+                    <TableHead>Reason</TableHead>
                     <TableHead />
                   </TableRow>
                 </TableHeader>
@@ -3956,12 +4229,13 @@ function CstIntegrationMonitor(props: CstMonitorProps) {
                       </TableCell>
                       <TableCell>{job.operation}</TableCell>
                       <TableCell><Badge variant={job.status === "SUCCESS" ? "success" : job.status === "FAILED" || job.status === "BLOCKED" ? "danger" : job.status === "PENDING" ? "warning" : "default"}>{job.status}</Badge></TableCell>
+                      <TableCell className="max-w-[360px] text-xs text-muted-foreground">{job.last_error || "-"}</TableCell>
                       <TableCell>
                         {job.status === "FAILED" || job.status === "BLOCKED" || job.status === "PENDING" ? <Button size="sm" variant="outline" onClick={() => props.onRetryCstJob(job)}>Retry</Button> : null}
                       </TableCell>
                     </TableRow>
                   ))}
-                  {!props.cstJobs.length ? <TableRow><TableCell colSpan={4} className="py-6 text-center text-muted-foreground">No CST jobs yet.</TableCell></TableRow> : null}
+                  {!props.cstJobs.length ? <TableRow><TableCell colSpan={5} className="py-6 text-center text-muted-foreground">No CST jobs yet.</TableCell></TableRow> : null}
                 </TableBody>
               </Table>
             </div>
@@ -4012,18 +4286,25 @@ function Administration(props: {
   ripeConfigForm: RipeConfigPayload;
   siebelConfig: SiebelConfig | null;
   siebelConfigForm: SiebelConfigPayload;
+  cstConfig: CstConfig | null;
+  cstConfigForm: CstConfigPayload;
   ripePoolCsv: string;
   ripeAllocatedPools: RipeAllocatedPool[];
   onNewUser: (value: { username: string; password: string; role: User["role"] }) => void;
   onPasswordReset: (value: { userId: string; password: string }) => void;
   onRipeConfigForm: (value: RipeConfigPayload) => void;
   onSiebelConfigForm: (value: SiebelConfigPayload) => void;
+  onCstConfigForm: (value: CstConfigPayload) => void;
   onRipePoolCsv: (value: string) => void;
   onAddUser: () => void;
   onSetPassword: () => void;
   onToggleUser: (user: User) => void;
   onSaveRipeConfig: () => void;
   onSaveSiebelConfig: () => void;
+  onTestSiebelConnection: () => void;
+  onSaveCstConfig: () => void;
+  onTestCstConnection: () => void;
+  onRunSiebelDeltaSync: () => void;
   onImportRipePools: () => void;
 }) {
   const roles = ["admin", "operator", "viewer"];
@@ -4169,7 +4450,7 @@ function Administration(props: {
       <Card>
         <CardHeader>
           <CardTitle>Siebel Integration</CardTitle>
-          <CardDescription>Oracle connection and query used to populate business customer assignment details by order number.</CardDescription>
+          <CardDescription>Oracle connection and query used to populate business customer assignment details by service ID.</CardDescription>
         </CardHeader>
         <CardContent className="grid gap-5">
           <div className="grid gap-3 md:grid-cols-3">
@@ -4178,17 +4459,39 @@ function Administration(props: {
             <Input value={props.siebelConfigForm.dsn} onChange={(event) => props.onSiebelConfigForm({ ...props.siebelConfigForm, dsn: event.target.value })} placeholder="172.31.23.101:1525/SIDB" />
             <Input value={String(props.siebelConfigForm.connection_timeout)} onChange={(event) => props.onSiebelConfigForm({ ...props.siebelConfigForm, connection_timeout: Number(event.target.value) || 10 })} placeholder="Connection timeout seconds" />
           </div>
-          <Textarea value={props.siebelConfigForm.query_sql} onChange={(event) => props.onSiebelConfigForm({ ...props.siebelConfigForm, query_sql: event.target.value })} placeholder="SELECT * FROM SIEBEL_VIEW WHERE ORDER_NUM = :order_number" />
+          <div className="grid gap-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="text-xs font-medium text-muted-foreground">Siebel business customer query</span>
+              <Button type="button" variant="outline" size="sm" onClick={() => props.onSiebelConfigForm({ ...props.siebelConfigForm, query_sql: DEFAULT_SIEBEL_QUERY })}>Use Salam service query</Button>
+            </div>
+            <Textarea value={props.siebelConfigForm.query_sql} onChange={(event) => props.onSiebelConfigForm({ ...props.siebelConfigForm, query_sql: event.target.value })} placeholder="SELECT ... WHERE sa.serial_num LIKE :service_id" />
+          </div>
+          <p className="text-xs text-muted-foreground">The query must include the Oracle bind variable :service_id; the app sends it as a LIKE pattern using the entered service ID. Delta sync re-queries active business assignments by service ID, updates changed BSS customer/contact fields, records each changed field in the BSS sync audit, and queues CST UPDATE jobs for public resources. Customer ID is not used as the matching key.</p>
           <div className="flex flex-wrap items-center gap-2">
             <Button onClick={props.onSaveSiebelConfig}>
               <Database className="h-4 w-4" />
               Save Siebel Settings
+            </Button>
+            <Button variant="outline" onClick={props.onTestSiebelConnection}>
+              <CheckCircle2 className="h-4 w-4" />
+              Test connection
+            </Button>
+            <Button variant="secondary" onClick={props.onRunSiebelDeltaSync}>
+              <RefreshCcw className="h-4 w-4" />
+              Run BSS Delta Sync
             </Button>
             <Badge variant={props.siebelConfig?.password_configured ? "success" : "warning"}>{props.siebelConfig?.password_configured ? "Password stored" : "Password missing"}</Badge>
             <span className="text-sm text-muted-foreground">Updated {props.siebelConfig?.updated_at ? props.siebelConfig.updated_at.slice(0, 19) : "not yet"}</span>
           </div>
         </CardContent>
       </Card>
+      <CstLirApiSettings
+        cstConfig={props.cstConfig}
+        cstConfigForm={props.cstConfigForm}
+        onCstConfigForm={props.onCstConfigForm}
+        onSaveCstConfig={props.onSaveCstConfig}
+        onTestCstConnection={props.onTestCstConnection}
+      />
       <Card>
         <CardHeader>
           <CardTitle>Policies</CardTitle>
@@ -6001,31 +6304,3 @@ function errorMessage(error: unknown) {
   }
   return error instanceof Error ? error.message : "Unknown error";
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

@@ -5,6 +5,8 @@ import hashlib
 import hmac
 import json
 from io import StringIO
+from urllib import error as urllib_error, parse as urllib_parse, request as urllib_request
+import ssl
 from ipaddress import IPv4Address, IPv4Network, ip_network, summarize_address_range
 import os
 from pathlib import Path
@@ -38,6 +40,14 @@ CST_SCHEDULER_STARTED = False
 DEFAULT_SERVICE_PROVIDER_ID = "5"
 DEFAULT_SERVICE_PROVIDER_NAME = "Salam"
 DEFAULT_ASN = "AS35753"
+CST_SEND_LIR_PATH = "/api/rest/v1.0/LIRDataService/SendLIRData"
+CST_UPDATE_LIR_PATH = "/api/rest/v1.0/LIRDataService/UpdateLIRData"
+CST_DELETE_LIR_PATH = "/api/rest/v1.0/LIRDataService/DeleteLIRData"
+CST_GET_LIR_PATH = "/api/rest/v1.0/LIRDataService/GetLIRData"
+CST_FALLBACK_PHONE_NUMBER = "9665000000"
+CST_FALLBACK_ID_NUMBER = "0000000000"
+CST_DEFAULT_ACCEPT_LANGUAGE = "EN"
+CST_API_TIMEZONE = timezone(timedelta(hours=3))
 AUDIT_SERVICE = AuditService(lambda: now_iso())
 
 app = FastAPI(title="NetAtlas IPAM API", version="1.0.0")
@@ -150,7 +160,10 @@ class AssignmentCreate(BaseModel):
     service_category: str = "L3 Service"
     service_order_id: str = ""
     siebel_order_number: str = ""
+    bss_customer_id: str = ""
     siebel_last_sync_at: str = ""
+    siebel_last_checked_at: str = ""
+    siebel_payload_hash: str = ""
     siebel_payload_json: str = ""
     service_characteristics: str = ""
     product_specification_id: str = ""
@@ -417,15 +430,45 @@ class SiebelConfigOut(BaseModel):
     updated_at: str
 
 
+
+class SiebelConnectionTestResponse(BaseModel):
+    success: bool
+    message: str
+    dsn: str
+    tested_at: str
+
 class SiebelLookupRequest(BaseModel):
-    order_number: str
+    service_id: str = ""
+    order_number: str = ""
 
 
 class SiebelLookupResponse(BaseModel):
-    order_number: str
+    service_id: str = ""
+    order_number: str = ""
     found: bool
     assignment: dict[str, str] = {}
     raw: dict[str, str] = {}
+    message: str = ""
+
+
+class BssSyncAuditRecord(BaseModel):
+    id: str
+    assignment_id: str
+    service_id: str = ""
+    siebel_order_number: str
+    changed_field: str
+    old_value: str = ""
+    new_value: str = ""
+    synced_at: str
+    status: str = "UPDATED"
+
+
+class BssDeltaSyncResponse(BaseModel):
+    checked: int = 0
+    updated: int = 0
+    unchanged: int = 0
+    failed: int = 0
+    audit: list[BssSyncAuditRecord] = []
     message: str = ""
 
 
@@ -548,6 +591,8 @@ class ResourceRecord(BaseModel):
     customer_type_id: str = ""
     region_id: str = ""
     city_id: str = ""
+    city: str = ""
+    region: str = ""
     full_name: str = ""
     mobile_number: str = ""
     id_number: str = ""
@@ -580,7 +625,10 @@ class AssignmentDetailRecord(BaseModel):
     service_id: str = ""
     service_order_id: str = ""
     siebel_order_number: str = ""
+    bss_customer_id: str = ""
     siebel_last_sync_at: str = ""
+    siebel_last_checked_at: str = ""
+    siebel_payload_hash: str = ""
     siebel_payload_json: str = ""
     customer_name: str = ""
     organization_name: str = ""
@@ -621,6 +669,26 @@ class CstConfig(BaseModel):
     service_provider_id: str = DEFAULT_SERVICE_PROVIDER_ID
     auto_execute: bool = True
     scheduled_sync_enabled: bool = True
+    integration_mode: str = "Real API"
+    host: str = "cst-oa-unified-gw-stg-fop.apps.apldev-sit-opshift.itc.local"
+    port: int = 443
+    base_url: str = "https://cst-oa-unified-gw-stg-fop.apps.apldev-sit-opshift.itc.local:443"
+    token_path: str = "/api/rest/v1.0/OAuthToken"
+    send_path: str = CST_SEND_LIR_PATH
+    update_path: str = CST_UPDATE_LIR_PATH
+    delete_path: str = CST_DELETE_LIR_PATH
+    get_path: str = CST_GET_LIR_PATH
+    auth_username: str = ""
+    accept_language: str = CST_DEFAULT_ACCEPT_LANGUAGE
+    auth_password_configured: bool = False
+    api_access_key_configured: bool = False
+    user_key_configured: bool = False
+    verify_ssl: bool = False
+    connection_timeout: int = 10
+    read_timeout: int = 30
+    token_refresh_buffer_seconds: int = 300
+    token_expires_at: str = ""
+    token_cached: bool = False
     schedule_time: str = "00:30"
     schedule_timezone: str = "Asia/Riyadh"
     last_scheduled_run_date: str = ""
@@ -630,11 +698,37 @@ class CstConfig(BaseModel):
     updated_at: str
 
 
+class CstConnectionTestResponse(BaseModel):
+    success: bool
+    message: str
+    token_path: str
+    token_expires_at: str
+    tested_at: str
+
+
 class CstConfigUpdate(BaseModel):
     enabled: bool | None = None
     service_provider_id: str | None = None
     auto_execute: bool | None = None
     scheduled_sync_enabled: bool | None = None
+    integration_mode: str | None = None
+    host: str | None = None
+    port: int | None = None
+    base_url: str | None = None
+    token_path: str | None = None
+    send_path: str | None = None
+    update_path: str | None = None
+    delete_path: str | None = None
+    get_path: str | None = None
+    auth_username: str | None = None
+    auth_password: str | None = None
+    api_access_key: str | None = None
+    user_key: str | None = None
+    accept_language: str | None = None
+    verify_ssl: bool | None = None
+    connection_timeout: int | None = None
+    read_timeout: int | None = None
+    token_refresh_buffer_seconds: int | None = None
     schedule_time: str | None = None
     schedule_timezone: str | None = None
     batch_size_limit: int | None = None
@@ -1120,8 +1214,10 @@ def resource_record_for_assignment(assignment: Assignment, existing: ResourceRec
         customer_type_id=assignment.customer_type_id,
         region_id=assignment.region_id,
         city_id=assignment.city_id,
+        city=assignment.city,
+        region=assignment.region,
         full_name="" if hide_individual_identity else assignment.full_name,
-        mobile_number="" if hide_individual_identity else assignment.mobile_number or assignment.contact_number,
+        mobile_number="" if hide_individual_identity else normalize_cst_mobile_number(assignment.mobile_number) or normalize_cst_mobile_number(assignment.contact_number) or assignment.mobile_number or assignment.contact_number,
         id_number="" if hide_individual_identity else assignment.id_number,
         email="" if hide_individual_identity else assignment.email or assignment.contact_email,
         customer_name=assignment.customer_name,
@@ -1155,7 +1251,10 @@ def assignment_detail_record_for_assignment(assignment: Assignment, resource: Re
         service_id=assignment.service_id or assignment.service_instance_id,
         service_order_id=assignment.service_order_id,
         siebel_order_number=assignment.siebel_order_number,
+        bss_customer_id=assignment.bss_customer_id,
         siebel_last_sync_at=assignment.siebel_last_sync_at,
+        siebel_last_checked_at=assignment.siebel_last_checked_at,
+        siebel_payload_hash=assignment.siebel_payload_hash,
         siebel_payload_json=assignment.siebel_payload_json,
         customer_name=assignment.customer_name,
         organization_name=assignment.organization_name or assignment.customer_name,
@@ -1273,9 +1372,10 @@ def normalized_inventory_needs_sync(connection: sqlite3.Connection) -> bool:
 
 SIEBEL_ASSIGNMENT_ALIASES: dict[str, list[str]] = {
     "service_order_id": ["ORDER_NUM", "ORDER_NUMBER", "ORDER_ID", "SERVICE_ORDER_ID", "ORDER_REF"],
+    "bss_customer_id": ["BSS_CUSTOMER_ID", "SIEBEL_CUSTOMER_ID", "CUSTOMER_ID", "ACCOUNT_ID", "ACCOUNT_NUMBER", "BILLING_ACCOUNT_ID"],
     "logical_resource_id": ["LOGICAL_RESOURCE_ID", "RESOURCE_ID", "ASSET_INTEG_ID"],
-    "service_id": ["SERVICE_ID", "SRV_ID", "ASSET_ID", "ASSET_INTEG_ID"],
-    "service_instance_id": ["SERVICE_INSTANCE_ID", "SERVICE_ID", "ASSET_ID", "ORDER_NUM"],
+    "service_id": ["SERVICE_ID", "SRV_ID", "SERIAL_NUM", "ASSET_ID", "ASSET_INTEG_ID"],
+    "service_instance_id": ["SERVICE_INSTANCE_ID", "SERVICE_ID", "SERIAL_NUM", "ASSET_ID", "ORDER_NUM"],
     "service_instance_name": ["SERVICE_INSTANCE_NAME", "SERVICE_NAME", "PRODUCT_NAME", "ASSET_NAME"],
     "service_type": ["SERVICE_TYPE", "PRODUCT_TYPE"],
     "service_category": ["SERVICE_CATEGORY", "PRODUCT_CATEGORY"],
@@ -1288,28 +1388,28 @@ SIEBEL_ASSIGNMENT_ALIASES: dict[str, list[str]] = {
     "customer_id": ["CUSTOMER_ID", "CUST_ID", "ACCOUNT_ID", "PARTY_ID"],
     "customer_name": ["CUSTOMER_NAME", "ACCOUNT_NAME", "ORGANIZATION_NAME", "ORG_NAME", "NAME"],
     "organization_name": ["ORGANIZATION_NAME", "ORG_NAME", "ACCOUNT_NAME", "CUSTOMER_NAME"],
-    "organization_id": ["ORGANIZATION_ID", "ORG_ID", "ACCOUNT_ID", "CUSTOMER_ID"],
-    "customer_type": ["CUSTOMER_TYPE", "ACCOUNT_TYPE"],
+    "organization_id": ["ORGANIZATION_ID", "ORG_ID", "X_ITC_B2B_COMMERCIAL_REGIS_NUM", "X_ITC_B2B_UNIFIED_NUMBER", "X_ITC_B2B_AP_IDENTITY_ID", "ACCOUNT_ID", "ACCOUNT_NUMBER", "CUSTOMER_ID"],
+    "customer_type": ["CUSTOMER_TYPE", "ACCOUNT_TYPE", "OU_TYPE_CD", "X_ITC_ACNT_SECTOR"],
     "customer_type_id": ["CUSTOMER_TYPE_ID", "CUST_TYPE_ID"],
     "customer_account_id": ["CUSTOMER_ACCOUNT_ID", "ACCOUNT_ID", "BILL_ACCNT_ID"],
     "customer_segment": ["CUSTOMER_SEGMENT", "SEGMENT", "MARKET_SEGMENT"],
-    "commercial_reg_id": ["COMMERCIAL_REG_ID", "CR_NUMBER", "CR_NUM", "COMM_REG_ID"],
-    "unified_number": ["UNIFIED_NUMBER", "UNIFIED_NUM", "700_NUMBER"],
-    "contact_name": ["CONTACT_NAME", "PRIMARY_CONTACT", "FULL_NAME"],
-    "contact_number": ["CONTACT_NUMBER", "CONTACT_PHONE", "MOBILE_NUMBER", "PHONE_NUMBER"],
-    "contact_email": ["CONTACT_EMAIL", "EMAIL", "EMAIL_ADDRESS"],
-    "full_name": ["FULL_NAME", "CONTACT_NAME", "PRIMARY_CONTACT"],
-    "mobile_number": ["MOBILE_NUMBER", "CONTACT_NUMBER", "CONTACT_PHONE", "PHONE_NUMBER"],
-    "id_number": ["ID_NUMBER", "NATIONAL_ID", "IQAMA_ID"],
-    "email": ["EMAIL", "EMAIL_ADDRESS", "CONTACT_EMAIL"],
-    "region": ["REGION", "REGION_NAME", "PROVINCE"],
+    "commercial_reg_id": ["COMMERCIAL_REG_ID", "CR_NUMBER", "CR_NUM", "COMM_REG_ID", "X_ITC_B2B_COMMERCIAL_REGIS_NUM"],
+    "unified_number": ["UNIFIED_NUMBER", "UNIFIED_NUM", "700_NUMBER", "X_ITC_B2B_UNIFIED_NUMBER"],
+    "contact_name": ["CONTACT_NAME", "PRIMARY_CONTACT", "FULL_NAME", "X_ITC_B2B_AP_NAME", "FST_NAME", "LAST_NAME"],
+    "contact_number": ["CONTACT_NUMBER", "CONTACT_PHONE", "MOBILE_NUMBER", "PHONE_NUMBER", "MAIN_PH_NUM", "CON_PHONE_NUM"],
+    "contact_email": ["CONTACT_EMAIL", "EMAIL", "EMAIL_ADDRESS", "MAIN_EMAIL_ADDR", "CON_EMAIL"],
+    "full_name": ["FULL_NAME", "CONTACT_NAME", "PRIMARY_CONTACT", "X_ITC_B2B_AP_NAME"],
+    "mobile_number": ["MOBILE_NUMBER", "CONTACT_NUMBER", "CONTACT_PHONE", "PHONE_NUMBER", "MAIN_PH_NUM", "CON_PHONE_NUM"],
+    "id_number": ["CONTACT_ID_NUM", "ID_NUMBER", "NATIONAL_ID", "IQAMA_ID", "X_ITC_B2B_AP_IDENTITY_ID"],
+    "email": ["EMAIL", "EMAIL_ADDRESS", "CONTACT_EMAIL", "MAIN_EMAIL_ADDR", "CON_EMAIL"],
+    "region": ["REGION", "REGION_NAME", "PROVINCE", "ACCOUNT_REGION"],
     "region_id": ["REGION_ID", "PROVINCE_ID"],
-    "city": ["CITY", "CITY_NAME"],
+    "city": ["CITY", "CITY_NAME", "ACCOUNT_CITY"],
     "city_id": ["CITY_ID"],
     "site": ["SITE", "SITE_NAME", "LOCATION_NAME"],
     "site_id": ["SITE_ID"],
     "location_name": ["LOCATION_NAME", "ADDRESS", "SITE_NAME"],
-    "access_technology": ["ACCESS_TECHNOLOGY", "ACCESS_TECH", "TECHNOLOGY"],
+    "access_technology": ["ACCESS_TECHNOLOGY", "ACCESS_TECH", "TECHNOLOGY", "PRODUCT_NAME"],
     "access_technology_id": ["ACCESS_TECHNOLOGY_ID", "ACCESS_TECH_ID"],
 }
 
@@ -1335,18 +1435,261 @@ def first_siebel_value(row: dict[str, str], aliases: list[str]) -> str:
     return ""
 
 
-def assignment_patch_from_siebel_row(row: dict[str, str], order_number: str) -> dict[str, str]:
+
+CST_REGION_ROWS: list[tuple[int, str]] = [(1, 'Riyadh'), (2, 'Qassim'), (3, 'Makkah'), (4, 'Al Madinah'), (5, 'Eastern Region'), (6, 'Al-Jouf'), (7, 'Tabuk'), (8, 'The Northern Border'), (9, 'Hail'), (10, 'Asir'), (11, 'Najran'), (12, 'Baha'), (13, 'Jazan'), (14, 'Central'), (15, 'Western'), (16, 'Eastern')]
+
+CST_CITY_ROWS: list[tuple[int, str, int]] = [(1, "Surat 'Obiedah", 10), (2, 'Hael', 9), (3, 'Al-Ghazalah', 9), (4, 'Al-Kharj', 1), (5, 'Al-Qariyat', 6), (6, "Yanb'u Al-Bahr", 4), (7, 'Tarif', 8), (8, 'Dhahran Al-Janoub', 10), (9, 'Al-Qonfazah', 3), (10, 'Sakaka', 6), (11, 'Makkah Al-Mukaramah', 3), (12, "Baq'aa", 9), (13, 'Al-Taief', 3), (14, 'Afif', 1), (15, 'Al-Darb', 13), (16, 'Tabuk', 7), (17, 'Abu Arish', 13), (18, 'Khaibar', 4), (19, 'Al-Dareiyah', 1), (20, 'Jazan', 13), (21, 'Habouna', 11), (22, 'Al-Jamom', 3), (23, 'Al-Dawadmi', 1), (24, 'Ras Tannoura', 5), (25, 'Al-Mahd', 4), (26, 'Oniezah', 2), (27, 'Al-Kamel', 3), (28, 'Sharorah', 11), (29, 'Samtah', 13), (30, 'Balqarn', 10), (31, 'Baljurashi', 12), (32, 'Auon Al-Jawa', 2), (33, 'Tathlieth', 10), (34, "Al-'Ola", 4), (35, 'Raith', 13), (36, 'Shaqra', 1), (37, 'Al-Jubial', 5), (38, 'Al-Bakiriyah', 2), (39, 'Abgig', 5), (40, 'Buriedah', 2), (41, 'Al-Riyadh', 1), (42, 'Tarbah', 3), (43, 'Baish', 13), (44, 'Fursan', 13), (45, 'Khamies Mihiesth', 10), (46, 'Al-Qura', 12), (47, 'Al-Khurmah', 3), (48, 'Mahaiel', 10), (49, "Al-'Aardah", 13), (50, 'Rabigh', 3), (51, "Al-'Aqiq", 12), (52, 'Al-Laith', 3), (53, 'Al-Ras', 2), (54, 'Al-Madinah Al-Monawarah', 4), (55, 'Al-Aflaj', 1), (56, 'AL-Ahsa', 5), (57, 'Al-Hrath', 13), (58, 'Al-Hanakiayh', 4), (59, 'Al-Nams', 10), (60, 'Al-Hariq', 1), (61, 'Al-Dammam', 5), (62, 'Al-Badaiee', 2), (63, 'Qulwah', 12), (64, 'Dhamd', 13), (65, 'Jeddah', 3), (66, "Al-Nu'aeriyah", 5), (67, 'Al-Kharkir', 11), (68, 'Thar', 11), (69, "Rijal Alma'a", 10), (70, 'Al-Qateif', 5), (71, "Rafha'", 8), (72, 'Al-Aidaby', 13), (73, 'Al-Ghat', 1), (74, 'Al-Shamasiyah', 2), (75, 'Sabiaa', 13), (76, 'Al-Mandak', 12), (77, 'Badr', 4), (78, 'Najran', 11), (79, 'Ahad Rufiedah', 10), (80, 'Al-Mukwah', 12), (81, 'Hafr Al-Batin', 5), (82, 'Hatat Bani Tamim', 1), (83, 'Abha', 10), (84, 'Al-Baha', 12), (85, 'Al-Nahbaniyah', 2), (86, 'Al-Zalfa', 1), (87, 'Al-Maznab', 2), (88, 'Al-Mozahimiyah', 1), (89, 'Al-Qiwaiyah', 1), (90, 'Darma', 1), (91, 'Al-Asyah', 2), (92, 'Al-Khafji', 5), (93, 'Thadiq', 1), (94, 'Haql', 7), (95, 'Al-Khobar', 5), (96, 'Yiadmah', 11), (97, 'Raniyah', 3), (98, 'Amlaj', 7), (99, 'Dawmat Al-Jandal', 6), (100, "Qariyat Al-'Oliyah", 5), (101, 'Khabash', 11), (102, 'Biesha', 10), (103, 'Harimla', 1), (104, 'Badr Al-Janoub', 11), (105, 'Ahad Al-Maserhah', 13), (106, 'Dhiba', 7), (107, "Al-Majma'ah", 1), (108, 'Khulies', 3), (109, 'Al-Dair', 13), (110, 'Wadi Al-Dawasir', 1), (111, 'Ramah', 1), (112, 'Arar', 8), (113, 'Al-Majardah', 10), (114, 'Al-Shanan', 9), (115, 'Al Wajh', 7), (116, "Tima'a", 7), (117, 'Al-Salil', 1), (118, 'Riyad Al-Khobara', 2), (119, 'Adom', 3), (120, 'Al-Aaes', 4), (121, 'Al-Aradiat', 3), (122, 'Al-Bida', 7), (123, 'Al-Birak', 10), (124, 'Al-Haiet', 9), (125, 'Al-Hujra', 12), (126, 'Al-Kurmah', 3), (127, 'Al-Moyah', 3), (128, "Al-'Odied", 5), (129, 'Al-Raith', 13), (130, 'Al-Salimi', 9), (131, 'Al-Shamli', 9), (132, 'Al-Tiwal', 13), (133, 'Al-Uwayqilah', 8), (134, 'Al-Wajh', 7), (135, 'Aqlat Al-Soqor', 2), (136, 'Bahrah', 3), (137, 'Bani Hasan', 12), (138, 'Bariq', 10), (139, 'Dariyah', 2), (140, "Far'at Ghamid Al-Zinad", 12), (141, 'Fifa', 13), (142, 'Huroub', 13), (143, 'Huroub', 13), (144, 'Maisan', 3), (145, 'Maisan', 3), (146, 'Maowqaq', 9), (147, 'Maraat', 1), (148, 'Tabrigl', 6), (149, 'Tanoumah', 10), (150, 'Turieb', 10), (151, "Wadi Al-Far'a", 4), (152, 'Other', 1), (153, 'Other', 1), (154, 'Al Dhahran', 10)]
+
+CST_ACCESS_TECHNOLOGY_BY_ID = {1: "FTTH", 2: "ADSL", 3: "Mobile", 4: "FWA"}
+CST_CUSTOMER_TYPE_BY_ID = {1: "Government", 2: "Non-Government"}
+
+CST_REGION_ALIASES = {
+    "central": 14,
+    "centralregion": 14,
+    "western": 15,
+    "westernregion": 15,
+    "eastern": 16,
+    "east": 16,
+    "easternsales": 16,
+    "riyadhregion": 1,
+    "makkahregion": 3,
+    "madinahregion": 4,
+    "easternprovince": 5,
+    "easternregion": 5,
+}
+
+CST_CITY_ALIASES = {
+    "riyadh": 41,
+    "dammam": 61,
+    "khobar": 95,
+    "dhahran": 154,
+    "jubail": 37,
+    "qatif": 70,
+    "qateef": 70,
+    "ahsa": 56,
+    "alhasa": 56,
+    "hasa": 56,
+    "madinah": 54,
+    "medina": 54,
+    "makkah": 11,
+    "mecca": 11,
+    "jeddah": 65,
+    "buraidah": 40,
+    "buraydah": 40,
+    "hail": 2,
+    "haiel": 2,
+    "khamismushait": 45,
+    "khamiesmushait": 45,
+    "najran": 78,
+    "abha": 83,
+    "tabuk": 16,
+    "jazan": 20,
+    "jizan": 20,
+    "sakaka": 10,
+    "arar": 112,
+    "hafralbatin": 81,
+    "yanbu": 6,
+    "taif": 13,
+    "taief": 13,
+}
+
+
+def cst_lookup_key(value: object) -> str:
+    return normalized_siebel_key(str(value or "").replace("&", "and"))
+
+
+def cst_name_variants(value: object) -> set[str]:
+    key = cst_lookup_key(value)
+    variants = {key} if key else set()
+    for prefix in ("al", "the"):
+        if key.startswith(prefix) and len(key) > len(prefix) + 2:
+            variants.add(key[len(prefix):])
+    return variants
+
+
+def cst_build_lookup(rows: list[tuple[int, str]]) -> dict[str, int]:
+    lookup: dict[str, int] = {}
+    for item_id, name in rows:
+        for variant in cst_name_variants(name):
+            lookup.setdefault(variant, item_id)
+    return lookup
+
+
+CST_REGION_LOOKUP = cst_build_lookup(CST_REGION_ROWS)
+CST_REGION_LOOKUP.update(CST_REGION_ALIASES)
+CST_CITY_LOOKUP = cst_build_lookup([(city_id, name) for city_id, name, _region_id in CST_CITY_ROWS])
+CST_CITY_LOOKUP.update(CST_CITY_ALIASES)
+CST_CITY_REGION_BY_ID = {city_id: region_id for city_id, _name, region_id in CST_CITY_ROWS}
+
+
+def cst_lookup_id(value: object, lookup: dict[str, int], allowed_ids: set[int]) -> int | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.isdigit():
+        item_id = int(text)
+        return item_id if item_id in allowed_ids else None
+    for variant in cst_name_variants(text):
+        item_id = lookup.get(variant)
+        if item_id in allowed_ids:
+            return item_id
+    return None
+
+
+def cst_region_id(value: object) -> int | None:
+    return cst_lookup_id(value, CST_REGION_LOOKUP, {item_id for item_id, _name in CST_REGION_ROWS})
+
+
+def cst_city_id(value: object) -> int | None:
+    return cst_lookup_id(value, CST_CITY_LOOKUP, {item_id for item_id, _name, _region_id in CST_CITY_ROWS})
+
+
+def cst_customer_type_id(value: object) -> int | None:
+    text = str(value or "").strip()
+    if text in {"1", "2"}:
+        return int(text)
+    key = cst_lookup_key(text)
+    if not key:
+        return None
+    if any(token in key for token in ["nongovernment", "nonpublic", "private", "enterprise", "business", "commercial", "corporate"]):
+        return 2
+    if any(token in key for token in ["government", "govt", "gov", "ministry", "municipality", "publicsector", "semigov"]):
+        return 1
+    return 2
+
+
+def cst_access_technology_id(value: object) -> int | None:
+    text = str(value or "").strip()
+    if text in {"1", "2", "3", "4"}:
+        return int(text)
+    key = cst_lookup_key(text)
+    if not key:
+        return None
+    if any(token in key for token in ["ftth", "fiber", "fibre", "gpon"]):
+        return 1
+    if any(token in key for token in ["adsl", "dsl"]):
+        return 2
+    if any(token in key for token in ["mobile", "lte", "5g", "4g"]):
+        return 3
+    if any(token in key for token in ["fwa", "fixedwireless", "wireless"]):
+        return 4
+    return None
+
+
+def cst_phone_without_extension(value: object) -> str:
+    text = str(value or "").strip()
+    return re.split(r"(?:\s+|(?<=\d))(?:extension|ext|ex)\.?\s*", text, maxsplit=1, flags=re.IGNORECASE)[0].strip()
+
+
+def normalize_cst_mobile_number(value: object) -> str:
+    digits = re.sub(r"\D", "", cst_phone_without_extension(value))
+    if digits.startswith("00"):
+        digits = digits[2:]
+    if digits == CST_FALLBACK_PHONE_NUMBER:
+        return CST_FALLBACK_PHONE_NUMBER
+    if digits.startswith("0") and len(digits) == 10 and digits[1] in {"1", "5"}:
+        digits = "966" + digits[1:]
+    elif len(digits) == 9 and digits[0] in {"1", "5"}:
+        digits = "966" + digits
+    if re.fullmatch(r"9665\d{8}", digits):
+        return digits
+    return digits if re.fullmatch(r"9661\d{8}", digits) else ""
+
+
+def normalize_cst_id_number(value: object) -> str:
+    digits = re.sub(r"\D", "", str(value or ""))
+    return digits if re.fullmatch(r"\d{10}", digits) else ""
+
+
+def normalize_cst_email(value: object) -> str:
+    email = str(value or "").strip().lower()
+    return email if re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) else ""
+
+
+def normalize_cst_contact_fields(patch: dict[str, str]) -> None:
+    normalized_mobile = normalize_cst_mobile_number(patch.get("mobile_number", ""))
+    normalized_contact = normalize_cst_mobile_number(patch.get("contact_number", ""))
+    if normalized_mobile:
+        patch["mobile_number"] = normalized_mobile
+    elif normalized_contact:
+        patch["mobile_number"] = normalized_contact
+    elif patch.get("mobile_number") or patch.get("contact_number"):
+        patch["mobile_number"] = CST_FALLBACK_PHONE_NUMBER
+    if normalized_contact:
+        patch["contact_number"] = normalized_contact
+    elif patch.get("contact_number"):
+        patch["contact_number"] = CST_FALLBACK_PHONE_NUMBER
+    normalized_id = normalize_cst_id_number(patch.get("id_number", ""))
+    if normalized_id:
+        patch["id_number"] = normalized_id
+    for field in ["email", "contact_email"]:
+        normalized = normalize_cst_email(patch.get(field, ""))
+        if normalized:
+            patch[field] = normalized
+
+
+def apply_cst_lookup_mappings(patch: dict[str, str], row: dict[str, str]) -> None:
+    customer_type_source = patch.get("customer_type_id") or patch.get("customer_type") or first_siebel_value(row, ["X_ITC_ACNT_SECTOR", "OU_TYPE_CD"])
+    customer_type = cst_customer_type_id(customer_type_source)
+    if customer_type is not None:
+        patch["customer_type_id"] = str(customer_type)
+        patch["customer_type"] = CST_CUSTOMER_TYPE_BY_ID[customer_type]
+
+    region_source = patch.get("region_id") or patch.get("region") or first_siebel_value(row, ["ACCOUNT_REGION"])
+    region_id = cst_region_id(region_source)
+    if region_id is not None:
+        patch["region_id"] = str(region_id)
+    if region_source and not patch.get("region"):
+        patch["region"] = str(region_source).strip()
+
+    city_source = patch.get("city_id") or patch.get("city") or first_siebel_value(row, ["ACCOUNT_CITY", "CITY", "CITY_NAME"])
+    city_id = cst_city_id(city_source)
+    if city_id is not None:
+        patch["city_id"] = str(city_id)
+        city_region_id = CST_CITY_REGION_BY_ID.get(city_id)
+        if city_region_id and not patch.get("region_id"):
+            patch["region_id"] = str(city_region_id)
+    if city_source and not patch.get("city"):
+        patch["city"] = str(city_source).strip()
+
+    access_source = patch.get("access_technology_id") or patch.get("access_technology") or patch.get("service_description") or first_siebel_value(row, ["PRODUCT_NAME"])
+    access_id = cst_access_technology_id(access_source)
+    if access_id is not None:
+        patch["access_technology_id"] = str(access_id)
+        patch["access_technology"] = CST_ACCESS_TECHNOLOGY_BY_ID[access_id]
+
+    normalize_cst_contact_fields(patch)
+
+
+def stable_json_hash(row: dict[str, str]) -> str:
+    return hashlib.sha256(json.dumps(row, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def assignment_patch_from_siebel_row(row: dict[str, str], service_id: str) -> dict[str, str]:
     patch: dict[str, str] = {}
     for field, aliases in SIEBEL_ASSIGNMENT_ALIASES.items():
         value = first_siebel_value(row, aliases)
         if value:
             patch[field] = value
+    checked_at = now_iso()
     patch["assignment_target_type"] = "business_customer"
-    patch["service_order_id"] = patch.get("service_order_id") or order_number
-    patch["siebel_order_number"] = order_number
-    patch["siebel_last_sync_at"] = now_iso()
-    patch["siebel_payload_json"] = json.dumps(row, ensure_ascii=False)
+    patch["service_id"] = patch.get("service_id") or service_id
+    patch["siebel_order_number"] = patch.get("siebel_order_number") or patch.get("service_order_id") or ""
+    patch["siebel_last_sync_at"] = checked_at
+    patch["siebel_last_checked_at"] = checked_at
+    patch["siebel_payload_hash"] = stable_json_hash(row)
+    patch["siebel_payload_json"] = json.dumps(row, ensure_ascii=False, sort_keys=True)
+    patch["id_number"] = normalize_cst_id_number(patch.get("id_number", "")) or CST_FALLBACK_ID_NUMBER
     patch["customer_type"] = patch.get("customer_type") or "Enterprise"
+    if not patch.get("full_name"):
+        name_parts = [first_siebel_value(row, ["PER_TITLE"]), first_siebel_value(row, ["FST_NAME"]), first_siebel_value(row, ["LAST_NAME"])]
+        full_name = " ".join(part.strip() for part in name_parts if part.strip())
+        if full_name:
+            patch["full_name"] = full_name
+            patch.setdefault("contact_name", full_name)
+    if not patch.get("organization_id"):
+        patch["organization_id"] = patch.get("commercial_reg_id") or patch.get("unified_number") or patch.get("bss_customer_id") or ""
+    apply_cst_lookup_mappings(patch, row)
     patch["customer_segment"] = patch.get("customer_segment") or "Enterprise"
     patch["service_type"] = patch.get("service_type") or "CustomerFacingService"
     patch["service_category"] = patch.get("service_category") or "L3 Service"
@@ -1356,14 +1699,84 @@ def assignment_patch_from_siebel_row(row: dict[str, str], order_number: str) -> 
     return patch
 
 
+def syncable_bss_fields() -> list[str]:
+    return [
+        "bss_customer_id",
+        "customer_id",
+        "customer_name",
+        "organization_name",
+        "organization_id",
+        "customer_account_id",
+        "customer_segment",
+        "commercial_reg_id",
+        "unified_number",
+        "contact_name",
+        "contact_number",
+        "contact_email",
+        "full_name",
+        "mobile_number",
+        "email",
+        "city",
+        "region",
+        "city_id",
+        "region_id",
+        "site",
+        "site_id",
+        "location_name",
+        "service_instance_id",
+        "service_instance_name",
+        "service_id",
+        "service_description",
+        "product_instance_id",
+        "service_characteristics",
+        "access_technology",
+        "access_technology_id",
+    ]
+
+
+def bss_sync_audit_from_row(row: sqlite3.Row) -> BssSyncAuditRecord:
+    return BssSyncAuditRecord(**dict(row))
+
+
+def record_bss_sync_audit(
+    connection: sqlite3.Connection,
+    assignment_id: str,
+    service_id: str,
+    order_number: str,
+    changed_field: str,
+    old_value: str = "",
+    new_value: str = "",
+    status: str = "UPDATED",
+) -> BssSyncAuditRecord:
+    record = BssSyncAuditRecord(
+        id=str(uuid4()),
+        assignment_id=assignment_id,
+        service_id=service_id,
+        siebel_order_number=order_number,
+        changed_field=changed_field,
+        old_value=old_value or "",
+        new_value=new_value or "",
+        synced_at=now_iso(),
+        status=status,
+    )
+    connection.execute(
+        """
+        INSERT INTO bss_sync_audit (id, assignment_id, service_id, siebel_order_number, changed_field, old_value, new_value, synced_at, status)
+        VALUES (:id, :assignment_id, :service_id, :siebel_order_number, :changed_field, :old_value, :new_value, :synced_at, :status)
+        """,
+        record.model_dump(),
+    )
+    return record
+
+
 def validate_siebel_query(query_sql: str) -> str:
     query = query_sql.strip()
     if not query:
         raise HTTPException(status_code=400, detail="Siebel query SQL is not configured")
     if not query.lower().startswith("select"):
         raise HTTPException(status_code=400, detail="Siebel query must be a SELECT statement")
-    if ":order_number" not in query.lower():
-        raise HTTPException(status_code=400, detail="Siebel query must include :order_number bind variable")
+    if ":service_id" not in query.lower():
+        raise HTTPException(status_code=400, detail="Siebel query must include :service_id bind variable")
     return query
 
 
@@ -1412,12 +1825,35 @@ def record_audit(
 
 def cst_config_from_row(row: sqlite3.Row) -> CstConfig:
     values = dict(row)
+    host = str(values.get("host") or "cst-oa-unified-gw-stg-fop.apps.apldev-sit-opshift.itc.local")
+    port = int(values.get("port") or 443)
+    base_url = str(values.get("base_url") or f"https://{host}:{port}")
     return CstConfig(
         id=str(values.get("id", "default")),
         enabled=bool(values.get("enabled", 1)),
         service_provider_id=str(values.get("service_provider_id") or DEFAULT_SERVICE_PROVIDER_ID),
-        auto_execute=bool(values.get("auto_execute", 1)),
+        auto_execute=True,
         scheduled_sync_enabled=bool(values.get("scheduled_sync_enabled", 1)),
+        integration_mode="Real API",
+        host=host,
+        port=port,
+        base_url=base_url,
+        token_path=str(values.get("token_path") or "/api/rest/v1.0/OAuthToken"),
+        send_path=str(values.get("send_path") or CST_SEND_LIR_PATH),
+        update_path=str(values.get("update_path") or CST_UPDATE_LIR_PATH),
+        delete_path=str(values.get("delete_path") or CST_DELETE_LIR_PATH),
+        get_path=str(values.get("get_path") or CST_GET_LIR_PATH),
+        auth_username=str(values.get("auth_username") or ""),
+        accept_language=str(values.get("accept_language") or CST_DEFAULT_ACCEPT_LANGUAGE),
+        auth_password_configured=bool(values.get("encrypted_auth_password")),
+        api_access_key_configured=bool(values.get("encrypted_api_access_key")),
+        user_key_configured=bool(values.get("encrypted_user_key")),
+        verify_ssl=False,
+        connection_timeout=int(values.get("connection_timeout") or 10),
+        read_timeout=int(values.get("read_timeout") or 30),
+        token_refresh_buffer_seconds=int(values.get("token_refresh_buffer_seconds") or 300),
+        token_expires_at=str(values.get("token_expires_at") or ""),
+        token_cached=bool(values.get("encrypted_access_token")),
         schedule_time=str(values.get("schedule_time") or "00:30"),
         schedule_timezone=str(values.get("schedule_timezone") or "Asia/Riyadh"),
         last_scheduled_run_date=str(values.get("last_scheduled_run_date") or ""),
@@ -1451,12 +1887,18 @@ def ensure_cst_config(connection: sqlite3.Connection) -> CstConfig:
             """
             INSERT INTO cst_config (
               id, enabled, service_provider_id, auto_execute, scheduled_sync_enabled,
+              integration_mode, host, port, base_url, token_path, send_path, update_path, delete_path, get_path,
+              auth_username, encrypted_auth_password, encrypted_api_access_key, encrypted_user_key, encrypted_access_token, token_expires_at,
+              verify_ssl, connection_timeout, read_timeout, token_refresh_buffer_seconds,
               schedule_time, schedule_timezone, last_scheduled_run_date, last_scheduled_run_at,
               batch_size_limit, hourly_request_limit, updated_at
             )
-            VALUES ('default', 1, ?, 1, 1, '00:30', 'Asia/Riyadh', '', '', 500, 1000, ?)
+            VALUES ('default', 1, ?, 1, 1, 'Real API', 'cst-oa-unified-gw-stg-fop.apps.apldev-sit-opshift.itc.local', 443,
+              'https://cst-oa-unified-gw-stg-fop.apps.apldev-sit-opshift.itc.local:443', '/api/rest/v1.0/OAuthToken',
+              ?, ?, ?, ?,
+              '', '', '', '', '', '', 0, 10, 30, 300, '00:30', 'Asia/Riyadh', '', '', 500, 1000, ?)
             """,
-            (DEFAULT_SERVICE_PROVIDER_ID, now_iso()),
+            (DEFAULT_SERVICE_PROVIDER_ID, CST_SEND_LIR_PATH, CST_UPDATE_LIR_PATH, CST_DELETE_LIR_PATH, CST_GET_LIR_PATH, now_iso()),
         )
         row = connection.execute("SELECT * FROM cst_config WHERE id = 'default'").fetchone()
     return cst_config_from_row(row)
@@ -1464,6 +1906,98 @@ def ensure_cst_config(connection: sqlite3.Connection) -> CstConfig:
 
 def resource_requires_cst(resource: ResourceRecord) -> bool:
     return resource.ip_type == "PUBLIC" and resource.status != "RETIRED"
+
+
+def cst_resource_reported_to_cst(connection: sqlite3.Connection, resource: ResourceRecord | None) -> bool:
+    if resource is None or resource.ip_type != "PUBLIC":
+        return False
+    if str(resource.cst_sync_status or "").upper() in {"SUCCESS", "SYNCHRONIZED"}:
+        return True
+    successful_job = connection.execute(
+        """
+        SELECT 1
+        FROM cst_sync_jobs
+        WHERE resource_uuid = ?
+          AND operation IN ('SEND', 'UPDATE')
+          AND status = 'SUCCESS'
+        LIMIT 1
+        """,
+        (resource.resource_uuid,),
+    ).fetchone()
+    if successful_job is not None:
+        return True
+    active_ledger = connection.execute(
+        """
+        SELECT 1
+        FROM cst_transaction_ledger
+        WHERE resource_uuid = ?
+          AND retired_at = ''
+          AND last_status = 'SUCCESS'
+        LIMIT 1
+        """,
+        (resource.resource_uuid,),
+    ).fetchone()
+    return active_ledger is not None
+
+
+def cst_resource_deleted_from_cst(connection: sqlite3.Connection, resource: ResourceRecord | None) -> bool:
+    if resource is None:
+        return False
+    successful_delete = connection.execute(
+        """
+        SELECT 1
+        FROM cst_sync_jobs
+        WHERE resource_uuid = ?
+          AND operation = 'DELETE'
+          AND status = 'SUCCESS'
+        LIMIT 1
+        """,
+        (resource.resource_uuid,),
+    ).fetchone()
+    if successful_delete is not None:
+        return True
+    retired_ledger = connection.execute(
+        """
+        SELECT 1
+        FROM cst_transaction_ledger
+        WHERE resource_uuid = ?
+          AND retired_at != ''
+        LIMIT 1
+        """,
+        (resource.resource_uuid,),
+    ).fetchone()
+    return retired_ledger is not None
+
+
+def cst_delete_succeeded(jobs: list[CstSyncJob]) -> bool:
+    return bool(jobs) and all(job.operation == "DELETE" and job.status == "SUCCESS" for job in jobs)
+
+
+def cst_get_lir_page_resource(config: CstConfig, page_number: int = 1) -> ResourceRecord:
+    timestamp = now_iso()
+    service_provider_id = str(config.service_provider_id or DEFAULT_SERVICE_PROVIDER_ID)
+    return ResourceRecord(
+        resource_uuid=stable_uuid("cst-get-lir-page", service_provider_id, str(page_number)),
+        version_uuid=stable_uuid("cst-get-lir-page-version", service_provider_id, str(page_number)),
+        cidr=f"CST GetLIR page {page_number}",
+        prefix=0,
+        start_ip="",
+        end_ip="",
+        size=0,
+        ownership_type="PROVIDER_RECONCILIATION",
+        status="AVAILABLE",
+        cidr_role="CST_RECONCILIATION_PAGE",
+        service_provider_id=service_provider_id,
+        service_provider_name=DEFAULT_SERVICE_PROVIDER_NAME,
+        asn=DEFAULT_ASN,
+        assignment_status_id=1,
+        ip_type="PUBLIC",
+        source_entity_type="cst_reconciliation",
+        source_entity_id=f"page-{page_number}",
+        created_at=timestamp,
+        updated_at=timestamp,
+    )
+
 
 
 def cst_transaction_id_for_resource(connection: sqlite3.Connection, resource: ResourceRecord, operation: str, batch_id: str, correlation_id: str) -> str:
@@ -1505,7 +2039,106 @@ def cst_transaction_id_for_resource(connection: sqlite3.Connection, resource: Re
     return candidate
 
 
+def cst_int_value(value: object, default: int | None = None) -> int | None:
+    text = str(value or "").strip()
+    if not text:
+        return default
+    try:
+        return int(text)
+    except ValueError:
+        return default
+
+
+def cst_date_value(value: str, default: str = "") -> str:
+    text = str(value or "").strip() or str(default or "").strip()
+    if not text:
+        return ""
+    normalized = text.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        match = re.match(r"^(\d{4})-(\d{2})-(\d{2})", text)
+        if not match:
+            return text
+        parsed = datetime(int(match.group(1)), int(match.group(2)), int(match.group(3)), tzinfo=CST_API_TIMEZONE)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=CST_API_TIMEZONE)
+    else:
+        parsed = parsed.astimezone(CST_API_TIMEZONE)
+    return parsed.isoformat(timespec="seconds")
+
+
 def cst_payload_for_resource(resource: ResourceRecord, operation: str, transaction_id: str, correlation_id: str) -> dict:
+    service_provider_id = str(resource.service_provider_id or DEFAULT_SERVICE_PROVIDER_ID)
+    if operation == "SEND":
+        today_text = datetime.now(timezone.utc).date().isoformat()
+        record = {
+            "transactionId": transaction_id,
+            "ipSubnet": resource.cidr,
+            "asn": resource.asn or DEFAULT_ASN,
+            "ipVersionId": cst_int_value(resource.ip_version, 1),
+            "assignmentStatusId": cst_int_value(resource.assignment_status_id, 1),
+            "serviceDescription": resource.service_description or resource.description or "",
+        }
+        organization_name = (resource.organization_name or resource.customer_name or "").strip()
+        optional_text_fields = {
+            "organizationName": organization_name,
+            "organizationId": resource.organization_id,
+            "description": resource.description,
+        }
+        for key, value in optional_text_fields.items():
+            if str(value or "").strip():
+                record[key] = str(value).strip()
+        optional_int_fields = {
+            "customerTypeId": resource.customer_type_id,
+            "regionId": resource.region_id,
+            "cityId": resource.city_id,
+            "accessTechnologyId": resource.access_technology_id,
+        }
+        for key, value in optional_int_fields.items():
+            int_value = cst_int_value(value)
+            if int_value is not None:
+                record[key] = int_value
+        raw_mobile_number = str(resource.mobile_number or "").strip()
+        mobile_number = normalize_cst_mobile_number(raw_mobile_number) or (CST_FALLBACK_PHONE_NUMBER if raw_mobile_number or resource.ownership_type in {"BUSINESS", "INDIVIDUAL"} else "")
+        id_number = normalize_cst_id_number(resource.id_number) or (CST_FALLBACK_ID_NUMBER if resource.ownership_type in {"BUSINESS", "INDIVIDUAL"} else str(resource.id_number or "").strip())
+        email = normalize_cst_email(resource.email) or str(resource.email or "").strip()
+        contact = {
+            "fullName": str(resource.full_name or "").strip(),
+            "mobileNumber": mobile_number,
+            "idNumber": id_number,
+            "email": email,
+        }
+        contact = {key: value for key, value in contact.items() if value}
+        if contact:
+            record["contact"] = contact
+        include_customer_dates = resource.ownership_type in {"BUSINESS", "INDIVIDUAL"} or bool(organization_name or contact)
+        if resource.assignment_date or include_customer_dates:
+            record["assignmentDate"] = cst_date_value(resource.assignment_date, today_text)
+        if resource.update_date or include_customer_dates:
+            record["updateDate"] = cst_date_value(resource.update_date, today_text)
+        return {
+            "serviceProviderId": cst_int_value(service_provider_id, cst_int_value(DEFAULT_SERVICE_PROVIDER_ID, 1)),
+            "data": [record],
+        }
+    if operation == "UPDATE":
+        return {
+            "serviceProviderId": service_provider_id,
+            "data": [
+                {
+                    "transactionId": transaction_id,
+                    "assignmentStatusId": str(resource.assignment_status_id),
+                    "serviceDescription": resource.service_description or resource.description or "",
+                    "asaan": resource.asn or DEFAULT_ASN,
+                }
+            ],
+        }
+    if operation == "GET":
+        return {
+            "serviceProviderId": cst_int_value(service_provider_id, cst_int_value(DEFAULT_SERVICE_PROVIDER_ID, 1)),
+            "pageNumber": 1,
+            "pageSize": 1000,
+        }
     return {
         "transactionId": transaction_id,
         "correlationId": correlation_id,
@@ -1518,7 +2151,7 @@ def cst_payload_for_resource(resource: ResourceRecord, operation: str, transacti
         "prefix": resource.prefix,
         "size": resource.size,
         "ipVersion": resource.ip_version,
-        "serviceProviderId": resource.service_provider_id or DEFAULT_SERVICE_PROVIDER_ID,
+        "serviceProviderId": service_provider_id,
         "serviceProviderName": resource.service_provider_name or DEFAULT_SERVICE_PROVIDER_NAME,
         "asn": resource.asn or DEFAULT_ASN,
         "assignmentStatusId": resource.assignment_status_id,
@@ -1537,6 +2170,88 @@ def cst_payload_for_resource(resource: ResourceRecord, operation: str, transacti
         "sourceEntityId": resource.source_entity_id,
     }
 
+
+
+def cst_payload_record(payload: dict) -> dict:
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        return data[0]
+    return {}
+
+
+def cst_quality_message(issues: list[str]) -> str:
+    return "BSS data quality validation failed: " + "; ".join(issues[:12])
+
+
+def cst_business_data_quality_issues(resource: ResourceRecord, record: dict) -> list[str]:
+    issues: list[str] = []
+    contact = record.get("contact") if isinstance(record.get("contact"), dict) else {}
+
+    def require_text(path: str, value: object) -> None:
+        if not str(value or "").strip():
+            issues.append(f"{path} is required for Business assignment")
+
+    require_text("organizationName", record.get("organizationName"))
+    require_text("contact.fullName", contact.get("fullName"))
+    require_text("contact.mobileNumber", contact.get("mobileNumber"))
+    require_text("contact.idNumber", contact.get("idNumber"))
+    require_text("contact.email", contact.get("email"))
+    require_text("assignmentDate", record.get("assignmentDate"))
+    require_text("updateDate", record.get("updateDate"))
+
+    customer_type_id = record.get("customerTypeId")
+    if customer_type_id not in {1, 2}:
+        issues.append("customerTypeId must map to CST 1 Government or 2 Non-Government")
+    region_id = record.get("regionId")
+    valid_region_ids = {item_id for item_id, _name in CST_REGION_ROWS}
+    if region_id not in valid_region_ids:
+        issues.append("regionId is required and must map to a CST region")
+    city_id = record.get("cityId")
+    if city_id is not None and city_id not in CST_CITY_REGION_BY_ID:
+        issues.append("cityId is present but does not map to a CST city")
+    access_technology_id = record.get("accessTechnologyId")
+    if access_technology_id is not None and access_technology_id not in CST_ACCESS_TECHNOLOGY_BY_ID:
+        issues.append("accessTechnologyId is present but does not map to CST FTTH/ADSL/Mobile/FWA")
+
+    mobile_number = str(contact.get("mobileNumber") or "")
+    if mobile_number and not normalize_cst_mobile_number(mobile_number):
+        issues.append("contact.mobileNumber must be Saudi phone format 9665XXXXXXXX, 9661XXXXXXXX, or fallback 9665000000")
+    id_number = str(contact.get("idNumber") or "")
+    if id_number and not normalize_cst_id_number(id_number):
+        issues.append("contact.idNumber must be 10 digits")
+    email = str(contact.get("email") or "")
+    if email and not normalize_cst_email(email):
+        issues.append("contact.email must be a valid email address")
+
+    resource_city = str(getattr(resource, "city", "") or "").strip()
+    resource_region = str(getattr(resource, "region", "") or "").strip()
+    if resource_city and record.get("cityId") is None:
+        issues.append(f"cityId could not be mapped from BSS city '{resource_city}'")
+    if resource_region and record.get("regionId") is None:
+        issues.append(f"regionId could not be mapped from BSS region '{resource_region}'")
+    return issues
+
+
+def cst_data_quality_issues(resource: ResourceRecord, operation: str, payload: dict) -> list[str]:
+    if operation not in {"SEND", "UPDATE"}:
+        return []
+    record = cst_payload_record(payload)
+    assignment_status_id = cst_int_value(record.get("assignmentStatusId"), resource.assignment_status_id)
+    ownership_type = (resource.ownership_type or "").upper()
+    issues: list[str] = []
+    if assignment_status_id == 3 or ownership_type == "BUSINESS":
+        issues.extend(cst_business_data_quality_issues(resource, record))
+    elif assignment_status_id == 2 or ownership_type == "INTERNAL":
+        if not str(record.get("serviceDescription") or resource.service_description or "").strip():
+            issues.append("serviceDescription is required for Internal assignment")
+    elif assignment_status_id == 4 or ownership_type == "INDIVIDUAL":
+        region_id = record.get("regionId")
+        access_technology_id = record.get("accessTechnologyId")
+        if region_id not in {item_id for item_id, _name in CST_REGION_ROWS}:
+            issues.append("regionId is required and must map to a CST region for Individual assignment")
+        if access_technology_id not in CST_ACCESS_TECHNOLOGY_BY_ID:
+            issues.append("accessTechnologyId is required for Individual assignment")
+    return issues
 
 
 def cst_resource_from_network(
@@ -1623,6 +2338,169 @@ def active_cst_containers_for_network(connection: sqlite3.Connection, network: I
     return [row for _prefix, row in containers[:1]]
 
 
+def parse_iso_datetime(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def cst_real_api_enabled(config: CstConfig) -> bool:
+    return True
+
+
+def cst_append_user_key_param(url: str, user_key: str) -> str:
+    if not user_key:
+        return url
+    parts = urllib_parse.urlsplit(url)
+    query_items = [(key, value) for key, value in urllib_parse.parse_qsl(parts.query, keep_blank_values=True) if key != "user_key"]
+    query_items.append(("user_key", user_key))
+    return urllib_parse.urlunsplit((parts.scheme, parts.netloc, parts.path, urllib_parse.urlencode(query_items), parts.fragment))
+
+
+def cst_redact_url(url: str) -> str:
+    parts = urllib_parse.urlsplit(url)
+    query_items = [(key, "***" if key == "user_key" else value) for key, value in urllib_parse.parse_qsl(parts.query, keep_blank_values=True)]
+    return urllib_parse.urlunsplit((parts.scheme, parts.netloc, parts.path, urllib_parse.urlencode(query_items), parts.fragment))
+
+
+def cst_token_url(config: CstConfig) -> str:
+    return urllib_parse.urljoin(config.base_url.rstrip("/") + "/", config.token_path.lstrip("/"))
+
+
+def cst_operation_path(config: CstConfig, operation: str) -> str:
+    return {
+        "SEND": config.send_path,
+        "UPDATE": config.update_path,
+        "DELETE": config.delete_path,
+        "GET": config.get_path,
+    }.get(operation, config.send_path)
+
+
+def cst_operation_url(config: CstConfig, resource: ResourceRecord, operation: str, transaction_id: str) -> str:
+    path = cst_operation_path(config, operation)
+    replacements = {
+        "resourceUuid": resource.resource_uuid,
+        "transactionId": transaction_id,
+        "cidr": resource.cidr,
+        "serviceId": resource.service_id,
+    }
+    for key, value in replacements.items():
+        path = path.replace("{" + key + "}", urllib_parse.quote(str(value or ""), safe=""))
+    return urllib_parse.urljoin(config.base_url.rstrip("/") + "/", path.lstrip("/"))
+
+
+def cst_ssl_context(config: CstConfig) -> ssl.SSLContext | None:
+    return ssl._create_unverified_context()
+
+
+def cst_http_request(config: CstConfig, method: str, url: str, headers: dict[str, str], body: bytes | None, timeout: int) -> tuple[int, dict]:
+    request = urllib_request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib_request.urlopen(request, timeout=timeout, context=cst_ssl_context(config)) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+            try:
+                parsed = json.loads(raw) if raw else {}
+            except json.JSONDecodeError:
+                parsed = {"raw": raw}
+            return int(response.status), parsed
+    except urllib_error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            parsed = {"raw": raw}
+        parsed.setdefault("error", exc.reason)
+        return int(exc.code), parsed
+    except (TimeoutError, OSError, urllib_error.URLError) as exc:
+        raise HTTPException(status_code=502, detail=f"CST request failed: {exc}") from exc
+
+
+def ensure_cst_access_token(connection: sqlite3.Connection, config: CstConfig, force_refresh: bool = False) -> str:
+    row = connection.execute("SELECT * FROM cst_config WHERE id = 'default'").fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="CST configuration not initialized")
+    values = dict(row)
+    expires_at = parse_iso_datetime(str(values.get("token_expires_at") or ""))
+    encrypted_token = str(values.get("encrypted_access_token") or "")
+    refresh_at = datetime.now(timezone.utc) + timedelta(seconds=config.token_refresh_buffer_seconds)
+    if not force_refresh and encrypted_token and expires_at and expires_at > refresh_at:
+        token = decrypt_secret(encrypted_token)
+        if token:
+            return token
+
+    password = decrypt_secret(str(values.get("encrypted_auth_password") or ""))
+    if not config.auth_username or not password:
+        raise HTTPException(status_code=400, detail="CST authorization username/password is not configured")
+    user_key = decrypt_secret(str(values.get("encrypted_user_key") or ""))
+    token_url = cst_append_user_key_param(cst_token_url(config), user_key)
+    basic_value = base64.b64encode(f"{config.auth_username}:{password}".encode("utf-8")).decode("ascii")
+    headers = {
+        "Authorization": f"Basic {basic_value}",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+    }
+    api_key = decrypt_secret(str(values.get("encrypted_api_access_key") or ""))
+    if api_key:
+        headers["X-API-Key"] = api_key
+    if user_key:
+        headers["user_key"] = user_key
+    body = urllib_parse.urlencode({"grant_type": "client_credentials"}).encode("utf-8")
+    status_code, response = cst_http_request(config, "POST", token_url, headers, body, config.connection_timeout)
+    if status_code < 200 or status_code >= 300:
+        raise HTTPException(status_code=502, detail=f"CST token request failed with HTTP {status_code}: {json.dumps(response)[:500]}")
+    token = str(response.get("access_token") or response.get("token") or "")
+    if not token:
+        raise HTTPException(status_code=502, detail="CST token response did not include access_token")
+    expires_in = int(response.get("expires_in") or response.get("expiresIn") or 3600)
+    token_expires_at = (datetime.now(timezone.utc) + timedelta(seconds=max(expires_in, 60))).isoformat()
+    connection.execute(
+        "UPDATE cst_config SET encrypted_access_token = ?, token_expires_at = ?, updated_at = ? WHERE id = 'default'",
+        (encrypt_secret(token), token_expires_at, now_iso()),
+    )
+    return token
+
+
+def execute_cst_real_api_job(connection: sqlite3.Connection, config: CstConfig, resource: ResourceRecord, operation: str, payload: dict, transaction_id: str) -> tuple[str, str, dict]:
+    token = ensure_cst_access_token(connection, config)
+    method = "POST"
+    url = cst_operation_url(config, resource, operation, transaction_id)
+    request_at = datetime.now(timezone.utc)
+    request_id = request_at.strftime("%Y%m%d%H%M%S") + f"{request_at.microsecond // 1000:03d}"
+    headers = {
+        "requestId": request_id,
+        "Accept-Language": config.accept_language or CST_DEFAULT_ACCEPT_LANGUAGE,
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    row = connection.execute("SELECT encrypted_api_access_key, encrypted_user_key FROM cst_config WHERE id = 'default'").fetchone()
+    api_key = decrypt_secret(str(row["encrypted_api_access_key"] or "")) if row else ""
+    if api_key:
+        headers["x-Gateway-APIKey"] = api_key
+    user_key = decrypt_secret(str(row["encrypted_user_key"] or "")) if row else ""
+    url = cst_append_user_key_param(url, user_key)
+    if user_key:
+        headers["user_key"] = user_key
+    body = None if method == "GET" else json.dumps(payload, sort_keys=True).encode("utf-8")
+    status_code, response_body = cst_http_request(config, method, url, headers, body, config.read_timeout)
+    accepted = 200 <= status_code < 300
+    response = {
+        "temporaryStorage": False,
+        "externalApiCalled": True,
+        "accepted": accepted,
+        "httpStatus": status_code,
+        "method": method,
+        "url": cst_redact_url(url),
+        "body": response_body,
+        "processedAt": now_iso(),
+    }
+    return ("SUCCESS" if accepted else "FAILED", "" if accepted else f"CST API HTTP {status_code}", response)
+
+
 def create_cst_assignment_create_jobs(
     connection: sqlite3.Connection,
     assignment: Assignment,
@@ -1679,28 +2557,27 @@ def create_cst_sync_jobs(
     for sequence_no, (resource, operation) in enumerate(eligible, start=1):
         transaction_id = cst_transaction_id_for_resource(connection, resource, operation, batch_id, correlation_id)
         payload = cst_payload_for_resource(resource, operation, transaction_id, correlation_id)
+        validation_payload = payload if operation == "SEND" else cst_payload_for_resource(resource, "SEND", transaction_id, correlation_id)
+        quality_issues = cst_data_quality_issues(resource, operation, validation_payload)
         if not config.enabled:
             status = "BLOCKED"
             last_error = "CST integration is disabled in Administration"
             response = {"temporaryStorage": True, "externalApiCalled": False, "accepted": False, "message": last_error}
-        elif config.scheduled_sync_enabled and not workflow_type.startswith("CST_DAILY_DAY_MINUS_1"):
-            status = "PENDING"
-            last_error = ""
-            response = {"temporaryStorage": True, "externalApiCalled": False, "accepted": True, "message": f"Queued for daily CST sync at {config.schedule_time} {config.schedule_timezone}"}
-        elif config.auto_execute:
-            status = "SUCCESS"
-            last_error = ""
-            response = {
-                "temporaryStorage": True,
-                "externalApiCalled": False,
-                "accepted": True,
-                "message": "Stored in local CST transaction table. External CST API integration is pending.",
-                "processedAt": now_iso(),
-            }
+        elif quality_issues:
+            status = "BLOCKED"
+            last_error = cst_quality_message(quality_issues)
+            response = {"temporaryStorage": True, "externalApiCalled": False, "accepted": False, "dataQualityStatus": "INVALID_FOR_CST", "issues": quality_issues, "message": last_error}
         else:
-            status = "PENDING"
-            last_error = ""
-            response = {"temporaryStorage": True, "externalApiCalled": False, "accepted": True, "message": "Queued locally for CST processing"}
+            try:
+                status, last_error, response = execute_cst_real_api_job(connection, config, resource, operation, payload, transaction_id)
+            except HTTPException as exc:
+                status = "FAILED"
+                last_error = str(exc.detail)
+                response = {"temporaryStorage": False, "externalApiCalled": True, "accepted": False, "message": last_error, "processedAt": now_iso()}
+            except Exception as exc:
+                status = "FAILED"
+                last_error = str(exc)
+                response = {"temporaryStorage": False, "externalApiCalled": True, "accepted": False, "message": last_error, "processedAt": now_iso()}
 
         updated_at = now_iso()
         job = CstSyncJob(
@@ -1753,7 +2630,7 @@ def create_cst_sync_jobs(
             )
         jobs.append(job)
 
-    completed_jobs = sum(1 for job in jobs if job.status == "SUCCESS")
+    completed_jobs = sum(1 for job in jobs if job.status in {"SUCCESS", "NOT_REQUIRED"})
     failed_jobs = sum(1 for job in jobs if job.status == "FAILED")
     blocked_jobs = sum(1 for job in jobs if job.status == "BLOCKED")
     batch_status = "SUCCESS" if completed_jobs == len(jobs) else "BLOCKED" if blocked_jobs else "FAILED" if failed_jobs else "PENDING"
@@ -1770,30 +2647,53 @@ def create_cst_sync_jobs(
 
 def retry_cst_jobs(connection: sqlite3.Connection, job_rows: list[sqlite3.Row]) -> list[CstSyncJob]:
     updated_jobs: list[CstSyncJob] = []
+    config = ensure_cst_config(connection)
     for row in job_rows:
         job = cst_job_from_row(row)
-        response = {
-            "temporaryStorage": True,
-            "externalApiCalled": False,
-            "accepted": True,
-            "message": "Retry stored locally. External CST API integration is pending.",
-            "processedAt": now_iso(),
-        }
+        resource_row = connection.execute("SELECT * FROM ip_resources WHERE resource_uuid = ?", (job.resource_uuid,)).fetchone()
+        resource = resource_from_row(resource_row) if resource_row else None
+        stored_payload = json.loads(job.payload_json or "{}")
+        if resource is None and job.operation == "GET":
+            page_number = int(stored_payload.get("pageNumber") or 1)
+            resource = cst_get_lir_page_resource(config, page_number)
         updated_at = now_iso()
+        payload = cst_payload_for_resource(resource, job.operation, job.transaction_id, job.batch_id) if resource else stored_payload
+        validation_payload = cst_payload_for_resource(resource, "SEND", job.transaction_id, job.batch_id) if resource and job.operation not in {"SEND", "GET"} else payload
+        quality_issues = cst_data_quality_issues(resource, job.operation, validation_payload) if resource else []
+        if quality_issues:
+            status = "BLOCKED"
+            last_error = cst_quality_message(quality_issues)
+            response = {"temporaryStorage": True, "externalApiCalled": False, "accepted": False, "dataQualityStatus": "INVALID_FOR_CST", "issues": quality_issues, "message": last_error}
+        elif config.enabled and resource:
+            try:
+                status, last_error, response = execute_cst_real_api_job(connection, config, resource, job.operation, payload, job.transaction_id)
+            except HTTPException as exc:
+                status = "FAILED"
+                last_error = str(exc.detail)
+                response = {"temporaryStorage": False, "externalApiCalled": True, "accepted": False, "message": last_error, "processedAt": now_iso()}
+            except Exception as exc:
+                status = "FAILED"
+                last_error = str(exc)
+                response = {"temporaryStorage": False, "externalApiCalled": True, "accepted": False, "message": last_error, "processedAt": now_iso()}
+        else:
+            status = "BLOCKED" if not config.enabled else "NOT_REQUIRED"
+            last_error = "CST integration is disabled in Administration" if not config.enabled else ""
+            message = last_error or "Local resource was removed before CST reporting; CST API call is not required"
+            response = {"temporaryStorage": False, "externalApiCalled": False, "accepted": status == "NOT_REQUIRED", "message": message, "processedAt": now_iso()}
         connection.execute(
             """
             UPDATE cst_sync_jobs
-            SET status = 'SUCCESS', attempt_count = attempt_count + 1, last_error = '', response_json = ?, updated_at = ?
+            SET status = ?, attempt_count = attempt_count + 1, last_error = ?, payload_json = ?, response_json = ?, updated_at = ?
             WHERE id = ?
             """,
-            (json.dumps(response, sort_keys=True), updated_at, job.id),
+            (status, last_error, json.dumps(payload, sort_keys=True), json.dumps(response, sort_keys=True), updated_at, job.id),
         )
         connection.execute(
-            "UPDATE cst_transaction_ledger SET last_status = 'SUCCESS', batch_id = ? WHERE transaction_id = ?",
-            (job.batch_id, job.transaction_id),
+            "UPDATE cst_transaction_ledger SET last_status = ?, batch_id = ? WHERE transaction_id = ?",
+            (status, job.batch_id, job.transaction_id),
         )
-        action_flag = "D" if job.operation == "DELETE" else "S"
-        retired_at = updated_at if job.operation == "DELETE" else ""
+        action_flag = "D" if job.operation == "DELETE" and status == "SUCCESS" else "S" if status == "SUCCESS" else "F" if status in {"FAILED", "BLOCKED"} else "U"
+        retired_at = updated_at if job.operation == "DELETE" and status == "SUCCESS" else ""
         retired_reason = "Removed from CST LIR registry" if retired_at else ""
         connection.execute(
             """
@@ -1804,21 +2704,21 @@ def retry_cst_jobs(connection: sqlite3.Connection, job_rows: list[sqlite3.Row]) 
             (retired_at, retired_reason, job.transaction_id),
         )
         connection.execute(
-            "UPDATE ip_resources SET cst_sync_status = 'SUCCESS', transaction_id = ?, action_flag = ?, updated_at = ? WHERE resource_uuid = ?",
-            (job.transaction_id, action_flag, updated_at, job.resource_uuid),
+            "UPDATE ip_resources SET cst_sync_status = ?, transaction_id = ?, action_flag = ?, updated_at = ? WHERE resource_uuid = ?",
+            (status, job.transaction_id, action_flag, updated_at, job.resource_uuid),
         )
         updated = connection.execute("SELECT * FROM cst_sync_jobs WHERE id = ?", (job.id,)).fetchone()
         updated_jobs.append(cst_job_from_row(updated))
     for batch_id in {job.batch_id for job in updated_jobs}:
         rows = connection.execute("SELECT status FROM cst_sync_jobs WHERE batch_id = ?", (batch_id,)).fetchall()
         total = len(rows)
-        completed = sum(1 for item in rows if item["status"] == "SUCCESS")
+        completed = sum(1 for item in rows if item["status"] in {"SUCCESS", "NOT_REQUIRED"})
         failed = sum(1 for item in rows if item["status"] == "FAILED")
         blocked = sum(1 for item in rows if item["status"] == "BLOCKED")
         status = "SUCCESS" if completed == total else "BLOCKED" if blocked else "FAILED" if failed else "PENDING"
         connection.execute(
             "UPDATE cst_sync_batches SET status = ?, completed_jobs = ?, failed_jobs = ?, blocked_jobs = ?, completed_at = ? WHERE id = ?",
-            (status, completed, failed, blocked, now_iso() if status == "SUCCESS" else "", batch_id),
+            (status, completed, failed, blocked, now_iso() if status in {"SUCCESS", "NOT_REQUIRED"} else "", batch_id),
         )
     return updated_jobs
 
@@ -2197,6 +3097,22 @@ def init_db() -> None:
               updated_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS bss_sync_audit (
+              id TEXT PRIMARY KEY,
+              assignment_id TEXT NOT NULL,
+              service_id TEXT NOT NULL DEFAULT '',
+              siebel_order_number TEXT NOT NULL,
+              changed_field TEXT NOT NULL,
+              old_value TEXT NOT NULL,
+              new_value TEXT NOT NULL,
+              synced_at TEXT NOT NULL,
+              status TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_bss_sync_assignment ON bss_sync_audit (assignment_id, synced_at);
+            CREATE INDEX IF NOT EXISTS idx_bss_sync_service ON bss_sync_audit (service_id, synced_at);
+            CREATE INDEX IF NOT EXISTS idx_bss_sync_order ON bss_sync_audit (siebel_order_number, synced_at);
+
             CREATE TABLE IF NOT EXISTS ripe_allocated_pools (
               id TEXT PRIMARY KEY,
               pool_name TEXT NOT NULL,
@@ -2218,6 +3134,26 @@ def init_db() -> None:
               service_provider_id TEXT NOT NULL,
               auto_execute INTEGER NOT NULL,
               scheduled_sync_enabled INTEGER NOT NULL DEFAULT 1,
+              integration_mode TEXT NOT NULL DEFAULT 'Real API',
+              host TEXT NOT NULL DEFAULT 'cst-oa-unified-gw-stg-fop.apps.apldev-sit-opshift.itc.local',
+              port INTEGER NOT NULL DEFAULT 443,
+              base_url TEXT NOT NULL DEFAULT 'https://cst-oa-unified-gw-stg-fop.apps.apldev-sit-opshift.itc.local:443',
+              token_path TEXT NOT NULL DEFAULT '/api/rest/v1.0/OAuthToken',
+              send_path TEXT NOT NULL DEFAULT '/api/rest/v1.0/LIRDataService/SendLIRData',
+              update_path TEXT NOT NULL DEFAULT '/api/rest/v1.0/LIRDataService/UpdateLIRData',
+              delete_path TEXT NOT NULL DEFAULT '/api/rest/v1.0/LIRDataService/DeleteLIRData',
+              get_path TEXT NOT NULL DEFAULT '/api/rest/v1.0/LIRDataService/GetLIRData',
+              auth_username TEXT NOT NULL DEFAULT '',
+              accept_language TEXT NOT NULL DEFAULT 'EN',
+              encrypted_auth_password TEXT NOT NULL DEFAULT '',
+              encrypted_api_access_key TEXT NOT NULL DEFAULT '',
+              encrypted_user_key TEXT NOT NULL DEFAULT '',
+              encrypted_access_token TEXT NOT NULL DEFAULT '',
+              token_expires_at TEXT NOT NULL DEFAULT '',
+              verify_ssl INTEGER NOT NULL DEFAULT 0,
+              connection_timeout INTEGER NOT NULL DEFAULT 10,
+              read_timeout INTEGER NOT NULL DEFAULT 30,
+              token_refresh_buffer_seconds INTEGER NOT NULL DEFAULT 300,
               schedule_time TEXT NOT NULL DEFAULT '00:30',
               schedule_timezone TEXT NOT NULL DEFAULT 'Asia/Riyadh',
               last_scheduled_run_date TEXT NOT NULL DEFAULT '',
@@ -2297,8 +3233,22 @@ def init_db() -> None:
                     """
                 )
         add_missing_columns(connection, "assignments", Assignment)
+        add_missing_columns(connection, "ip_resources", ResourceRecord)
         add_missing_columns(connection, "assignment_details", AssignmentDetailRecord)
+        bss_audit_columns = {row["name"] for row in connection.execute("PRAGMA table_info(bss_sync_audit)").fetchall()}
+        if "service_id" not in bss_audit_columns:
+            connection.execute("ALTER TABLE bss_sync_audit ADD COLUMN service_id TEXT NOT NULL DEFAULT ''")
         add_missing_columns(connection, "cst_config", CstConfig)
+        cst_config_columns = {row["name"] for row in connection.execute("PRAGMA table_info(cst_config)").fetchall()}
+        if "accept_language" not in cst_config_columns:
+            connection.execute("ALTER TABLE cst_config ADD COLUMN accept_language TEXT NOT NULL DEFAULT 'EN'")
+        connection.execute("UPDATE cst_config SET send_path = ? WHERE send_path = '/api/rest/v1.0/lir/resources'", (CST_SEND_LIR_PATH,))
+        connection.execute("UPDATE cst_config SET update_path = ? WHERE update_path = '/api/rest/v1.0/lir/resources/{resourceUuid}'", (CST_UPDATE_LIR_PATH,))
+        connection.execute("UPDATE cst_config SET delete_path = ? WHERE delete_path = '/api/rest/v1.0/lir/resources/{resourceUuid}'", (CST_DELETE_LIR_PATH,))
+        connection.execute("UPDATE cst_config SET get_path = ? WHERE get_path = '/api/rest/v1.0/lir/resources/{resourceUuid}'", (CST_GET_LIR_PATH,))
+        for column_name in ["encrypted_auth_password", "encrypted_api_access_key", "encrypted_user_key", "encrypted_access_token"]:
+            if column_name not in cst_config_columns:
+                connection.execute(f"ALTER TABLE cst_config ADD COLUMN {column_name} TEXT NOT NULL DEFAULT ''")
         migrate_legacy_cst_transaction_ids(connection)
 
         siebel_config_count = connection.execute("SELECT COUNT(*) FROM siebel_config").fetchone()[0]
@@ -2306,7 +3256,7 @@ def init_db() -> None:
             connection.execute(
                 """
                 INSERT INTO siebel_config (id, username, encrypted_password, dsn, connection_timeout, query_sql, updated_at)
-                VALUES ('default', 'LIR_USER', '', '172.31.23.101:1525/SIDB', 10, '', ?)
+                VALUES ('default', 'LIR_USER', '', '172.31.23.101:1525/SIDB', 10, ?, ?)
                 """,
                 (now_iso(),),
             )
@@ -2317,13 +3267,21 @@ def init_db() -> None:
                 """
                 INSERT INTO cst_config (
                   id, enabled, service_provider_id, auto_execute, scheduled_sync_enabled,
+                  integration_mode, host, port, base_url, token_path, send_path, update_path, delete_path, get_path,
+                  auth_username, encrypted_auth_password, encrypted_api_access_key, encrypted_user_key, encrypted_access_token, token_expires_at,
+                  verify_ssl, connection_timeout, read_timeout, token_refresh_buffer_seconds,
                   schedule_time, schedule_timezone, last_scheduled_run_date, last_scheduled_run_at,
                   batch_size_limit, hourly_request_limit, updated_at
                 )
-                VALUES ('default', 1, ?, 1, 1, '00:30', 'Asia/Riyadh', '', '', 500, 1000, ?)
+                VALUES ('default', 1, ?, 1, 1, 'Real API', 'cst-oa-unified-gw-stg-fop.apps.apldev-sit-opshift.itc.local', 443,
+                  'https://cst-oa-unified-gw-stg-fop.apps.apldev-sit-opshift.itc.local:443', '/api/rest/v1.0/OAuthToken',
+                  ?, ?, ?, ?,
+                  '', '', '', '', '', '', 0, 10, 30, 300, '00:30', 'Asia/Riyadh', '', '', 500, 1000, ?)
                 """,
-                (DEFAULT_SERVICE_PROVIDER_ID, now_iso()),
+                (DEFAULT_SERVICE_PROVIDER_ID, CST_SEND_LIR_PATH, CST_UPDATE_LIR_PATH, CST_DELETE_LIR_PATH, CST_GET_LIR_PATH, now_iso()),
             )
+
+        connection.execute("UPDATE cst_config SET integration_mode = 'Real API', auto_execute = 1")
 
         user_count = connection.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         if user_count == 0:
@@ -3081,11 +4039,40 @@ def update_siebel_config(payload: SiebelConfigUpdate) -> SiebelConfigOut:
     return siebel_config_from_row(row)
 
 
-@app.post("/siebel/business-customer", response_model=SiebelLookupResponse)
-def lookup_siebel_business_customer(payload: SiebelLookupRequest) -> SiebelLookupResponse:
-    order_number = payload.order_number.strip()
-    if not order_number:
-        raise HTTPException(status_code=400, detail="Order number is required")
+
+@app.post("/siebel/config/test-connection", response_model=SiebelConnectionTestResponse)
+def test_siebel_connection() -> SiebelConnectionTestResponse:
+    if oracledb is None:
+        raise HTTPException(status_code=503, detail="Python package oracledb is not installed on the API server")
+    with connect() as connection:
+        config = connection.execute("SELECT * FROM siebel_config WHERE id = 'default'").fetchone()
+    if config is None:
+        raise HTTPException(status_code=404, detail="Siebel configuration not initialized")
+    encrypted_password = str(config["encrypted_password"] or "")
+    if not encrypted_password:
+        raise HTTPException(status_code=400, detail="Siebel password is not configured")
+    dsn = str(config["dsn"] or "172.31.23.101:1525/SIDB")
+    try:
+        siebel_connection = oracledb.connect(
+            user=str(config["username"] or "LIR_USER"),
+            password=decrypt_secret(encrypted_password),
+            dsn=dsn,
+        )
+        siebel_connection.call_timeout = int(config["connection_timeout"] or 10) * 1000
+        with siebel_connection:
+            cursor = siebel_connection.cursor()
+            cursor.execute("SELECT 1 FROM dual")
+            cursor.fetchone()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Siebel connection test failed: {exc}") from exc
+    return SiebelConnectionTestResponse(
+        success=True,
+        message="Siebel database connection test succeeded.",
+        dsn=dsn,
+        tested_at=now_iso(),
+    )
+
+def fetch_siebel_business_customer(service_id: str) -> SiebelLookupResponse:
     if oracledb is None:
         raise HTTPException(status_code=503, detail="Python package oracledb is not installed on the API server")
     with connect() as connection:
@@ -3105,17 +4092,140 @@ def lookup_siebel_business_customer(payload: SiebelLookupRequest) -> SiebelLooku
         siebel_connection.call_timeout = int(config["connection_timeout"] or 10) * 1000
         with siebel_connection:
             cursor = siebel_connection.cursor()
-            cursor.execute(query, order_number=order_number)
+            cursor.execute(query, service_id=f"%{service_id}%")
             row = cursor.fetchone()
             if row is None:
-                return SiebelLookupResponse(order_number=order_number, found=False, message="No Siebel customer details found for this order number")
+                return SiebelLookupResponse(service_id=service_id, found=False, message="No Siebel customer details found for this service ID")
             columns = [str(column[0]) for column in cursor.description]
             raw = {column: serialize_siebel_value(value) for column, value in zip(columns, row)}
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Siebel lookup failed: {exc}") from exc
-    return SiebelLookupResponse(order_number=order_number, found=True, assignment=assignment_patch_from_siebel_row(raw, order_number), raw=raw, message="Siebel customer details fetched")
+    patch = assignment_patch_from_siebel_row(raw, service_id)
+    return SiebelLookupResponse(service_id=service_id, order_number=patch.get("siebel_order_number", ""), found=True, assignment=patch, raw=raw, message="Siebel customer details fetched")
+
+
+def apply_bss_delta_to_assignment(connection: sqlite3.Connection, assignment: Assignment, patch: dict[str, str]) -> tuple[Assignment, list[BssSyncAuditRecord], bool]:
+    service_id = patch.get("service_id") or assignment.service_id
+    order_number = patch.get("siebel_order_number") or assignment.siebel_order_number or assignment.service_order_id
+    audit_rows: list[BssSyncAuditRecord] = []
+    changed_values: dict[str, str] = {}
+    for field in syncable_bss_fields():
+        if field not in patch:
+            continue
+        old_value = str(getattr(assignment, field, "") or "")
+        new_value = str(patch.get(field, "") or "")
+        if new_value and new_value != old_value:
+            changed_values[field] = new_value
+            audit_rows.append(record_bss_sync_audit(connection, assignment.id, service_id, order_number, field, old_value, new_value, "UPDATED"))
+    business_changed = bool(changed_values)
+    metadata_values = {
+        field: str(patch.get(field, "") or "")
+        for field in ["siebel_order_number", "siebel_last_checked_at", "siebel_payload_hash", "siebel_payload_json"]
+        if field in patch
+    }
+    if business_changed:
+        changed_values.update(metadata_values)
+        changed_values["siebel_last_sync_at"] = str(patch.get("siebel_last_sync_at") or now_iso())
+        set_sql = ", ".join(f"{field} = :{field}" for field in changed_values)
+        connection.execute(
+            f"UPDATE assignments SET {set_sql} WHERE id = :assignment_id",
+            {**changed_values, "assignment_id": assignment.id},
+        )
+    else:
+        connection.execute(
+            "UPDATE assignments SET siebel_last_checked_at = ?, siebel_payload_hash = ?, siebel_payload_json = ? WHERE id = ?",
+            (metadata_values.get("siebel_last_checked_at", now_iso()), metadata_values.get("siebel_payload_hash", assignment.siebel_payload_hash), metadata_values.get("siebel_payload_json", assignment.siebel_payload_json), assignment.id),
+        )
+        audit_rows.append(record_bss_sync_audit(connection, assignment.id, service_id, order_number, "NO_CHANGE", "", "", "UNCHANGED"))
+    updated = assignment_from_row(connection.execute("SELECT * FROM assignments WHERE id = ?", (assignment.id,)).fetchone())
+    resource = sync_assignment_resource(connection, updated)
+    if business_changed and resource_requires_cst(resource):
+        create_cst_sync_jobs(connection, [(resource, "UPDATE")], "BSS_DELTA_SYNC")
+    return updated, audit_rows, business_changed
+
+
+def sync_assignment_from_bss(connection: sqlite3.Connection, assignment: Assignment) -> tuple[Assignment | None, list[BssSyncAuditRecord], bool, str]:
+    service_id = assignment.service_id.strip()
+    order_number = assignment.siebel_order_number or assignment.service_order_id
+    if not service_id:
+        audit = record_bss_sync_audit(connection, assignment.id, "", order_number, "SERVICE_ID", "", "", "SKIPPED")
+        return assignment, [audit], False, "skipped"
+    lookup = fetch_siebel_business_customer(service_id)
+    if not lookup.found:
+        audit = record_bss_sync_audit(connection, assignment.id, service_id, order_number, "LOOKUP", "", lookup.message, "NOT_FOUND")
+        connection.execute("UPDATE assignments SET siebel_last_checked_at = ? WHERE id = ?", (now_iso(), assignment.id))
+        return assignment, [audit], False, "not_found"
+    updated, audit_rows, changed = apply_bss_delta_to_assignment(connection, assignment, lookup.assignment)
+    return updated, audit_rows, changed, "updated" if changed else "unchanged"
+
+
+@app.post("/siebel/business-customer", response_model=SiebelLookupResponse)
+def lookup_siebel_business_customer(payload: SiebelLookupRequest) -> SiebelLookupResponse:
+    service_id = (payload.service_id or payload.order_number).strip()
+    if not service_id:
+        raise HTTPException(status_code=400, detail="Service ID is required")
+    return fetch_siebel_business_customer(service_id)
+
+
+@app.post("/assignments/{assignment_id}/siebel-refresh", response_model=BssDeltaSyncResponse)
+def refresh_assignment_from_siebel(assignment_id: str) -> BssDeltaSyncResponse:
+    assignment = find_assignment(assignment_id)
+    if assignment.assignment_target_type != "business_customer":
+        raise HTTPException(status_code=400, detail="Only business customer assignments can be refreshed from Siebel")
+    with connect() as connection:
+        updated, audit_rows, changed, status = sync_assignment_from_bss(connection, assignment)
+        record_audit(connection, "BSS Delta Sync", "assignment", assignment.id, assignment.model_dump_json(), updated.model_dump_json() if updated else "")
+    checked = 1
+    return BssDeltaSyncResponse(checked=checked, updated=1 if changed else 0, unchanged=1 if status == "unchanged" else 0, failed=0 if status in {"updated", "unchanged"} else 1, audit=audit_rows, message=f"Siebel refresh {status}")
+
+
+@app.post("/siebel/delta-sync", response_model=BssDeltaSyncResponse)
+def run_siebel_delta_sync() -> BssDeltaSyncResponse:
+    checked = updated_count = unchanged = failed = 0
+    audit_rows: list[BssSyncAuditRecord] = []
+    with connect() as connection:
+        assignments = [
+            assignment_from_row(row)
+            for row in connection.execute(
+                """
+                SELECT * FROM assignments
+                WHERE assignment_target_type = 'business_customer'
+                  AND status IN ('Active', 'Planned', 'Reserved', 'Blocked')
+                  AND service_id != ''
+                ORDER BY created_at DESC
+                """
+            ).fetchall()
+        ]
+        for assignment in assignments:
+            checked += 1
+            try:
+                before = assignment
+                after, rows, changed, status = sync_assignment_from_bss(connection, assignment)
+                audit_rows.extend(rows)
+                if changed:
+                    updated_count += 1
+                    record_audit(connection, "BSS Delta Sync", "assignment", assignment.id, before.model_dump_json(), after.model_dump_json() if after else "")
+                elif status == "unchanged":
+                    unchanged += 1
+                else:
+                    failed += 1
+            except HTTPException as exc:
+                failed += 1
+                audit_rows.append(record_bss_sync_audit(connection, assignment.id, assignment.service_id, assignment.siebel_order_number or assignment.service_order_id, "LOOKUP", "", str(exc.detail), "FAILED"))
+            except Exception as exc:
+                failed += 1
+                audit_rows.append(record_bss_sync_audit(connection, assignment.id, assignment.service_id, assignment.siebel_order_number or assignment.service_order_id, "LOOKUP", "", str(exc), "FAILED"))
+    return BssDeltaSyncResponse(checked=checked, updated=updated_count, unchanged=unchanged, failed=failed, audit=audit_rows[:100], message="Siebel delta sync completed")
+
+
+@app.get("/siebel/delta-audit", response_model=list[BssSyncAuditRecord])
+def list_bss_delta_audit(limit: int = 100) -> list[BssSyncAuditRecord]:
+    safe_limit = min(max(limit, 1), 500)
+    with connect() as connection:
+        rows = connection.execute("SELECT * FROM bss_sync_audit ORDER BY synced_at DESC LIMIT ?", (safe_limit,)).fetchall()
+    return [bss_sync_audit_from_row(row) for row in rows]
 
 
 @app.get("/ripe/config", response_model=RipeConfigOut)
@@ -3417,15 +4527,54 @@ def get_cst_config() -> CstConfig:
         return ensure_cst_config(connection)
 
 
+@app.post("/cst/config/test-token", response_model=CstConnectionTestResponse)
+def test_cst_token_connection() -> CstConnectionTestResponse:
+    with connect() as connection:
+        config = ensure_cst_config(connection)
+        ensure_cst_access_token(connection, config, force_refresh=True)
+        row = connection.execute("SELECT token_expires_at FROM cst_config WHERE id = 'default'").fetchone()
+        return CstConnectionTestResponse(
+            success=True,
+            message="CST OAuth token API responded successfully. Token was refreshed and cached.",
+            token_path=config.token_path,
+            token_expires_at=str(row["token_expires_at"] or "") if row else "",
+            tested_at=now_iso(),
+        )
+
+
 @app.put("/cst/config", response_model=CstConfig)
 def update_cst_config(payload: CstConfigUpdate) -> CstConfig:
     updates = payload.model_dump(exclude_unset=True)
     if not updates:
         return get_cst_config()
-    allowed = {"enabled", "service_provider_id", "auto_execute", "scheduled_sync_enabled", "schedule_time", "schedule_timezone", "batch_size_limit", "hourly_request_limit"}
+    allowed = {
+        "enabled", "service_provider_id", "auto_execute", "scheduled_sync_enabled", "integration_mode",
+        "host", "port", "base_url", "token_path", "send_path", "update_path", "delete_path", "get_path",
+        "auth_username", "accept_language", "verify_ssl", "connection_timeout", "read_timeout", "token_refresh_buffer_seconds",
+        "schedule_time", "schedule_timezone", "batch_size_limit", "hourly_request_limit"
+    }
     values = {key: value for key, value in updates.items() if key in allowed and value is not None}
+    if updates.get("auth_password"):
+        values["encrypted_auth_password"] = encrypt_secret(str(updates["auth_password"]))
+        values["encrypted_access_token"] = ""
+        values["token_expires_at"] = ""
+    if updates.get("api_access_key"):
+        values["encrypted_api_access_key"] = encrypt_secret(str(updates["api_access_key"]))
+        values["encrypted_access_token"] = ""
+        values["token_expires_at"] = ""
+    if updates.get("user_key"):
+        values["encrypted_user_key"] = encrypt_secret(str(updates["user_key"]))
+        values["encrypted_access_token"] = ""
+        values["token_expires_at"] = ""
     if not values:
         return get_cst_config()
+    values["integration_mode"] = "Real API"
+    values["auto_execute"] = 1
+    if "port" in values and int(values["port"]) <= 0:
+        raise HTTPException(status_code=400, detail="port must be greater than zero")
+    for timeout_field in ["connection_timeout", "read_timeout", "token_refresh_buffer_seconds"]:
+        if timeout_field in values and int(values[timeout_field]) < 1:
+            raise HTTPException(status_code=400, detail=f"{timeout_field} must be at least 1")
     if "batch_size_limit" in values and int(values["batch_size_limit"]) < 1:
         raise HTTPException(status_code=400, detail="batchSizeLimit must be at least 1")
     if "hourly_request_limit" in values and int(values["hourly_request_limit"]) < 1:
@@ -3437,12 +4586,16 @@ def update_cst_config(payload: CstConfigUpdate) -> CstConfig:
             ZoneInfo(str(values["schedule_timezone"]))
         except Exception as exc:
             raise HTTPException(status_code=400, detail="Unsupported CST schedule timezone") from exc
-    if "enabled" in values:
-        values["enabled"] = 1 if values["enabled"] else 0
-    if "auto_execute" in values:
-        values["auto_execute"] = 1 if values["auto_execute"] else 0
-    if "scheduled_sync_enabled" in values:
-        values["scheduled_sync_enabled"] = 1 if values["scheduled_sync_enabled"] else 0
+    if "host" in values and "base_url" not in values:
+        port = int(values.get("port") or get_cst_config().port or 443)
+        values["base_url"] = f"https://{str(values['host']).strip()}:{port}"
+    elif "port" in values and "base_url" not in values:
+        current = get_cst_config()
+        values["base_url"] = f"https://{current.host}:{int(values['port'])}"
+    values["verify_ssl"] = 0
+    for boolean_field in ["enabled", "scheduled_sync_enabled"]:
+        if boolean_field in values:
+            values[boolean_field] = 1 if values[boolean_field] else 0
     values["updated_at"] = now_iso()
     with connect() as connection:
         ensure_cst_config(connection)
@@ -3534,14 +4687,10 @@ def bootstrap_current_cst_resources() -> list[CstSyncJob]:
 @app.post("/cst/reconcile", response_model=list[CstSyncJob])
 def reconcile_cst_resources() -> list[CstSyncJob]:
     with connect() as connection:
-        resources = [
-            resource_from_row(row)
-            for row in connection.execute(
-                "SELECT * FROM ip_resources WHERE ip_type = 'PUBLIC' ORDER BY prefix, cidr"
-            ).fetchall()
-        ]
-        jobs = create_cst_sync_jobs(connection, [(resource, "GET") for resource in resources], "CST_RECONCILIATION")
-        record_audit(connection, "CST Reconciliation Jobs Created", "cst_batch", jobs[0].batch_id if jobs else "", "", json.dumps({"jobs": len(jobs)}))
+        config = ensure_cst_config(connection)
+        page_resource = cst_get_lir_page_resource(config, 1)
+        jobs = create_cst_sync_jobs(connection, [(page_resource, "GET")], "CST_RECONCILIATION_GETLIR_PAGE")
+        record_audit(connection, "CST GetLIR Page Job Created", "cst_batch", jobs[0].batch_id if jobs else "", "", json.dumps({"jobs": len(jobs), "pageNumber": 1, "pageSize": 1000}))
     return jobs
 
 
@@ -4024,6 +5173,8 @@ def add_assignment(payload: AssignmentCreate) -> Assignment:
     return assignment
 
 
+
+
 def process_assignment_bulk(csv_text: str) -> BulkImportResult:
     imported = 0
     errors: list[str] = []
@@ -4170,7 +5321,7 @@ def update_assignment_status(assignment_id: str, payload: StatusUpdate) -> Assig
         after = assignment_from_row(connection.execute("SELECT * FROM assignments WHERE id = ?", (assignment_id,)).fetchone())
         resource = sync_assignment_resource(connection, after)
         if payload.status == "Retiring":
-            if str(before.cst_sync_status or "").upper() in {"SUCCESS", "SYNCHRONIZED"}:
+            if cst_resource_reported_to_cst(connection, resource) and not cst_resource_deleted_from_cst(connection, resource):
                 create_cst_sync_jobs(connection, [(resource, "DELETE")], "ASSIGNMENT_RELEASE")
             else:
                 connection.execute(
@@ -4193,13 +5344,31 @@ def unassign(assignment_id: str) -> None:
     assignment = find_assignment(assignment_id)
     with connect() as connection:
         resource = find_resource_by_source(connection, "assignment", assignment_id)
+        cst_delete_required = cst_resource_reported_to_cst(connection, resource) and not cst_resource_deleted_from_cst(connection, resource)
         if resource and resource.status == "RETIRED":
-            audit_action = "Retired Resource Deletion"
-            audit_new_value = "Deleted retired resource"
+            audit_action = "Retired Resource Deletion" if not cst_delete_required else "CST Assignment Removal"
+            audit_new_value = "Deleted retired resource" if not cst_delete_required else "Removed from CST and released locally"
         else:
             assert_resource_can_change(connection, "assignment", assignment_id)
             audit_action = "Subnet Release"
             audit_new_value = "Released to free pool"
+
+        if cst_delete_required:
+            connection.execute(
+                "UPDATE assignments SET status = ?, action_flag = ? WHERE id = ?",
+                ("Retiring", "D", assignment_id),
+            )
+            retiring_assignment = assignment_from_row(connection.execute("SELECT * FROM assignments WHERE id = ?", (assignment_id,)).fetchone())
+            resource = sync_assignment_resource(connection, retiring_assignment)
+            jobs = create_cst_sync_jobs(connection, [(resource, "DELETE")], "ASSIGNMENT_UNASSIGN")
+            if not cst_delete_succeeded(jobs):
+                failed = next((job for job in jobs if job.status != "SUCCESS"), None)
+                detail = failed.last_error if failed and failed.last_error else "CST DeleteLIRData did not complete successfully"
+                record_audit(connection, "CST Assignment Removal Failed", "assignment", assignment_id, assignment.model_dump_json(), detail)
+                raise HTTPException(status_code=502, detail=detail)
+            audit_action = "CST Assignment Removal"
+            audit_new_value = "Removed from CST and released locally"
+
         result = connection.execute("DELETE FROM assignments WHERE id = ?", (assignment_id,))
         if result.rowcount == 0:
             raise HTTPException(status_code=404, detail="Assignment not found")
@@ -4285,21 +5454,4 @@ def list_conflicts() -> list[Conflict]:
 
 
 init_db()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
