@@ -236,6 +236,9 @@ export type Conflict = {
   title: string;
   detail: string;
   ranges: string[];
+  assignment_ids?: string[];
+  resource_uuids?: string[];
+  resolution_status?: string;
 };
 
 export type BulkResult = {
@@ -405,6 +408,10 @@ export type CstConfig = {
   service_provider_id: string;
   auto_execute: boolean;
   scheduled_sync_enabled: boolean;
+  send_enabled: boolean;
+  update_enabled: boolean;
+  delete_enabled: boolean;
+  get_enabled: boolean;
   integration_mode: "Real API";
   host: string;
   port: number;
@@ -434,7 +441,7 @@ export type CstConfig = {
   updated_at: string;
 };
 
-export type CstConfigPayload = Partial<Pick<CstConfig, "enabled" | "service_provider_id" | "auto_execute" | "scheduled_sync_enabled" | "integration_mode" | "host" | "port" | "base_url" | "token_path" | "send_path" | "update_path" | "delete_path" | "get_path" | "auth_username" | "accept_language" | "verify_ssl" | "connection_timeout" | "read_timeout" | "token_refresh_buffer_seconds" | "schedule_time" | "schedule_timezone" | "batch_size_limit" | "hourly_request_limit">> & {
+export type CstConfigPayload = Partial<Pick<CstConfig, "enabled" | "service_provider_id" | "auto_execute" | "scheduled_sync_enabled" | "send_enabled" | "update_enabled" | "delete_enabled" | "get_enabled" | "integration_mode" | "host" | "port" | "base_url" | "token_path" | "send_path" | "update_path" | "delete_path" | "get_path" | "auth_username" | "accept_language" | "verify_ssl" | "connection_timeout" | "read_timeout" | "token_refresh_buffer_seconds" | "schedule_time" | "schedule_timezone" | "batch_size_limit" | "hourly_request_limit">> & {
   auth_password?: string;
   api_access_key?: string;
   user_key?: string;
@@ -448,6 +455,34 @@ export type CstConnectionTestResponse = {
   tested_at: string;
 };
 
+export type DatabaseConnectionStatus = {
+  current_engine: string;
+  sqlite_path: string;
+  database_url_configured: boolean;
+  database_url_redacted: string;
+  postgres_driver_available: boolean;
+  postgres_runtime_supported: boolean;
+  message: string;
+};
+
+export type DatabaseConnectionPayload = {
+  host: string;
+  port: number;
+  database: string;
+  username: string;
+  password?: string;
+  ssl_mode: string;
+  connect_timeout: number;
+};
+
+export type DatabaseConnectionTestResponse = {
+  success: boolean;
+  message: string;
+  server_version: string;
+  database: string;
+  username: string;
+  tested_at: string;
+};
 export type CstSyncSummary = {
   enabled: boolean;
   auto_execute: boolean;
@@ -497,6 +532,23 @@ export type CstSyncJob = {
   updated_at: string;
 };
 
+
+export type CstPendingPushResult = {
+  started_at: string;
+  completed_at: string;
+  requested_jobs: number;
+  processed_jobs: number;
+  success_jobs: number;
+  failed_jobs: number;
+  pending_jobs: number;
+  not_required_jobs: number;
+  message: string;
+  effective_limit: number;
+  batch_size_limit: number;
+  hourly_request_limit: number;
+  rate_delay_seconds: number;
+  jobs: CstSyncJob[];
+};
 export type CstSchedulerRun = {
   id: string;
   target_date: string;
@@ -524,7 +576,7 @@ export type CstTransactionLedger = {
 };
 export type BulkOutputRow = {
   inputRowNumber: number;
-  processingStatus: "SUCCESS" | "FAILED" | "PARTIAL_SUCCESS";
+  processingStatus: "SUCCESS" | "FAILED" | "PARTIAL_SUCCESS" | "IMPORTED_NOT_READY";
   processingMessage: string;
   generatedResourceUuid: string;
   generatedVersionUuid: string;
@@ -533,6 +585,11 @@ export type BulkOutputRow = {
   status: string;
   assignmentDate: string;
   customerName: string;
+  assignmentType: string;
+  cstSyncReady: boolean;
+  cstValidationStatus: string;
+  cstValidationErrors: string;
+  cstValidationWarnings: string;
 };
 
 export type ResourceRecord = {
@@ -762,6 +819,16 @@ export async function getConflicts() {
   return data;
 }
 
+export async function acceptConflictAssignment(assignmentId: string) {
+  const { data } = await api.post<Assignment>(`/conflicts/assignments/${assignmentId}/accept`);
+  return data;
+}
+
+export async function rejectConflictAssignment(assignmentId: string) {
+  const { data } = await api.post<Assignment>(`/conflicts/assignments/${assignmentId}/reject`);
+  return data;
+}
+
 export async function getAuditEvents() {
   const { data } = await api.get<AuditEvent[]>("/audit");
   return data;
@@ -772,6 +839,15 @@ export async function getBulkBatches() {
   return data;
 }
 
+export async function getDatabaseConnectionStatus() {
+  const { data } = await api.get<DatabaseConnectionStatus>("/database/status");
+  return data;
+}
+
+export async function testDatabaseConnection(payload: DatabaseConnectionPayload) {
+  const { data } = await api.post<DatabaseConnectionTestResponse>("/database/test-postgres", payload);
+  return data;
+}
 export async function getRipeConfig() {
   const { data } = await api.get<RipeConfig>("/ripe/config");
   return data;
@@ -846,6 +922,11 @@ export async function reconcileCstResources() {
   return data;
 }
 
+
+export async function pushPendingCstJobs(limit = 0) {
+  const { data } = await api.post<CstPendingPushResult>("/cst/jobs/push-pending", null, { params: limit > 0 ? { limit } : undefined });
+  return data;
+}
 export async function retryCstJob(jobId: string) {
   const { data } = await api.post<CstSyncJob>(`/cst/jobs/${jobId}/retry`);
   return data;

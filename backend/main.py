@@ -14,6 +14,10 @@ import re
 import secrets
 import sqlite3
 try:
+    import psycopg
+except ImportError:  # Optional until PostgreSQL runtime is enabled on the server.
+    psycopg = None
+try:
     import oracledb
 except ImportError:  # Optional until Siebel lookup is enabled on the server.
     oracledb = None
@@ -32,9 +36,12 @@ from backend import ripe_integration_service as ripe_service
 
 
 DB_PATH = Path(__file__).with_name("ipam.db")
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 PUBLIC_FAVICON_PATH = Path(__file__).resolve().parent.parent / "public" / "favicon.png"
 DB_BUSY_TIMEOUT_MS = 30_000
 DB_WRITE_LOCK = threading.RLock()
+CST_API_CALL_LOCK = threading.RLock()
+CST_PENDING_PUSH_LOCK = threading.Lock()
 CST_SCHEDULER_LOCK = threading.Lock()
 CST_SCHEDULER_STARTED = False
 DEFAULT_SERVICE_PROVIDER_ID = "5"
@@ -44,7 +51,7 @@ CST_SEND_LIR_PATH = "/api/rest/v1.0/LIRDataService/SendLIRData"
 CST_UPDATE_LIR_PATH = "/api/rest/v1.0/LIRDataService/UpdateLIRData"
 CST_DELETE_LIR_PATH = "/api/rest/v1.0/LIRDataService/DeleteLIRData"
 CST_GET_LIR_PATH = "/api/rest/v1.0/LIRDataService/GetLIRData"
-CST_FALLBACK_PHONE_NUMBER = "9665000000"
+CST_FALLBACK_PHONE_NUMBER = "0000000000"
 CST_FALLBACK_ID_NUMBER = "0000000000"
 CST_DEFAULT_ACCEPT_LANGUAGE = "EN"
 CST_API_TIMEZONE = timezone(timedelta(hours=3))
@@ -135,6 +142,13 @@ class AssignmentCreate(BaseModel):
     service_provider_name: str = DEFAULT_SERVICE_PROVIDER_NAME
     action_flag: str = "N"
     cst_sync_status: str = "PENDING"
+    cst_sync_ready: bool = False
+    cst_validation_status: str = "NOT_EVALUATED"
+    cst_validation_errors: str = ""
+    cst_validation_warnings: str = ""
+    migration_conflict_status: str = ""
+    migration_conflict_reason: str = ""
+    migration_conflict_group: str = ""
     ripe_sync_status: str = "PENDING"
     assignment_target_type: str = "business_customer"
     assignment_name: str = ""
@@ -268,6 +282,9 @@ class Conflict(BaseModel):
     title: str
     detail: str
     ranges: list[str]
+    assignment_ids: list[str] = []
+    resource_uuids: list[str] = []
+    resolution_status: str = ""
 
 
 class StatusUpdate(BaseModel):
@@ -365,6 +382,11 @@ class BulkOutputRow(BaseModel):
     status: str = ""
     assignmentDate: str = ""
     customerName: str = ""
+    assignmentType: str = ""
+    cstSyncReady: bool = False
+    cstValidationStatus: str = "NOT_EVALUATED"
+    cstValidationErrors: str = ""
+    cstValidationWarnings: str = ""
 
 
 class BulkImportResult(BaseModel):
@@ -606,6 +628,13 @@ class ResourceRecord(BaseModel):
     description: str = ""
     action_flag: str = "N"
     cst_sync_status: str = "PENDING"
+    cst_sync_ready: bool = False
+    cst_validation_status: str = "NOT_EVALUATED"
+    cst_validation_errors: str = ""
+    cst_validation_warnings: str = ""
+    migration_conflict_status: str = ""
+    migration_conflict_reason: str = ""
+    migration_conflict_group: str = ""
     ripe_sync_status: str = "PENDING"
     ip_type: str = "PUBLIC"
     root_pool_uuid: str = ""
@@ -658,6 +687,13 @@ class AssignmentDetailRecord(BaseModel):
     service_description: str = ""
     owner: str = ""
     purpose: str = ""
+    cst_sync_ready: bool = False
+    cst_validation_status: str = "NOT_EVALUATED"
+    cst_validation_errors: str = ""
+    cst_validation_warnings: str = ""
+    migration_conflict_status: str = ""
+    migration_conflict_reason: str = ""
+    migration_conflict_group: str = ""
     created_at: str
     updated_at: str
 
@@ -669,6 +705,10 @@ class CstConfig(BaseModel):
     service_provider_id: str = DEFAULT_SERVICE_PROVIDER_ID
     auto_execute: bool = True
     scheduled_sync_enabled: bool = True
+    send_enabled: bool = True
+    update_enabled: bool = True
+    delete_enabled: bool = True
+    get_enabled: bool = True
     integration_mode: str = "Real API"
     host: str = "cst-oa-unified-gw-stg-fop.apps.apldev-sit-opshift.itc.local"
     port: int = 443
@@ -711,6 +751,10 @@ class CstConfigUpdate(BaseModel):
     service_provider_id: str | None = None
     auto_execute: bool | None = None
     scheduled_sync_enabled: bool | None = None
+    send_enabled: bool | None = None
+    update_enabled: bool | None = None
+    delete_enabled: bool | None = None
+    get_enabled: bool | None = None
     integration_mode: str | None = None
     host: str | None = None
     port: int | None = None
@@ -734,6 +778,34 @@ class CstConfigUpdate(BaseModel):
     batch_size_limit: int | None = None
     hourly_request_limit: int | None = None
 
+
+class DatabaseConnectionStatus(BaseModel):
+    current_engine: str
+    sqlite_path: str
+    database_url_configured: bool
+    database_url_redacted: str = ""
+    postgres_driver_available: bool
+    postgres_runtime_supported: bool
+    message: str
+
+
+class DatabaseConnectionTestRequest(BaseModel):
+    host: str = "localhost"
+    port: int = 5432
+    database: str = "lir"
+    username: str = "lir_app"
+    password: str = ""
+    ssl_mode: str = "prefer"
+    connect_timeout: int = 10
+
+
+class DatabaseConnectionTestResponse(BaseModel):
+    success: bool
+    message: str
+    server_version: str = ""
+    database: str = ""
+    username: str = ""
+    tested_at: str
 
 class CstSyncBatch(BaseModel):
     id: str
@@ -808,6 +880,23 @@ class CstSchedulerRun(BaseModel):
     triggered_by: str = "scheduler"
     started_at: str
     completed_at: str = ""
+
+
+class CstPendingPushResult(BaseModel):
+    started_at: str
+    completed_at: str
+    requested_jobs: int = 0
+    processed_jobs: int = 0
+    success_jobs: int = 0
+    failed_jobs: int = 0
+    pending_jobs: int = 0
+    not_required_jobs: int = 0
+    message: str = ""
+    effective_limit: int = 0
+    batch_size_limit: int = 0
+    hourly_request_limit: int = 0
+    rate_delay_seconds: float = 0
+    jobs: list[CstSyncJob] = Field(default_factory=list)
 
 
 class ResourceWithAssignment(ResourceRecord):
@@ -1229,6 +1318,13 @@ def resource_record_for_assignment(assignment: Assignment, existing: ResourceRec
         description=assignment.notes or assignment.assignment_description,
         action_flag=assignment.action_flag or ("N" if not existing else "U"),
         cst_sync_status=assignment.cst_sync_status or "PENDING",
+        cst_sync_ready=assignment.cst_sync_ready,
+        cst_validation_status=assignment.cst_validation_status,
+        cst_validation_errors=assignment.cst_validation_errors,
+        cst_validation_warnings=assignment.cst_validation_warnings,
+        migration_conflict_status=assignment.migration_conflict_status,
+        migration_conflict_reason=assignment.migration_conflict_reason,
+        migration_conflict_group=assignment.migration_conflict_group,
         ripe_sync_status=assignment.ripe_sync_status or ("PENDING" if network.is_global else "NOT_REQUIRED"),
         ip_type="PRIVATE" if network.is_private else "PUBLIC",
         root_pool_uuid=existing.root_pool_uuid if existing and existing.root_pool_uuid else root_pool_uuid,
@@ -1284,6 +1380,13 @@ def assignment_detail_record_for_assignment(assignment: Assignment, resource: Re
         service_description=assignment.service_description or assignment.service or assignment.assignment_purpose,
         owner=assignment.owner,
         purpose=assignment.assignment_purpose,
+        cst_sync_ready=assignment.cst_sync_ready,
+        cst_validation_status=assignment.cst_validation_status,
+        cst_validation_errors=assignment.cst_validation_errors,
+        cst_validation_warnings=assignment.cst_validation_warnings,
+        migration_conflict_status=assignment.migration_conflict_status,
+        migration_conflict_reason=assignment.migration_conflict_reason,
+        migration_conflict_group=assignment.migration_conflict_group,
         created_at=existing.created_at if existing else assignment.created_at,
         updated_at=now_iso(),
     )
@@ -1832,8 +1935,12 @@ def cst_config_from_row(row: sqlite3.Row) -> CstConfig:
         id=str(values.get("id", "default")),
         enabled=bool(values.get("enabled", 1)),
         service_provider_id=str(values.get("service_provider_id") or DEFAULT_SERVICE_PROVIDER_ID),
-        auto_execute=True,
+        auto_execute=bool(values.get("auto_execute", 1)),
         scheduled_sync_enabled=bool(values.get("scheduled_sync_enabled", 1)),
+        send_enabled=bool(values.get("send_enabled", 1)),
+        update_enabled=bool(values.get("update_enabled", 1)),
+        delete_enabled=bool(values.get("delete_enabled", 1)),
+        get_enabled=bool(values.get("get_enabled", 1)),
         integration_mode="Real API",
         host=host,
         port=port,
@@ -1906,6 +2013,19 @@ def ensure_cst_config(connection: sqlite3.Connection) -> CstConfig:
 
 def resource_requires_cst(resource: ResourceRecord) -> bool:
     return resource.ip_type == "PUBLIC" and resource.status != "RETIRED"
+
+
+def cst_operation_enabled(config: CstConfig, operation: str) -> bool:
+    return {
+        "SEND": config.send_enabled,
+        "UPDATE": config.update_enabled,
+        "DELETE": config.delete_enabled,
+        "GET": config.get_enabled,
+    }.get(operation.upper(), True)
+
+
+def cst_operation_disabled_message(operation: str) -> str:
+    return f"CST {operation.upper()} operation is disabled in Administration"
 
 
 def cst_resource_reported_to_cst(connection: sqlite3.Connection, resource: ResourceRecord | None) -> bool:
@@ -2215,7 +2335,7 @@ def cst_business_data_quality_issues(resource: ResourceRecord, record: dict) -> 
 
     mobile_number = str(contact.get("mobileNumber") or "")
     if mobile_number and not normalize_cst_mobile_number(mobile_number):
-        issues.append("contact.mobileNumber must be Saudi phone format 9665XXXXXXXX, 9661XXXXXXXX, or fallback 9665000000")
+        issues.append("contact.mobileNumber must be Saudi phone format 9665XXXXXXXX, 9661XXXXXXXX, or fallback 0000000000")
     id_number = str(contact.get("idNumber") or "")
     if id_number and not normalize_cst_id_number(id_number):
         issues.append("contact.idNumber must be 10 digits")
@@ -2393,6 +2513,19 @@ def cst_operation_url(config: CstConfig, resource: ResourceRecord, operation: st
     return urllib_parse.urljoin(config.base_url.rstrip("/") + "/", path.lstrip("/"))
 
 
+
+def cst_operation_url_from_payload(config: CstConfig, operation: str, payload: dict, transaction_id: str) -> str:
+    path = cst_operation_path(config, operation)
+    replacements = {
+        "resourceUuid": payload.get("resourceUuid") or "",
+        "transactionId": transaction_id,
+        "cidr": payload.get("cidr") or "",
+        "serviceId": payload.get("serviceId") or "",
+    }
+    for key, value in replacements.items():
+        path = path.replace("{" + key + "}", urllib_parse.quote(str(value or ""), safe=""))
+    return urllib_parse.urljoin(config.base_url.rstrip("/") + "/", path.lstrip("/"))
+
 def cst_ssl_context(config: CstConfig) -> ssl.SSLContext | None:
     return ssl._create_unverified_context()
 
@@ -2560,16 +2693,25 @@ def create_cst_sync_jobs(
         validation_payload = payload if operation == "SEND" else cst_payload_for_resource(resource, "SEND", transaction_id, correlation_id)
         quality_issues = cst_data_quality_issues(resource, operation, validation_payload)
         if not config.enabled:
-            status = "BLOCKED"
+            status = "PENDING"
             last_error = "CST integration is disabled in Administration"
             response = {"temporaryStorage": True, "externalApiCalled": False, "accepted": False, "message": last_error}
+        elif not cst_operation_enabled(config, operation):
+            status = "PENDING"
+            last_error = cst_operation_disabled_message(operation)
+            response = {"temporaryStorage": True, "externalApiCalled": False, "accepted": False, "message": last_error}
         elif quality_issues:
-            status = "BLOCKED"
+            status = "PENDING"
             last_error = cst_quality_message(quality_issues)
             response = {"temporaryStorage": True, "externalApiCalled": False, "accepted": False, "dataQualityStatus": "INVALID_FOR_CST", "issues": quality_issues, "message": last_error}
+        elif not config.auto_execute:
+            status = "PENDING"
+            last_error = ""
+            response = {"temporaryStorage": True, "externalApiCalled": False, "accepted": False, "message": "CST auto-execute is disabled in Administration; job queued for manual retry", "processedAt": now_iso()}
         else:
             try:
-                status, last_error, response = execute_cst_real_api_job(connection, config, resource, operation, payload, transaction_id)
+                with CST_API_CALL_LOCK:
+                    status, last_error, response = execute_cst_real_api_job(connection, config, resource, operation, payload, transaction_id)
             except HTTPException as exc:
                 status = "FAILED"
                 last_error = str(exc.detail)
@@ -2614,7 +2756,7 @@ def create_cst_sync_jobs(
             """,
             (resource.cidr, status, retired_at, retired_reason, batch_id, correlation_id, transaction_id),
         )
-        action_flag = "D" if operation == "DELETE" and status == "SUCCESS" else "S" if status == "SUCCESS" else "F" if status in {"FAILED", "BLOCKED"} else "U"
+        action_flag = "D" if operation == "DELETE" and status == "SUCCESS" else "S" if status == "SUCCESS" else "F" if status in {"FAILED"} else "U"
         connection.execute(
             """
             UPDATE ip_resources
@@ -2632,8 +2774,8 @@ def create_cst_sync_jobs(
 
     completed_jobs = sum(1 for job in jobs if job.status in {"SUCCESS", "NOT_REQUIRED"})
     failed_jobs = sum(1 for job in jobs if job.status == "FAILED")
-    blocked_jobs = sum(1 for job in jobs if job.status == "BLOCKED")
-    batch_status = "SUCCESS" if completed_jobs == len(jobs) else "BLOCKED" if blocked_jobs else "FAILED" if failed_jobs else "PENDING"
+    blocked_jobs = 0
+    batch_status = "SUCCESS" if completed_jobs == len(jobs) else "FAILED" if failed_jobs else "PENDING"
     connection.execute(
         """
         UPDATE cst_sync_batches
@@ -2660,13 +2802,47 @@ def retry_cst_jobs(connection: sqlite3.Connection, job_rows: list[sqlite3.Row]) 
         payload = cst_payload_for_resource(resource, job.operation, job.transaction_id, job.batch_id) if resource else stored_payload
         validation_payload = cst_payload_for_resource(resource, "SEND", job.transaction_id, job.batch_id) if resource and job.operation not in {"SEND", "GET"} else payload
         quality_issues = cst_data_quality_issues(resource, job.operation, validation_payload) if resource else []
+        retry_without_resource = resource is None and job.operation == "DELETE" and bool(payload)
         if quality_issues:
-            status = "BLOCKED"
+            status = "PENDING"
             last_error = cst_quality_message(quality_issues)
             response = {"temporaryStorage": True, "externalApiCalled": False, "accepted": False, "dataQualityStatus": "INVALID_FOR_CST", "issues": quality_issues, "message": last_error}
-        elif config.enabled and resource:
+        elif not config.enabled:
+            status = "PENDING"
+            last_error = "CST integration is disabled in Administration"
+            response = {"temporaryStorage": True, "externalApiCalled": False, "accepted": False, "message": last_error, "processedAt": now_iso()}
+        elif not cst_operation_enabled(config, job.operation):
+            status = "PENDING"
+            last_error = cst_operation_disabled_message(job.operation)
+            response = {"temporaryStorage": True, "externalApiCalled": False, "accepted": False, "message": last_error, "processedAt": now_iso()}
+        elif resource or retry_without_resource:
             try:
-                status, last_error, response = execute_cst_real_api_job(connection, config, resource, job.operation, payload, job.transaction_id)
+                with CST_API_CALL_LOCK:
+                    if resource:
+                        status, last_error, response = execute_cst_real_api_job(connection, config, resource, job.operation, payload, job.transaction_id)
+                    else:
+                        token = ensure_cst_access_token(connection, config)
+                        url = cst_operation_url_from_payload(config, job.operation, payload, job.transaction_id)
+                        request_at = datetime.now(timezone.utc)
+                        request_id = request_at.strftime("%Y%m%d%H%M%S") + f"{request_at.microsecond // 1000:03d}"
+                        config_row = connection.execute("SELECT encrypted_api_access_key, encrypted_user_key FROM cst_config WHERE id = 'default'").fetchone()
+                        api_key = decrypt_secret(str(config_row["encrypted_api_access_key"] or "")) if config_row else ""
+                        user_key = decrypt_secret(str(config_row["encrypted_user_key"] or "")) if config_row else ""
+                        url = cst_append_user_key_param(url, user_key)
+                        headers = {
+                            "requestId": request_id,
+                            "Accept-Language": config.accept_language or CST_DEFAULT_ACCEPT_LANGUAGE,
+                            "Authorization": f"Bearer {token}",
+                            "Content-Type": "application/json",
+                            "Accept": "application/json",
+                        }
+                        if api_key:
+                            headers["x-Gateway-APIKey"] = api_key
+                        if user_key:
+                            headers["user_key"] = user_key
+                        status_code, response = cst_http_request(config, "POST", url, headers, json.dumps(payload, sort_keys=True).encode("utf-8"), config.read_timeout)
+                        status = "SUCCESS" if 200 <= status_code < 300 else "FAILED"
+                        last_error = "" if status == "SUCCESS" else f"CST API HTTP {status_code}"
             except HTTPException as exc:
                 status = "FAILED"
                 last_error = str(exc.detail)
@@ -2676,10 +2852,10 @@ def retry_cst_jobs(connection: sqlite3.Connection, job_rows: list[sqlite3.Row]) 
                 last_error = str(exc)
                 response = {"temporaryStorage": False, "externalApiCalled": True, "accepted": False, "message": last_error, "processedAt": now_iso()}
         else:
-            status = "BLOCKED" if not config.enabled else "NOT_REQUIRED"
-            last_error = "CST integration is disabled in Administration" if not config.enabled else ""
-            message = last_error or "Local resource was removed before CST reporting; CST API call is not required"
-            response = {"temporaryStorage": False, "externalApiCalled": False, "accepted": status == "NOT_REQUIRED", "message": message, "processedAt": now_iso()}
+            status = "NOT_REQUIRED"
+            last_error = ""
+            message = "Local resource was removed before CST reporting; CST API call is not required"
+            response = {"temporaryStorage": False, "externalApiCalled": False, "accepted": True, "message": message, "processedAt": now_iso()}
         connection.execute(
             """
             UPDATE cst_sync_jobs
@@ -2692,7 +2868,7 @@ def retry_cst_jobs(connection: sqlite3.Connection, job_rows: list[sqlite3.Row]) 
             "UPDATE cst_transaction_ledger SET last_status = ?, batch_id = ? WHERE transaction_id = ?",
             (status, job.batch_id, job.transaction_id),
         )
-        action_flag = "D" if job.operation == "DELETE" and status == "SUCCESS" else "S" if status == "SUCCESS" else "F" if status in {"FAILED", "BLOCKED"} else "U"
+        action_flag = "D" if job.operation == "DELETE" and status == "SUCCESS" else "S" if status == "SUCCESS" else "F" if status in {"FAILED"} else "U"
         retired_at = updated_at if job.operation == "DELETE" and status == "SUCCESS" else ""
         retired_reason = "Removed from CST LIR registry" if retired_at else ""
         connection.execute(
@@ -2714,8 +2890,8 @@ def retry_cst_jobs(connection: sqlite3.Connection, job_rows: list[sqlite3.Row]) 
         total = len(rows)
         completed = sum(1 for item in rows if item["status"] in {"SUCCESS", "NOT_REQUIRED"})
         failed = sum(1 for item in rows if item["status"] == "FAILED")
-        blocked = sum(1 for item in rows if item["status"] == "BLOCKED")
-        status = "SUCCESS" if completed == total else "BLOCKED" if blocked else "FAILED" if failed else "PENDING"
+        blocked = 0
+        status = "SUCCESS" if completed == total else "FAILED" if failed else "PENDING"
         connection.execute(
             "UPDATE cst_sync_batches SET status = ?, completed_jobs = ?, failed_jobs = ?, blocked_jobs = ?, completed_at = ? WHERE id = ?",
             (status, completed, failed, blocked, now_iso() if status in {"SUCCESS", "NOT_REQUIRED"} else "", batch_id),
@@ -2723,6 +2899,62 @@ def retry_cst_jobs(connection: sqlite3.Connection, job_rows: list[sqlite3.Row]) 
     return updated_jobs
 
 
+def cst_effective_pending_push_limit(config: CstConfig, requested_limit: int) -> int:
+    configured_limit = max(int(config.batch_size_limit or 500), 1)
+    if requested_limit > 0:
+        return min(int(requested_limit), configured_limit)
+    return configured_limit
+
+
+def cst_rate_limit_delay_seconds(config: CstConfig) -> float:
+    hourly_limit = max(int(config.hourly_request_limit or 1000), 1)
+    return 3600.0 / hourly_limit
+
+
+def cst_job_called_external_api(job: CstSyncJob) -> bool:
+    try:
+        response = json.loads(job.response_json or "{}")
+    except Exception:
+        return False
+    return bool(response.get("externalApiCalled"))
+def mark_cst_job_running(connection: sqlite3.Connection, row: sqlite3.Row) -> sqlite3.Row:
+    job = cst_job_from_row(row)
+    if job.status == "RUNNING":
+        raise HTTPException(status_code=409, detail="CST job is already running")
+    updated_at = now_iso()
+    cursor = connection.execute(
+        "UPDATE cst_sync_jobs SET status = 'RUNNING', updated_at = ? WHERE id = ? AND status != 'RUNNING'",
+        (updated_at, job.id),
+    )
+    if cursor.rowcount == 0:
+        raise HTTPException(status_code=409, detail="CST job is already running")
+    connection.execute(
+        "UPDATE cst_transaction_ledger SET last_status = 'RUNNING', batch_id = ? WHERE transaction_id = ?",
+        (job.batch_id, job.transaction_id),
+    )
+    resource_row = connection.execute("SELECT * FROM ip_resources WHERE resource_uuid = ?", (job.resource_uuid,)).fetchone()
+    if resource_row:
+        resource = resource_from_row(resource_row)
+        connection.execute(
+            "UPDATE ip_resources SET cst_sync_status = 'RUNNING', transaction_id = ?, action_flag = 'U', updated_at = ? WHERE resource_uuid = ?",
+            (job.transaction_id, updated_at, job.resource_uuid),
+        )
+        if resource.source_entity_type == "assignment":
+            connection.execute(
+                "UPDATE assignments SET cst_sync_status = 'RUNNING', action_flag = 'U' WHERE id = ?",
+                (resource.source_entity_id,),
+            )
+    connection.execute("UPDATE cst_sync_batches SET status = 'RUNNING', completed_at = '' WHERE id = ?", (job.batch_id,))
+    running_row = connection.execute("SELECT * FROM cst_sync_jobs WHERE id = ?", (job.id,)).fetchone()
+    if running_row is None:
+        raise HTTPException(status_code=404, detail="CST job not found")
+    return running_row
+
+
+def process_cst_job_sequentially(connection: sqlite3.Connection, row: sqlite3.Row) -> CstSyncJob:
+    running_row = mark_cst_job_running(connection, row)
+    connection.commit()
+    return retry_cst_jobs(connection, [running_row])[0]
 def cst_schedule_timezone(config: CstConfig) -> ZoneInfo:
     try:
         return ZoneInfo(config.schedule_timezone or "Asia/Riyadh")
@@ -3134,6 +3366,10 @@ def init_db() -> None:
               service_provider_id TEXT NOT NULL,
               auto_execute INTEGER NOT NULL,
               scheduled_sync_enabled INTEGER NOT NULL DEFAULT 1,
+              send_enabled INTEGER NOT NULL DEFAULT 1,
+              update_enabled INTEGER NOT NULL DEFAULT 1,
+              delete_enabled INTEGER NOT NULL DEFAULT 1,
+              get_enabled INTEGER NOT NULL DEFAULT 1,
               integration_mode TEXT NOT NULL DEFAULT 'Real API',
               host TEXT NOT NULL DEFAULT 'cst-oa-unified-gw-stg-fop.apps.apldev-sit-opshift.itc.local',
               port INTEGER NOT NULL DEFAULT 443,
@@ -3250,6 +3486,11 @@ def init_db() -> None:
             if column_name not in cst_config_columns:
                 connection.execute(f"ALTER TABLE cst_config ADD COLUMN {column_name} TEXT NOT NULL DEFAULT ''")
         migrate_legacy_cst_transaction_ids(connection)
+        connection.execute("UPDATE cst_sync_jobs SET status = 'PENDING' WHERE status = 'BLOCKED'")
+        connection.execute("UPDATE cst_transaction_ledger SET last_status = 'PENDING' WHERE last_status = 'BLOCKED'")
+        connection.execute("UPDATE ip_resources SET cst_sync_status = 'PENDING', action_flag = 'U' WHERE cst_sync_status = 'BLOCKED'")
+        connection.execute("UPDATE assignments SET cst_sync_status = 'PENDING', action_flag = 'U' WHERE cst_sync_status = 'BLOCKED'")
+        connection.execute("UPDATE cst_sync_batches SET status = 'PENDING', blocked_jobs = 0 WHERE status = 'BLOCKED' OR blocked_jobs > 0")
 
         siebel_config_count = connection.execute("SELECT COUNT(*) FROM siebel_config").fetchone()[0]
         if siebel_config_count == 0:
@@ -3281,7 +3522,7 @@ def init_db() -> None:
                 (DEFAULT_SERVICE_PROVIDER_ID, CST_SEND_LIR_PATH, CST_UPDATE_LIR_PATH, CST_DELETE_LIR_PATH, CST_GET_LIR_PATH, now_iso()),
             )
 
-        connection.execute("UPDATE cst_config SET integration_mode = 'Real API', auto_execute = 1")
+        connection.execute("UPDATE cst_config SET integration_mode = 'Real API'")
 
         user_count = connection.execute("SELECT COUNT(*) FROM users").fetchone()[0]
         if user_count == 0:
@@ -3791,6 +4032,83 @@ def bulk_assignment_networks_from_row(row: dict[str, str]) -> tuple[list[IPv4Net
     return list(summarize_address_range(start_ip, end_ip)), is_pr_format
 
 
+def bulk_assignment_type(row: dict[str, str], status_id: int) -> str:
+    raw_type = csv_value(row, "assignmentType", "assignment_type", "type")
+    normalized = raw_type.strip().upper().replace(" ", "_").replace("-", "_")
+    if normalized in {"BUSINESS", "BUSINESS_CUSTOMER", "B2B"}:
+        return "BUSINESS"
+    if normalized in {"INTERNAL", "SALAM", "SALAM_INTERNAL"}:
+        return "INTERNAL"
+    if normalized:
+        raise HTTPException(status_code=400, detail="assignmentType must be BUSINESS or INTERNAL")
+    return "INTERNAL" if status_id == 2 else "BUSINESS"
+
+
+def status_id_for_assignment_type(row: dict[str, str], status_id: int) -> int:
+    assignment_type = bulk_assignment_type(row, status_id)
+    if assignment_type == "INTERNAL":
+        return 2
+    if assignment_type == "BUSINESS":
+        return 3
+    return status_id
+
+
+def normalize_bulk_cst_phone(value: str, row_number: int, field_name: str, warnings: list[str]) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    normalized = normalize_cst_mobile_number(raw)
+    if normalized:
+        return normalized
+    warnings.append(f"{field_name} value '{raw}' is invalid and was normalized to {CST_FALLBACK_PHONE_NUMBER}")
+    return CST_FALLBACK_PHONE_NUMBER
+
+
+def valid_organization_identifier(value: str) -> bool:
+    return bool(re.fullmatch(r"\d{10}", str(value or "").strip()))
+
+
+def cst_bulk_readiness_for_assignment(connection: sqlite3.Connection, assignment: Assignment, warnings: list[str]) -> tuple[bool, str, list[str], list[str]]:
+    resource = resource_record_for_assignment(assignment, connection=connection)
+    transaction_id = assignment.logical_resource_id or assignment.id
+    payload = cst_payload_for_resource(resource, "SEND", transaction_id, "bulk-import-preview")
+    errors = cst_data_quality_issues(resource, "SEND", payload)
+    assignment_type = (assignment.assignment_target_type or "").lower()
+    if assignment_type == "business_customer" or assignment.assignment_status_id == 3:
+        organization_identifier = assignment.organization_id or assignment.commercial_reg_id or assignment.unified_number
+        if not valid_organization_identifier(organization_identifier):
+            errors.append("organizationId/commercialRegId/unifiedNumber must contain a valid 10-digit customer organization identifier for Business assignment")
+        if assignment.commercial_reg_id and assignment.commercial_reg_id != "N/A" and not valid_organization_identifier(assignment.commercial_reg_id):
+            errors.append("commercialRegId must be 10 digits when supplied")
+        if assignment.unified_number and assignment.unified_number != "N/A" and not valid_organization_identifier(assignment.unified_number):
+            errors.append("unifiedNumber must be 10 digits when supplied")
+        if not (assignment.service_id or assignment.service_instance_id).strip():
+            errors.append("serviceId is required for Business assignment")
+        if not str(assignment.customer_id or assignment.bss_customer_id or "").strip():
+            errors.append("customerId is required for Business assignment and preserved for BSS traceability")
+    if assignment_type == "internal" or assignment.assignment_status_id == 2:
+        if not str(assignment.owner or "").strip():
+            errors.append("owner is required for Internal assignment")
+        if not str(assignment.assignment_purpose or "").strip():
+            errors.append("assignmentPurpose is required for Internal assignment")
+        if not str(assignment.service_description or assignment.service or "").strip():
+            errors.append("serviceDescription is required for Internal assignment")
+        if not str(assignment.site or assignment.location_name or "").strip():
+            errors.append("site or locationName is required for Internal assignment")
+        if not str(assignment.region_id or assignment.region or "").strip():
+            errors.append("regionId or region is required for Internal assignment")
+        if not str(assignment.city_id or assignment.city or "").strip():
+            errors.append("cityId or city is required for Internal assignment")
+        if not str(assignment.full_name or assignment.contact_name or "").strip():
+            errors.append("fullName or contactName is required for Internal assignment")
+        if not str(assignment.mobile_number or assignment.contact_number or "").strip():
+            errors.append("mobileNumber or contactNumber is required for Internal assignment")
+        if not str(assignment.email or assignment.contact_email or "").strip():
+            errors.append("email or contactEmail is required for Internal assignment")
+    unique_errors = list(dict.fromkeys(errors))
+    unique_warnings = list(dict.fromkeys(warnings))
+    ready = not unique_errors
+    return ready, "READY" if ready else "NOT_READY", unique_errors, unique_warnings
 def bulk_assignment_status(row: dict[str, str], is_pr_format: bool) -> tuple[int, str]:
     status_value = csv_value(row, "status")
     if not status_value:
@@ -3801,54 +4119,87 @@ def bulk_assignment_status(row: dict[str, str], is_pr_format: bool) -> tuple[int
     return status_id, assignment_status
 
 
-def assignment_payload_from_bulk_row(row: dict[str, str], network: IPv4Network, assignment_status_id: int, assignment_status: str) -> AssignmentCreate:
+def assignment_payload_from_bulk_row(row: dict[str, str], network: IPv4Network, assignment_status_id: int, assignment_status: str, row_number: int = 0) -> AssignmentCreate:
+    warnings: list[str] = []
+    assignment_type = bulk_assignment_type(row, assignment_status_id)
     assignment_date = csv_value(row, "assignmentDate", "assignment_date")
     customer_name = csv_value(row, "customerName", "customer_name", "organizationName", "organization_name", "fullName", "full_name")
     service_id = csv_value(row, "serviceId", "service_id", "service_instance_id")
     service_description = csv_value(row, "serviceDescription", "service_description", "service")
+    organization_id = csv_value(row, "organizationId", "organization_id")
+    commercial_reg_id = csv_value(row, "commercial_reg_id", "commercialRegId", "crNumber", "cr_number")
+    unified_number = csv_value(row, "unified_number", "unifiedNumber", "unifiedFacilityNumber", "unified_facility_number")
+    if not organization_id:
+        organization_id = commercial_reg_id or unified_number
+    mobile_number = normalize_bulk_cst_phone(csv_value(row, "mobileNumber", "mobile_number"), row_number, "mobileNumber", warnings)
+    contact_number = normalize_bulk_cst_phone(csv_value(row, "contact_number", "contactNumber"), row_number, "contactNumber", warnings)
+    if not mobile_number and contact_number:
+        mobile_number = contact_number
+    full_name = csv_value(row, "fullName", "full_name") or csv_value(row, "contact_name", "contactName")
+    email = normalize_cst_email(csv_value(row, "email")) or csv_value(row, "email")
+    contact_email = normalize_cst_email(csv_value(row, "contact_email", "contactEmail")) or csv_value(row, "contact_email", "contactEmail")
+    if not email and contact_email:
+        email = contact_email
     if not assignment_date:
         raise HTTPException(status_code=400, detail="assignmentDate is mandatory")
-    if assignment_status_id == 3 and not service_id:
-        raise HTTPException(status_code=400, detail="serviceId is mandatory when assignmentStatusId = 3 (Business)")
-    if assignment_status_id == 2 and not service_description:
-        raise HTTPException(status_code=400, detail="serviceDescription is mandatory when assignmentStatusId = 2 (Internal)")
+    if assignment_type == "BUSINESS" and not service_id:
+        raise HTTPException(status_code=400, detail="serviceId is mandatory for Business assignment")
+    if assignment_type == "INTERNAL" and not service_description:
+        raise HTTPException(status_code=400, detail="serviceDescription is mandatory for Internal assignment")
     customer_name = customer_name or assignment_status_id_name(assignment_status_id)
-    target_type = "internal" if assignment_status_id == 2 else "business_customer"
-    if assignment_status_id == 4:
-        target_type = "individual"
+    target_type = "internal" if assignment_type == "INTERNAL" else "business_customer"
     return AssignmentCreate(
         cidr=str(network),
         assignment_status_id=assignment_status_id,
         assignment_target_type=target_type,
         service_id=service_id,
-        service_instance_id=service_id,
+        service_instance_id=csv_value(row, "serviceInstanceId", "service_instance_id") or service_id,
+        service_order_id=csv_value(row, "serviceOrderId", "service_order_id"),
+        siebel_order_number=csv_value(row, "siebelOrderNumber", "siebel_order_number"),
+        bss_customer_id=csv_value(row, "bssCustomerId", "bss_customer_id", "customerId", "customer_id"),
+        customer_id=csv_value(row, "customerId", "customer_id"),
         customer_name=customer_name,
-        organization_name=csv_value(row, "organizationName", "organization_name"),
-        organization_id=csv_value(row, "organizationId", "organization_id"),
+        organization_name=csv_value(row, "organizationName", "organization_name") or customer_name,
+        organization_id=organization_id,
         customer_type_id=csv_value(row, "customerTypeId", "customer_type_id"),
         region_id=csv_value(row, "regionId", "region_id"),
         city_id=csv_value(row, "cityId", "city_id"),
-        full_name=csv_value(row, "fullName", "full_name"),
-        mobile_number=csv_value(row, "mobileNumber", "mobile_number"),
-        id_number=csv_value(row, "idNumber", "id_number"),
-        email=csv_value(row, "email"),
-        commercial_reg_id=csv_value(row, "commercial_reg_id", "commercialRegId") or "N/A",
-        unified_number=csv_value(row, "unified_number", "unifiedNumber") or "N/A",
-        contact_number=csv_value(row, "contact_number", "contactNumber") or "N/A",
-        city=csv_value(row, "city") or "N/A",
-        region=csv_value(row, "region") or "N/A",
-        contact_name=csv_value(row, "contact_name", "contactName") or "N/A",
-        l3_service=csv_value(row, "l3_service", "l3Service") or "MPLS L3VPN",
-        service=service_description or "L3 service allocation",
+        full_name=full_name,
+        mobile_number=mobile_number,
+        id_number=normalize_cst_id_number(csv_value(row, "idNumber", "id_number", "customerIdentity", "customer_identity")) or csv_value(row, "idNumber", "id_number", "customerIdentity", "customer_identity"),
+        email=email,
+        commercial_reg_id=commercial_reg_id,
+        unified_number=unified_number,
+        contact_number=contact_number or mobile_number,
+        contact_email=contact_email or email,
+        city=csv_value(row, "city"),
+        region=csv_value(row, "region"),
+        contact_name=csv_value(row, "contact_name", "contactName") or full_name,
+        internal_consumer_type=csv_value(row, "internalConsumerType", "internal_consumer_type"),
+        internal_business_unit=csv_value(row, "internalBusinessUnit", "internal_business_unit"),
+        internal_application_id=csv_value(row, "internalApplicationId", "internal_application_id"),
+        internal_application_name=csv_value(row, "internalApplicationName", "internal_application_name"),
+        internal_environment=csv_value(row, "internalEnvironment", "internal_environment"),
+        internal_owner_team=csv_value(row, "internalOwnerTeam", "internal_owner_team"),
+        internal_cost_center=csv_value(row, "internalCostCenter", "internal_cost_center"),
+        internal_project_code=csv_value(row, "internalProjectCode", "internal_project_code"),
+        internal_change_request_id=csv_value(row, "internalChangeRequestId", "internal_change_request_id"),
+        internal_justification=csv_value(row, "internalJustification", "internal_justification"),
+        l3_service=csv_value(row, "l3_service", "l3Service") or ("MPLS L3VPN" if assignment_type == "BUSINESS" else "Internal L3 Service"),
+        service=service_description or csv_value(row, "service") or "L3 service allocation",
         service_description=service_description,
         access_technology_id=csv_value(row, "accessTechnologyId", "access_technology_id"),
         access_technology=csv_value(row, "accessTechnology", "access_technology"),
-        owner=csv_value(row, "owner") or "Network service desk",
-        site=csv_value(row, "site") or "Unassigned site",
+        owner=csv_value(row, "owner") or ("Business Customer" if assignment_type == "BUSINESS" else ""),
+        site=csv_value(row, "site"),
+        site_id=csv_value(row, "siteId", "site_id"),
+        location_name=csv_value(row, "locationName", "location_name"),
+        assignment_purpose=csv_value(row, "assignmentPurpose", "assignment_purpose", "purpose"),
         environment=csv_value(row, "environment") or "Production",
         status=assignment_status,
         assignment_date=assignment_date,
         notes=csv_value(row, "notes"),
+        cst_validation_warnings="; ".join(warnings),
     )
 
 
@@ -3869,7 +4220,37 @@ def validate_private_pool_registration(candidate: IPv4Network) -> None:
         )
 
 
-def validate_assignment(candidate: IPv4Network) -> None:
+def assignment_active_for_conflict(assignment: Assignment) -> bool:
+    if assignment_released_after_ripe_removal(assignment):
+        return False
+    if str(assignment.migration_conflict_status or "").upper() == "REJECTED":
+        return False
+    return str(assignment.status or "").strip().lower() not in {"retiring", "retired"}
+
+
+def assignment_overlap_candidates(candidate: IPv4Network, excluded_assignment_ids: set[str] | None = None) -> list[Assignment]:
+    excluded_assignment_ids = excluded_assignment_ids or set()
+    overlaps: list[Assignment] = []
+    for assignment in list_assignments_from_db():
+        if assignment.id in excluded_assignment_ids or not assignment_active_for_conflict(assignment):
+            continue
+        if candidate.overlaps(network_of(assignment)):
+            overlaps.append(assignment)
+    return overlaps
+
+
+def assignment_conflict_message(candidate: IPv4Network, overlaps: list[Assignment]) -> str:
+    joined = "; ".join(f"{item.customer_name or item.id} allocation {item.cidr}" for item in overlaps[:8])
+    extra = f" and {len(overlaps) - 8} more" if len(overlaps) > 8 else ""
+    return f"{candidate} overlaps existing assignment(s): {joined}{extra}"
+
+
+def conflict_group_for_assignments(candidate: IPv4Network, overlaps: list[Assignment]) -> str:
+    members = ":".join(sorted([str(candidate), *[item.id for item in overlaps]]))
+    return stable_uuid("migration-conflict", members)
+
+
+def validate_assignment(candidate: IPv4Network, allow_overlap: bool = False) -> list[Assignment]:
     parent_candidates = [
         pool
         for pool in list_pools_from_db()
@@ -3880,14 +4261,10 @@ def validate_assignment(candidate: IPv4Network) -> None:
     if parent is None:
         raise HTTPException(status_code=409, detail=f"{candidate} is outside managed parent pools")
 
-    for assignment in list_assignments_from_db():
-        if assignment_released_after_ripe_removal(assignment):
-            continue
-        if candidate.overlaps(network_of(assignment)):
-            raise HTTPException(
-                status_code=409,
-                detail=f"{candidate} overlaps {assignment.customer_name} allocation {assignment.cidr}",
-            )
+    overlaps = assignment_overlap_candidates(candidate)
+    if overlaps and not allow_overlap:
+        raise HTTPException(status_code=409, detail=assignment_conflict_message(candidate, overlaps))
+    return overlaps
 
 
 def active_child_resources(connection: sqlite3.Connection, root_resource_uuid: str) -> list[ResourceRecord]:
@@ -3923,13 +4300,81 @@ def assert_resource_can_change(connection: sqlite3.Connection, entity_type: str,
     return resource
 
 
+def redact_database_url(url: str) -> str:
+    text = str(url or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = urllib_parse.urlsplit(text)
+    except Exception:
+        return "***"
+    if not parsed.netloc:
+        return "***"
+    username = urllib_parse.quote(urllib_parse.unquote(parsed.username or ""), safe="")
+    host = parsed.hostname or ""
+    port = f":{parsed.port}" if parsed.port else ""
+    auth = f"{username}:***@" if username else "***@"
+    return urllib_parse.urlunsplit((parsed.scheme or "postgresql", f"{auth}{host}{port}", parsed.path, parsed.query, ""))
+
+
+def postgres_test_dsn(payload: DatabaseConnectionTestRequest) -> str:
+    host = payload.host.strip()
+    database = payload.database.strip()
+    username = payload.username.strip()
+    if not host or not database or not username:
+        raise HTTPException(status_code=400, detail="PostgreSQL host, database, and username are required")
+    if payload.port <= 0:
+        raise HTTPException(status_code=400, detail="PostgreSQL port must be greater than zero")
+    ssl_mode = payload.ssl_mode.strip() or "prefer"
+    if ssl_mode not in {"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}:
+        raise HTTPException(status_code=400, detail="Unsupported PostgreSQL SSL mode")
+    netloc = f"{urllib_parse.quote(username, safe='')}:{urllib_parse.quote(payload.password or '', safe='')}@{host}:{payload.port}"
+    query = urllib_parse.urlencode({"sslmode": ssl_mode, "connect_timeout": max(int(payload.connect_timeout or 10), 1)})
+    return urllib_parse.urlunsplit(("postgresql", netloc, f"/{urllib_parse.quote(database, safe='')}", query, ""))
+
 @app.get("/health")
 def health() -> dict[str, int | bool | str]:
     with connect() as connection:
         pool_count = connection.execute("SELECT COUNT(*) FROM pools").fetchone()[0]
         assignment_count = connection.execute("SELECT COUNT(*) FROM assignments").fetchone()[0]
         resource_count = connection.execute("SELECT COUNT(*) FROM ip_resources").fetchone()[0]
-    return {"ok": True, "pools": pool_count, "assignments": assignment_count, "resources": resource_count, "database": str(DB_PATH)}
+    return {"ok": True, "pools": pool_count, "assignments": assignment_count, "resources": resource_count, "database": str(DB_PATH), "database_engine": "SQLite"}
+
+
+@app.get("/database/status", response_model=DatabaseConnectionStatus)
+def database_connection_status() -> DatabaseConnectionStatus:
+    configured = bool(DATABASE_URL)
+    return DatabaseConnectionStatus(
+        current_engine="SQLite",
+        sqlite_path=str(DB_PATH),
+        database_url_configured=configured,
+        database_url_redacted=redact_database_url(DATABASE_URL),
+        postgres_driver_available=psycopg is not None,
+        postgres_runtime_supported=False,
+        message="Current backend in this workspace still uses SQLite. Set DATABASE_URL only after PostgreSQL runtime support is merged and restart the API service.",
+    )
+
+
+@app.post("/database/test-postgres", response_model=DatabaseConnectionTestResponse)
+def test_postgres_connection(payload: DatabaseConnectionTestRequest) -> DatabaseConnectionTestResponse:
+    if psycopg is None:
+        raise HTTPException(status_code=503, detail="Python package psycopg is not installed on the API server")
+    dsn = postgres_test_dsn(payload)
+    try:
+        with psycopg.connect(dsn) as pg_connection:
+            with pg_connection.cursor() as cursor:
+                cursor.execute("SELECT version(), current_database(), current_user")
+                version, database, username = cursor.fetchone()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"PostgreSQL connection test failed: {exc}") from exc
+    return DatabaseConnectionTestResponse(
+        success=True,
+        message="PostgreSQL connection test succeeded. Configure DATABASE_URL on the API server and restart when ready to switch.",
+        server_version=str(version),
+        database=str(database),
+        username=str(username),
+        tested_at=now_iso(),
+    )
 
 
 @app.get("/favicon.ico", include_in_schema=False)
@@ -4548,7 +4993,7 @@ def update_cst_config(payload: CstConfigUpdate) -> CstConfig:
     if not updates:
         return get_cst_config()
     allowed = {
-        "enabled", "service_provider_id", "auto_execute", "scheduled_sync_enabled", "integration_mode",
+        "enabled", "service_provider_id", "auto_execute", "scheduled_sync_enabled", "send_enabled", "update_enabled", "delete_enabled", "get_enabled", "integration_mode",
         "host", "port", "base_url", "token_path", "send_path", "update_path", "delete_path", "get_path",
         "auth_username", "accept_language", "verify_ssl", "connection_timeout", "read_timeout", "token_refresh_buffer_seconds",
         "schedule_time", "schedule_timezone", "batch_size_limit", "hourly_request_limit"
@@ -4569,7 +5014,6 @@ def update_cst_config(payload: CstConfigUpdate) -> CstConfig:
     if not values:
         return get_cst_config()
     values["integration_mode"] = "Real API"
-    values["auto_execute"] = 1
     if "port" in values and int(values["port"]) <= 0:
         raise HTTPException(status_code=400, detail="port must be greater than zero")
     for timeout_field in ["connection_timeout", "read_timeout", "token_refresh_buffer_seconds"]:
@@ -4593,7 +5037,7 @@ def update_cst_config(payload: CstConfigUpdate) -> CstConfig:
         current = get_cst_config()
         values["base_url"] = f"https://{current.host}:{int(values['port'])}"
     values["verify_ssl"] = 0
-    for boolean_field in ["enabled", "scheduled_sync_enabled"]:
+    for boolean_field in ["enabled", "auto_execute", "scheduled_sync_enabled", "send_enabled", "update_enabled", "delete_enabled", "get_enabled"]:
         if boolean_field in values:
             values[boolean_field] = 1 if values[boolean_field] else 0
     values["updated_at"] = now_iso()
@@ -4694,25 +5138,92 @@ def reconcile_cst_resources() -> list[CstSyncJob]:
     return jobs
 
 
+
+@app.post("/cst/jobs/push-pending", response_model=CstPendingPushResult)
+def push_pending_cst_jobs(limit: int = 0) -> CstPendingPushResult:
+    if limit < 0:
+        raise HTTPException(status_code=400, detail="limit must be zero or greater")
+    if not CST_PENDING_PUSH_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Another CST push is already running")
+    started_at = now_iso()
+    processed_jobs: list[CstSyncJob] = []
+    requested_jobs = 0
+    effective_limit = 0
+    batch_size_limit = 0
+    hourly_request_limit = 0
+    rate_delay_seconds = 0.0
+    try:
+        with connect() as connection:
+            config = ensure_cst_config(connection)
+            batch_size_limit = max(int(config.batch_size_limit or 500), 1)
+            hourly_request_limit = max(int(config.hourly_request_limit or 1000), 1)
+            effective_limit = cst_effective_pending_push_limit(config, limit)
+            rate_delay_seconds = cst_rate_limit_delay_seconds(config)
+            rows = connection.execute(
+                "SELECT * FROM cst_sync_jobs WHERE status = 'PENDING' ORDER BY created_at, sequence_no, id LIMIT ?",
+                (effective_limit,),
+            ).fetchall()
+            requested_jobs = len(rows)
+            for index, row in enumerate(rows):
+                job = process_cst_job_sequentially(connection, row)
+                processed_jobs.append(job)
+                connection.commit()
+                if index < len(rows) - 1 and cst_job_called_external_api(job):
+                    time.sleep(rate_delay_seconds)
+    finally:
+        CST_PENDING_PUSH_LOCK.release()
+    completed_at = now_iso()
+    success_jobs = sum(1 for job in processed_jobs if job.status == "SUCCESS")
+    failed_jobs = sum(1 for job in processed_jobs if job.status == "FAILED")
+    pending_jobs = sum(1 for job in processed_jobs if job.status == "PENDING")
+    not_required_jobs = sum(1 for job in processed_jobs if job.status == "NOT_REQUIRED")
+    return CstPendingPushResult(
+        started_at=started_at,
+        completed_at=completed_at,
+        requested_jobs=requested_jobs,
+        processed_jobs=len(processed_jobs),
+        success_jobs=success_jobs,
+        failed_jobs=failed_jobs,
+        pending_jobs=pending_jobs,
+        not_required_jobs=not_required_jobs,
+        message=f"Processed {len(processed_jobs)} pending CST job(s) sequentially. Batch limit: {batch_size_limit}. Hourly limit: {hourly_request_limit}.",
+        effective_limit=effective_limit,
+        batch_size_limit=batch_size_limit,
+        hourly_request_limit=hourly_request_limit,
+        rate_delay_seconds=rate_delay_seconds,
+        jobs=processed_jobs,
+    )
 @app.post("/cst/jobs/{job_id}/retry", response_model=CstSyncJob)
 def retry_cst_job(job_id: str) -> CstSyncJob:
-    with connect() as connection:
-        row = connection.execute("SELECT * FROM cst_sync_jobs WHERE id = ?", (job_id,)).fetchone()
-        if row is None:
-            raise HTTPException(status_code=404, detail="CST job not found")
-        return retry_cst_jobs(connection, [row])[0]
+    if not CST_PENDING_PUSH_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Another CST push is already running")
+    try:
+        with connect() as connection:
+            row = connection.execute("SELECT * FROM cst_sync_jobs WHERE id = ?", (job_id,)).fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="CST job not found")
+            return process_cst_job_sequentially(connection, row)
+    finally:
+        CST_PENDING_PUSH_LOCK.release()
 
 
 @app.post("/cst/batches/{batch_id}/retry-failed", response_model=list[CstSyncJob])
 def retry_failed_cst_batch(batch_id: str) -> list[CstSyncJob]:
-    with connect() as connection:
-        rows = connection.execute(
-            "SELECT * FROM cst_sync_jobs WHERE batch_id = ? AND status IN ('FAILED', 'BLOCKED', 'PENDING') ORDER BY sequence_no",
-            (batch_id,),
-        ).fetchall()
-        if not rows:
-            return []
-        return retry_cst_jobs(connection, rows)
+    if not CST_PENDING_PUSH_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail="Another CST push is already running")
+    try:
+        with connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM cst_sync_jobs WHERE batch_id = ? AND status IN ('FAILED', 'BLOCKED', 'PENDING') ORDER BY sequence_no",
+                (batch_id,),
+            ).fetchall()
+            updated_jobs: list[CstSyncJob] = []
+            for row in rows:
+                updated_jobs.append(process_cst_job_sequentially(connection, row))
+                connection.commit()
+            return updated_jobs
+    finally:
+        CST_PENDING_PUSH_LOCK.release()
 
 @app.get("/pools", response_model=list[Pool])
 def list_pools() -> list[Pool]:
@@ -5186,22 +5697,40 @@ def process_assignment_bulk(csv_text: str) -> BulkImportResult:
             assignment_status_id, assignment_status = bulk_assignment_status(row, is_pr_format)
             for network in networks:
                 try:
-                    assignment_payload = assignment_payload_from_bulk_row(row, network, assignment_status_id, assignment_status)
+                    assignment_payload = assignment_payload_from_bulk_row(row, network, assignment_status_id, assignment_status, index)
                     validate_cst_lir_assignment(assignment_payload)
-                    validate_assignment(network)
+                    overlap_assignments = validate_assignment(network, allow_overlap=True)
                     assignment = assignment_from_network(network, assignment_payload)
+                    conflict_errors: list[str] = []
+                    if overlap_assignments:
+                        conflict_errors = [assignment_conflict_message(network, overlap_assignments)]
+                        assignment.migration_conflict_status = "CONFLICT"
+                        assignment.migration_conflict_reason = conflict_errors[0]
+                        assignment.migration_conflict_group = conflict_group_for_assignments(network, overlap_assignments)
                     with connect() as connection:
+                        ready, validation_status, validation_errors, validation_warnings = cst_bulk_readiness_for_assignment(connection, assignment, [item for item in assignment.cst_validation_warnings.split("; ") if item])
+                        if conflict_errors:
+                            validation_errors = list(dict.fromkeys([*conflict_errors, *validation_errors]))
+                            ready = False
+                            validation_status = "CONFLICT"
+                        assignment.cst_sync_ready = ready
+                        assignment.cst_validation_status = validation_status
+                        assignment.cst_validation_errors = "; ".join(validation_errors)
+                        assignment.cst_validation_warnings = "; ".join(validation_warnings)
                         insert_assignment(connection, assignment)
                         resource = sync_assignment_resource(connection, assignment)
-                        if resource_requires_cst(resource):
-                            create_cst_assignment_create_jobs(connection, assignment, resource, "ASSIGNMENT_BULK_IMPORT")
                         record_audit(connection, "Subnet Allocation", "assignment", assignment.id, "", assignment.model_dump_json())
+                        if conflict_errors:
+                            record_audit(connection, "Bulk Assignment Conflict", "assignment", assignment.id, "", json.dumps({"row": index, "conflicts": conflict_errors, "group": assignment.migration_conflict_group}))
+                        if validation_warnings:
+                            record_audit(connection, "CST Bulk Import Normalization", "assignment", assignment.id, "", json.dumps({"row": index, "warnings": validation_warnings}))
                     imported += 1
+                    processing_message = "Imported with overlap conflict; resolve in Integrity & Conflicts before CST sync" if conflict_errors else "Ready for CST sync" if ready else "Imported but not ready for CST sync"
                     output_rows.append(
                         BulkOutputRow(
                             inputRowNumber=index,
-                            processingStatus="SUCCESS",
-                            processingMessage="Imported",
+                            processingStatus="IMPORTED_WITH_CONFLICT" if conflict_errors else "SUCCESS" if ready else "IMPORTED_NOT_READY",
+                            processingMessage=processing_message,
                             generatedResourceUuid=resource.resource_uuid,
                             generatedVersionUuid=resource.version_uuid,
                             generatedCidr=assignment.cidr,
@@ -5209,6 +5738,11 @@ def process_assignment_bulk(csv_text: str) -> BulkImportResult:
                             status=str(resource.assignment_status_id),
                             assignmentDate=assignment.assignment_date,
                             customerName=assignment.customer_name,
+                            assignmentType=bulk_assignment_type(row, assignment_status_id),
+                            cstSyncReady=ready,
+                            cstValidationStatus=validation_status,
+                            cstValidationErrors=assignment.cst_validation_errors,
+                            cstValidationWarnings=assignment.cst_validation_warnings,
                         )
                     )
                 except HTTPException as exc:
@@ -5224,25 +5758,34 @@ def process_assignment_bulk(csv_text: str) -> BulkImportResult:
                             status=str(assignment_status_id),
                             assignmentDate=csv_value(row, "assignmentDate", "assignment_date"),
                             customerName=csv_value(row, "customerName", "customer_name"),
+                            assignmentType=csv_value(row, "assignmentType", "assignment_type"),
+                            cstSyncReady=False,
+                            cstValidationStatus="REJECTED",
+                            cstValidationErrors=str(exc.detail),
                         )
                     )
                 except (sqlite3.IntegrityError, ValueError) as exc:
-                    message = f"row {index} {network}: invalid or duplicate assignment"
+                    duplicate_detail = "duplicate CIDR already exists; exact duplicate CIDRs cannot be parked as normal assignment rows" if isinstance(exc, sqlite3.IntegrityError) else "invalid assignment"
+                    message = f"row {index} {network}: {duplicate_detail}"
                     errors.append(message)
                     output_rows.append(
                         BulkOutputRow(
                             inputRowNumber=index,
-                            processingStatus="FAILED",
-                            processingMessage="invalid or duplicate assignment",
+                            processingStatus="FAILED_DUPLICATE_CONFLICT" if isinstance(exc, sqlite3.IntegrityError) else "FAILED",
+                            processingMessage=duplicate_detail,
                             generatedCidr=str(network),
                             generatedSize=network.num_addresses,
                             status=str(assignment_status_id),
                             assignmentDate=csv_value(row, "assignmentDate", "assignment_date"),
                             customerName=csv_value(row, "customerName", "customer_name"),
+                            assignmentType=csv_value(row, "assignmentType", "assignment_type"),
+                            cstSyncReady=False,
+                            cstValidationStatus="REJECTED",
+                            cstValidationErrors=duplicate_detail,
                         )
                     )
             row_outputs = output_rows[row_output_start:]
-            if any(item.processingStatus == "SUCCESS" for item in row_outputs) and any(item.processingStatus == "FAILED" for item in row_outputs):
+            if any(item.processingStatus in {"SUCCESS", "IMPORTED_NOT_READY", "IMPORTED_WITH_CONFLICT"} for item in row_outputs) and any(item.processingStatus.startswith("FAILED") for item in row_outputs):
                 for item in row_outputs:
                     item.processingStatus = "PARTIAL_SUCCESS"
         except HTTPException as exc:
@@ -5361,13 +5904,15 @@ def unassign(assignment_id: str) -> None:
             retiring_assignment = assignment_from_row(connection.execute("SELECT * FROM assignments WHERE id = ?", (assignment_id,)).fetchone())
             resource = sync_assignment_resource(connection, retiring_assignment)
             jobs = create_cst_sync_jobs(connection, [(resource, "DELETE")], "ASSIGNMENT_UNASSIGN")
-            if not cst_delete_succeeded(jobs):
+            if cst_delete_succeeded(jobs):
+                audit_action = "CST Assignment Removal"
+                audit_new_value = "Removed from CST and released locally"
+            else:
                 failed = next((job for job in jobs if job.status != "SUCCESS"), None)
-                detail = failed.last_error if failed and failed.last_error else "CST DeleteLIRData did not complete successfully"
-                record_audit(connection, "CST Assignment Removal Failed", "assignment", assignment_id, assignment.model_dump_json(), detail)
-                raise HTTPException(status_code=502, detail=detail)
-            audit_action = "CST Assignment Removal"
-            audit_new_value = "Removed from CST and released locally"
+                detail = failed.last_error if failed and failed.last_error else "CST DeleteLIRData queued for later retry"
+                record_audit(connection, "CST Assignment Removal Deferred", "assignment", assignment_id, assignment.model_dump_json(), detail)
+                audit_action = "Subnet Release"
+                audit_new_value = f"Released locally; CST DeleteLIRData deferred: {detail}"
 
         result = connection.execute("DELETE FROM assignments WHERE id = ?", (assignment_id,))
         if result.rowcount == 0:
@@ -5389,12 +5934,15 @@ def list_audit_events() -> list[AuditEvent]:
 def list_conflicts() -> list[Conflict]:
     conflicts: list[Conflict] = []
     pools = list_pools_from_db()
-    assignments = [
-        assignment
-        for assignment in list_assignments_from_db()
-        if not assignment_released_after_ripe_removal(assignment)
-    ]
+    assignments = [assignment for assignment in list_assignments_from_db() if assignment_active_for_conflict(assignment)]
     pool_ranges = [(network_of(pool), pool) for pool in pools]
+    with connect() as connection:
+        resource_by_assignment_id = {
+            str(row["source_entity_id"]): str(row["resource_uuid"])
+            for row in connection.execute(
+                "SELECT source_entity_id, resource_uuid FROM ip_resources WHERE source_entity_type = 'assignment'"
+            ).fetchall()
+        }
 
     pool_intervals = sorted(
         ((int(pool_network.network_address), int(pool_network.broadcast_address), pool) for pool_network, pool in pool_ranges),
@@ -5411,6 +5959,7 @@ def list_conflicts() -> list[Conflict]:
                         title="Registered subnets overlap",
                         detail=f"{active_pool.cidr} overlaps {pool.cidr}",
                         ranges=[active_pool.cidr, pool.cidr],
+                        resolution_status="OPEN",
                     )
                 )
                 if len(conflicts) >= 500:
@@ -5426,6 +5975,9 @@ def list_conflicts() -> list[Conflict]:
                     title="Assignment outside managed pools",
                     detail=f"{assignment.customer_name} allocation {assignment.cidr} is not covered by a parent pool",
                     ranges=[assignment.cidr],
+                    assignment_ids=[assignment.id],
+                    resource_uuids=[resource_by_assignment_id.get(assignment.id, "")],
+                    resolution_status="PENDING_RESOLUTION" if assignment.migration_conflict_status else "OPEN",
                 )
             )
 
@@ -5438,12 +5990,18 @@ def list_conflicts() -> list[Conflict]:
         active_overlaps = [(active_start, active_end, active_assignment) for active_start, active_end, active_assignment in active_overlaps if active_end >= start]
         for _active_start, active_end, active_assignment in active_overlaps:
             if start <= active_end:
+                resolution_status = "PENDING_RESOLUTION" if (
+                    active_assignment.migration_conflict_status or assignment.migration_conflict_status
+                ) else "OPEN"
                 conflicts.append(
                     Conflict(
                         severity="critical",
                         title="Customer assignments overlap",
                         detail=f"{active_assignment.customer_name} overlaps {assignment.customer_name}",
                         ranges=[active_assignment.cidr, assignment.cidr],
+                        assignment_ids=[active_assignment.id, assignment.id],
+                        resource_uuids=[resource_by_assignment_id.get(active_assignment.id, ""), resource_by_assignment_id.get(assignment.id, "")],
+                        resolution_status=resolution_status,
                     )
                 )
                 if len(conflicts) >= 500:
@@ -5452,6 +6010,126 @@ def list_conflicts() -> list[Conflict]:
 
     return conflicts
 
+
+def cst_warning_list(value: str) -> list[str]:
+    return [item for item in str(value or "").split("; ") if item]
+
+
+def update_assignment_conflict_state(
+    connection: sqlite3.Connection,
+    assignment: Assignment,
+    *,
+    status: str,
+    conflict_status: str,
+    conflict_reason: str,
+    validation_status: str,
+    validation_errors: list[str],
+    cst_ready: bool,
+    cst_sync_status: str,
+    action_flag: str,
+) -> Assignment:
+    validation_warnings = cst_warning_list(assignment.cst_validation_warnings)
+    connection.execute(
+        """
+        UPDATE assignments
+        SET status = ?, migration_conflict_status = ?, migration_conflict_reason = ?, migration_conflict_group = ?,
+            cst_validation_status = ?, cst_validation_errors = ?, cst_validation_warnings = ?,
+            cst_sync_ready = ?, cst_sync_status = ?, action_flag = ?
+        WHERE id = ?
+        """,
+        (
+            status,
+            conflict_status,
+            conflict_reason,
+            assignment.migration_conflict_group,
+            validation_status,
+            "; ".join(dict.fromkeys(validation_errors)),
+            "; ".join(dict.fromkeys(validation_warnings)),
+            cst_ready,
+            cst_sync_status,
+            action_flag,
+            assignment.id,
+        ),
+    )
+    updated = assignment_from_row(connection.execute("SELECT * FROM assignments WHERE id = ?", (assignment.id,)).fetchone())
+    sync_assignment_resource(connection, updated)
+    return updated
+
+
+@app.post("/conflicts/assignments/{assignment_id}/reject", response_model=Assignment)
+def reject_conflicting_assignment(assignment_id: str) -> Assignment:
+    before = find_assignment(assignment_id)
+    with connect() as connection:
+        resource = find_resource_by_source(connection, "assignment", assignment_id)
+        if resource and cst_resource_reported_to_cst(connection, resource):
+            raise HTTPException(status_code=409, detail="Reported CST assignments must be unassigned through the CST delete flow, not rejected as a migration conflict")
+        after = update_assignment_conflict_state(
+            connection,
+            before,
+            status="Retiring",
+            conflict_status="REJECTED",
+            conflict_reason="Rejected during migration conflict resolution",
+            validation_status="REJECTED",
+            validation_errors=["Rejected during migration conflict resolution"],
+            cst_ready=False,
+            cst_sync_status="NOT_REQUIRED",
+            action_flag="D",
+        )
+        record_audit(connection, "Bulk Assignment Conflict Rejected", "assignment", assignment_id, before.model_dump_json(), after.model_dump_json())
+    return after
+
+
+@app.post("/conflicts/assignments/{assignment_id}/accept", response_model=Assignment)
+def accept_conflicting_assignment(assignment_id: str) -> Assignment:
+    before = find_assignment(assignment_id)
+    candidate_network = network_of(before)
+    remaining_overlaps = assignment_overlap_candidates(candidate_network, {assignment_id})
+    with connect() as connection:
+        if remaining_overlaps:
+            reason = assignment_conflict_message(candidate_network, remaining_overlaps)
+            after = update_assignment_conflict_state(
+                connection,
+                before,
+                status="Active",
+                conflict_status="CONFLICT",
+                conflict_reason=reason,
+                validation_status="CONFLICT",
+                validation_errors=[reason],
+                cst_ready=False,
+                cst_sync_status="PENDING",
+                action_flag=before.action_flag or "N",
+            )
+            record_audit(connection, "Bulk Assignment Conflict Recheck", "assignment", assignment_id, before.model_dump_json(), after.model_dump_json())
+            raise HTTPException(status_code=409, detail=f"Cannot accept yet. {reason}")
+
+        candidate = before.model_copy(update={
+            "status": "Active",
+            "migration_conflict_status": "ACCEPTED",
+            "migration_conflict_reason": "",
+            "migration_conflict_group": "",
+        })
+        ready, validation_status, validation_errors, validation_warnings = cst_bulk_readiness_for_assignment(connection, candidate, cst_warning_list(candidate.cst_validation_warnings))
+        candidate.cst_sync_ready = ready
+        candidate.cst_validation_status = validation_status
+        candidate.cst_validation_errors = "; ".join(validation_errors)
+        candidate.cst_validation_warnings = "; ".join(validation_warnings)
+        after = update_assignment_conflict_state(
+            connection,
+            candidate,
+            status="Active",
+            conflict_status="ACCEPTED",
+            conflict_reason="",
+            validation_status=validation_status,
+            validation_errors=validation_errors,
+            cst_ready=ready,
+            cst_sync_status="PENDING" if ready else before.cst_sync_status or "PENDING",
+            action_flag=before.action_flag or "N",
+        )
+        connection.execute("UPDATE assignments SET migration_conflict_group = '' WHERE id = ?", (assignment_id,))
+        after = assignment_from_row(connection.execute("SELECT * FROM assignments WHERE id = ?", (assignment_id,)).fetchone())
+        sync_assignment_resource(connection, after)
+        record_audit(connection, "Bulk Assignment Conflict Accepted", "assignment", assignment_id, before.model_dump_json(), after.model_dump_json())
+    return after
 
 init_db()
 

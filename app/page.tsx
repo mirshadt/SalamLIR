@@ -54,16 +54,21 @@ import {
   CstSyncSummary,
   CstSchedulerRun,
   CstTransactionLedger,
+  DatabaseConnectionPayload,
+  DatabaseConnectionStatus,
   getAssignments,
   getAuditEvents,
   getBulkBatches,
   getConflicts,
+  acceptConflictAssignment,
+  rejectConflictAssignment,
   getCstBatches,
   getCstConfig,
   getCstJobs,
   getCstSchedulerRuns,
   getCstSummary,
   getCstTransactions,
+  getDatabaseConnectionStatus,
   getPools,
   getRipeAllocatedPools,
   getRipeConfig,
@@ -85,9 +90,11 @@ import {
   SiebelLookupResponse,
   retryCstJob,
   retryFailedCstBatch,
+  pushPendingCstJobs,
   runCstDayMinusOneSync,
   updateCstConfig,
   testCstConnection,
+  testDatabaseConnection,
   testSiebelConnection,
   reconcileCstResources,
   User
@@ -303,6 +310,12 @@ const SEARCH_FILTER_FIELDS: Array<{ value: SearchFilterField; label: string; mod
   { value: "description", label: "Description", mode: "text" }
 ];
 
+
+const CST_BULK_ASSIGNMENT_TEMPLATE = [
+  "assignmentType,cidr,startIp,endIp,size,status,assignmentDate,customerName,organizationName,organizationId,commercialRegId,unifiedNumber,customerTypeId,regionId,cityId,fullName,mobileNumber,idNumber,email,contactName,contactNumber,contactEmail,customerId,serviceId,serviceDescription,accessTechnologyId,owner,assignmentPurpose,site,city,region,notes",
+  "BUSINESS,5.42.224.0/30,,,4,3,2026-06-03,Example Enterprise,Example Enterprise LLC,1010112916,1010112916,,2,14,41,Primary Contact,+966501234567,1234567890,contact@example.com,Primary Contact,+966501234567,contact@example.com,CUST-10001,SVC-10001,Enterprise L3 service,1,Business Customer,Customer L3 service,Riyadh HQ,Riyadh,Riyadh,Ready business example",
+  "INTERNAL,5.42.224.4/30,,,4,2,2026-06-03,Salam Internal,,,,,,14,41,Network Operations,+966501234568,1234567891,noc@salam.sa,Network Operations,+966501234568,noc@salam.sa,,INT-SVC-10001,Internal firewall management,1,Network Operations,Firewall installation,Riyadh DC,Riyadh,Riyadh,Ready internal example"
+].join("\n");
 const navigation: Array<{ id: ViewKey; label: string; icon: React.ReactNode }> = [
   { id: "executive", label: "Home", icon: <Gauge className="h-4 w-4" /> },
   { id: "registry", label: "Resource Registry", icon: <Database className="h-4 w-4" /> },
@@ -788,10 +801,18 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   const [splitForm, setSplitForm] = useState({ poolId: "", search: "", prefix: "24", direction: "start" as PartitionDirection });
   const [mergeForm, setMergeForm] = useState({ leftPoolId: "", rightPoolId: "", leftSearch: "", rightSearch: "" });
   const [bulkPoolCsv, setBulkPoolCsv] = useState("StartIP,EndIP,Total\n10.24.0.0,10.24.255.255,65536");
-  const [bulkAssignmentCsv, setBulkAssignmentCsv] = useState("cidr,size,status,assignmentDate,customerName,serviceId,serviceDescription\n5.42.224.0/24,256,3,2026-06-03,Example Enterprise,SVC-10001,Enterprise L3 service");
+  const [bulkAssignmentCsv, setBulkAssignmentCsv] = useState(CST_BULK_ASSIGNMENT_TEMPLATE);
   const [ripeConfigForm, setRipeConfigForm] = useState<RipeConfigPayload>({ base_url: "https://rest.db.ripe.net", auth_type: "Basic Authentication", username: "", password: "", connection_timeout: 10, read_timeout: 30, default_maintainer: "ITC-NOC-MNT" });
   const [siebelConfigForm, setSiebelConfigForm] = useState<SiebelConfigPayload>({ username: "LIR_USER", password: "", dsn: "172.31.23.101:1525/SIDB", connection_timeout: 10, query_sql: DEFAULT_SIEBEL_QUERY });
+  const [databaseConnectionForm, setDatabaseConnectionForm] = useState<DatabaseConnectionPayload>({ host: "localhost", port: 5432, database: "lir", username: "lir_app", password: "", ssl_mode: "prefer", connect_timeout: 10 });
   const [cstConfigForm, setCstConfigForm] = useState<CstConfigPayload>({
+    enabled: true,
+    auto_execute: true,
+    scheduled_sync_enabled: true,
+    send_enabled: true,
+    update_enabled: true,
+    delete_enabled: true,
+    get_enabled: true,
     integration_mode: "Real API",
     host: "cst-oa-unified-gw-stg-fop.apps.apldev-sit-opshift.itc.local",
     port: 443,
@@ -809,7 +830,9 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
     verify_ssl: false,
     connection_timeout: 10,
     read_timeout: 30,
-    token_refresh_buffer_seconds: 300
+    token_refresh_buffer_seconds: 300,
+    batch_size_limit: 500,
+    hourly_request_limit: 1000
   });
   const [ripePoolCsv, setRipePoolCsv] = useState("pool_name,cidr,allocation_type,source,created_date\nRIPE Allocation 5.42.224.0,5.42.224.0/19,RIPE Allocated Pool,RIPE Database,2026-06-01");
   const [ripeReportForm, setRipeReportForm] = useState({ dateFrom: "", dateTo: "", reportType: "RIPE Assignment Report" });
@@ -835,6 +858,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   const ripeConfigQuery = useQuery({ queryKey: ["ripe-config"], queryFn: getRipeConfig, ...liveQueryOptions });
   const siebelConfigQuery = useQuery({ queryKey: ["siebel-config"], queryFn: getSiebelConfig, ...liveQueryOptions });
   const ripeAllocatedPoolsQuery = useQuery({ queryKey: ["ripe-allocated-pools"], queryFn: getRipeAllocatedPools, ...liveQueryOptions });
+  const databaseStatusQuery = useQuery({ queryKey: ["database-status"], queryFn: getDatabaseConnectionStatus, ...liveQueryOptions });
   const cstConfigQuery = useQuery({ queryKey: ["cst-config"], queryFn: getCstConfig, ...liveQueryOptions });
   const cstSummaryQuery = useQuery({ queryKey: ["cst-summary"], queryFn: getCstSummary, ...liveQueryOptions });
   const cstBatchesQuery = useQuery({ queryKey: ["cst-batches"], queryFn: getCstBatches, ...liveQueryOptions });
@@ -861,6 +885,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   const ripeConfig = ripeConfigQuery.data ?? null;
   const siebelConfig = siebelConfigQuery.data ?? null;
   const ripeAllocatedPools = ripeAllocatedPoolsQuery.data ?? [];
+  const databaseConnectionStatus = databaseStatusQuery.data ?? null;
   const cstConfig = cstConfigQuery.data ?? null;
   const cstSummary = cstSummaryQuery.data ?? null;
   const cstBatches = cstBatchesQuery.data ?? [];
@@ -908,6 +933,13 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
       return;
     }
     setCstConfigForm({
+      enabled: cstConfig.enabled,
+      auto_execute: cstConfig.auto_execute,
+      scheduled_sync_enabled: cstConfig.scheduled_sync_enabled,
+      send_enabled: cstConfig.send_enabled,
+      update_enabled: cstConfig.update_enabled,
+      delete_enabled: cstConfig.delete_enabled,
+      get_enabled: cstConfig.get_enabled,
       integration_mode: cstConfig.integration_mode,
       host: cstConfig.host,
       port: cstConfig.port,
@@ -925,7 +957,9 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
       verify_ssl: false,
       connection_timeout: cstConfig.connection_timeout,
       read_timeout: cstConfig.read_timeout,
-      token_refresh_buffer_seconds: cstConfig.token_refresh_buffer_seconds
+      token_refresh_buffer_seconds: cstConfig.token_refresh_buffer_seconds,
+      batch_size_limit: cstConfig.batch_size_limit,
+      hourly_request_limit: cstConfig.hourly_request_limit
     });
   }, [cstConfig]);
 
@@ -1154,6 +1188,14 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                 onRetryCstBatch={(batch) => run(async () => {
                   const jobs = await retryFailedCstBatch(batch.id);
                   setNotice({ title: "CST Batch Retry", detail: `${jobs.length} pending/failed job(s) retried against the real CST API.` });
+                })}
+                onPushPendingCstJobs={(limit) => run(async () => {
+                  const result = await pushPendingCstJobs(limit);
+                  void cstSummaryQuery.refetch();
+                  void cstJobsQuery.refetch();
+                  void cstBatchesQuery.refetch();
+                  void cstTransactionsQuery.refetch();
+                  setNotice({ title: "CST Pending Push", detail: `${result.processed_jobs}/${result.requested_jobs} pending job(s) processed sequentially. Success: ${result.success_jobs}, failed: ${result.failed_jobs}, still pending: ${result.pending_jobs}. Batch limit: ${result.batch_size_limit}, hourly limit: ${result.hourly_request_limit}.` });
                 })}
                 onToggleCstEnabled={(enabled) => run(async () => { await updateCstConfig({ enabled }); })}
                 onToggleCstAutoExecute={(auto_execute) => run(async () => { await updateCstConfig({ auto_execute }); })}
@@ -1467,7 +1509,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                 })}
               />
             ) : null}
-            {view === "integrity" ? <IntegrityManagement conflicts={conflicts} resources={resources} onOpen={openResource} /> : null}
+            {view === "integrity" ? <IntegrityManagement conflicts={conflicts} resources={resources} onOpen={openResource} onAcceptAssignment={(assignmentId) => run(async () => { await acceptConflictAssignment(assignmentId); })} onRejectAssignment={(assignmentId) => run(async () => { await rejectConflictAssignment(assignmentId); })} /> : null}
             {view === "bulk" ? (
               <BulkOperations
                 poolCsv={bulkPoolCsv}
@@ -1549,6 +1591,8 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                 ripeConfigForm={ripeConfigForm}
                 siebelConfig={siebelConfig}
                 siebelConfigForm={siebelConfigForm}
+                databaseConnectionStatus={databaseConnectionStatus}
+                databaseConnectionForm={databaseConnectionForm}
                 cstConfig={cstConfig}
                 cstConfigForm={cstConfigForm}
                 ripePoolCsv={ripePoolCsv}
@@ -1557,6 +1601,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                 onPasswordReset={setPasswordReset}
                 onRipeConfigForm={setRipeConfigForm}
                 onSiebelConfigForm={setSiebelConfigForm}
+                onDatabaseConnectionForm={setDatabaseConnectionForm}
                 onCstConfigForm={setCstConfigForm}
                 onRipePoolCsv={setRipePoolCsv}
                 onAddUser={() => run(async () => { await api.post("/users", newUser); setNewUser({ username: "", password: "", role: "operator" }); })}
@@ -1564,6 +1609,11 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                 onToggleUser={(user) => run(async () => { await api.patch(`/users/${user.id}/status`, { status: user.status === "Active" ? "Disabled" : "Active" }); })}
                 onSaveRipeConfig={() => run(async () => { await api.put("/ripe/config", ripeConfigForm); })}
                 onSaveSiebelConfig={() => run(async () => { await api.put("/siebel/config", siebelConfigForm); void siebelConfigQuery.refetch(); })}
+                onTestDatabaseConnection={() => run(async () => {
+                  const result = await testDatabaseConnection(databaseConnectionForm);
+                  void databaseStatusQuery.refetch();
+                  setNotice({ title: "PostgreSQL Test Succeeded", detail: `${result.message}\nDatabase: ${result.database}\nUser: ${result.username}\nTested: ${result.tested_at.slice(0, 19)}` });
+                })}
                 onTestSiebelConnection={() => run(async () => {
                   await api.put("/siebel/config", siebelConfigForm);
                   const result = await testSiebelConnection();
@@ -1691,6 +1741,7 @@ function ExecutiveDashboard({
     { title: "Reporting", detail: "Run RIPE Assignment, CST/LIR registry, utilization, and subnet summary exports.", status: "CSV and XLSX exports", accent: "cyan", icon: <FileDown className="h-5 w-5" />, view: "reports" },
     { title: "CST Sync Monitor", detail: "Monitor transaction jobs, daily schedule, retries, batches, and ledger status.", status: `${cstPending} pending jobs`, accent: cstPending ? "violet" : "green", icon: <Network className="h-5 w-5" />, view: "registry", registryPanel: "cst-sync-monitor" },
     { title: "Integrity & Conflicts", detail: "Investigate overlaps, orphan resources, duplicates, and registry consistency issues.", status: `${criticalConflicts} issues`, accent: criticalConflicts ? "red" : "green", icon: <AlertTriangle className="h-5 w-5" />, view: "integrity" },
+    { title: "Bulk Operations", detail: "Import assignment migration CSVs, review CST readiness, and export row-level error or warning reports.", status: "Admin import tools", accent: "blue", icon: <Upload className="h-5 w-5" />, view: "bulk", adminOnly: true },
     { title: "Administration", detail: "Manage users, RIPE settings, CST controls, policies, and integration configuration.", status: "Admin controls", accent: "slate", icon: <Shield className="h-5 w-5" />, view: "administration", adminOnly: true }
   ];
   const workflowTiles = workflowTileDefinitions.filter((tile) => !tile.adminOnly || currentRole === "admin");
@@ -1789,6 +1840,7 @@ type CstMonitorProps = {
   onRunCstDayMinusOne: () => void;
   onRetryCstJob: (job: CstSyncJob) => void;
   onRetryCstBatch: (batch: CstSyncBatch) => void;
+  onPushPendingCstJobs: (limit: number) => void;
   onToggleCstEnabled: (enabled: boolean) => void;
   onToggleCstAutoExecute: (autoExecute: boolean) => void;
   onToggleCstSchedule: (scheduled: boolean) => void;
@@ -2958,7 +3010,7 @@ function SubnetOperations(props: {
   );
 }
 
-function IntegrityManagement({ conflicts, resources, onOpen }: { conflicts: Conflict[]; resources: ManagedResource[]; onOpen: (resource: ManagedResource) => void }) {
+function IntegrityManagement({ conflicts, resources, onOpen, onAcceptAssignment, onRejectAssignment }: { conflicts: Conflict[]; resources: ManagedResource[]; onOpen: (resource: ManagedResource) => void; onAcceptAssignment: (assignmentId: string) => void; onRejectAssignment: (assignmentId: string) => void }) {
   const derivedIssues = detectIntegrityIssues(resources);
   const [selectedConflictKey, setSelectedConflictKey] = useState("");
   const conflictItems = conflicts.map((conflict, index) => ({ conflict, key: conflictKey(conflict, index), sides: conflictSides(conflict, resources) }));
@@ -3005,14 +3057,14 @@ function IntegrityManagement({ conflicts, resources, onOpen }: { conflicts: Conf
             ))}
             {!conflicts.length && !derivedIssues.length ? <p className="text-sm text-muted-foreground">No integrity issues detected.</p> : null}
           </div>
-          <ConflictReviewPanel item={selectedConflict} onOpen={onOpen} />
+          <ConflictReviewPanel item={selectedConflict} onOpen={onOpen} onAcceptAssignment={onAcceptAssignment} onRejectAssignment={onRejectAssignment} />
         </CardContent>
       </Card>
     </div>
   );
 }
 
-function ConflictReviewPanel({ item, onOpen }: { item: { conflict: Conflict; key: string; sides: ReturnType<typeof conflictSides> } | null; onOpen: (resource: ManagedResource) => void }) {
+function ConflictReviewPanel({ item, onOpen, onAcceptAssignment, onRejectAssignment }: { item: { conflict: Conflict; key: string; sides: ReturnType<typeof conflictSides> } | null; onOpen: (resource: ManagedResource) => void; onAcceptAssignment: (assignmentId: string) => void; onRejectAssignment: (assignmentId: string) => void }) {
   if (!item) {
     return (
       <div className="rounded-md border bg-muted/10 p-4">
@@ -3035,6 +3087,31 @@ function ConflictReviewPanel({ item, onOpen }: { item: { conflict: Conflict; key
         <ConflictSide label="Source Subnet" side={item.sides.left} onOpen={onOpen} />
         <ConflictSide label="Target Subnet" side={item.sides.right} onOpen={onOpen} />
       </div>
+      {item.conflict.title === "Customer assignments overlap" && item.conflict.assignment_ids?.filter(Boolean).length ? (
+        <div className="rounded-md border bg-background/40 p-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <p className="text-xs font-semibold uppercase text-muted-foreground">Migration Resolution</p>
+              <p className="mt-1 text-sm text-muted-foreground">Reject the incorrect candidate, then accept/re-check the one to keep.</p>
+            </div>
+            {item.conflict.resolution_status ? <Badge variant="warning">{item.conflict.resolution_status.replace(/_/g, " ")}</Badge> : null}
+          </div>
+          <div className="mt-3 grid gap-2">
+            {item.conflict.assignment_ids.filter(Boolean).map((assignmentId, index) => (
+              <div key={assignmentId} className="flex flex-wrap items-center justify-between gap-2 rounded-md border bg-muted/20 p-2">
+                <div className="min-w-0 text-sm">
+                  <p className="font-semibold">{item.conflict.ranges[index] ?? `Assignment ${index + 1}`}</p>
+                  <p className="break-all text-xs text-muted-foreground">Assignment ID: {assignmentId}</p>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <Button size="sm" variant="outline" type="button" onClick={() => onAcceptAssignment(assignmentId)}>Accept / Re-check</Button>
+                  <Button size="sm" variant="destructive" type="button" onClick={() => onRejectAssignment(assignmentId)}>Reject</Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
       {item.conflict.ranges.length > 2 ? (
         <div className="rounded-md border bg-background/40 p-3">
           <p className="text-xs font-semibold uppercase text-muted-foreground">Additional Ranges</p>
@@ -3173,6 +3250,27 @@ function BulkOperations(props: {
             <p className="text-sm text-muted-foreground">
               {props.assignmentCsv ? `${props.assignmentCsv.split(/\r?\n/).filter(Boolean).length - 1} data rows loaded${props.assignmentFileName ? ` from ${props.assignmentFileName}` : ""}` : "No file loaded"}
             </p>
+            <div className="rounded-md border bg-muted/20 p-3">
+              <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                <div>
+                  <p className="text-sm font-semibold">CST assignment data template</p>
+                  <p className="text-xs text-muted-foreground">Includes Business and Internal rows with CST readiness fields: customer, service, organization, address, contact, purpose, and validation report columns.</p>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <Button size="sm" variant="outline" onClick={() => { props.onAssignmentCsv(CST_BULK_ASSIGNMENT_TEMPLATE); props.onAssignmentFileName("cst-lir-assignment-template.csv"); }}>
+                    Load CST Template
+                  </Button>
+                  <Button size="sm" variant="outline" onClick={() => downloadBlob(`cst-lir-assignment-template-${today()}.csv`, "text/csv;charset=utf-8", CST_BULK_ASSIGNMENT_TEMPLATE)}>
+                    <FileDown className="h-4 w-4" />
+                    Download Template
+                  </Button>
+                </div>
+              </div>
+              <div className="mt-3 grid gap-2 text-xs text-muted-foreground md:grid-cols-2">
+                <p><span className="font-semibold text-foreground">Business mandatory:</span> assignmentType, CIDR/range, status, assignmentDate, customerId, serviceId, organization, customerTypeId, regionId, contact name, mobile, idNumber, email.</p>
+                <p><span className="font-semibold text-foreground">Internal mandatory:</span> assignmentType, CIDR/range, status, assignmentDate, serviceDescription, owner, assignmentPurpose, site/address, region/city, contact name, mobile, email.</p>
+              </div>
+            </div>
             <Button className="w-fit" onClick={props.onImportAssignments} disabled={!props.assignmentCsv.trim()}>
               <Upload className="h-4 w-4" />
               Start Assignment Batch
@@ -3407,7 +3505,12 @@ function exportBulkBatch(batch: BulkBatch) {
     "GeneratedSize",
     "Status",
     "AssignmentDate",
-    "CustomerName"
+    "CustomerName",
+    "AssignmentType",
+    "CstSyncReady",
+    "CstValidationStatus",
+    "CstValidationErrors",
+    "CstValidationWarnings"
   ];
   const csvRows = rows.map((row) => [
     batch.id,
@@ -3421,7 +3524,12 @@ function exportBulkBatch(batch: BulkBatch) {
     row.generatedSize,
     row.status,
     row.assignmentDate,
-    row.customerName
+    row.customerName,
+    row.assignmentType ?? "",
+    row.cstSyncReady ? "true" : "false",
+    row.cstValidationStatus ?? "",
+    row.cstValidationErrors ?? "",
+    row.cstValidationWarnings ?? ""
   ]);
   downloadBlob(`bulk-${batch.id}.csv`, "text/csv;charset=utf-8", buildSimpleCsv(headers, csvRows));
 }
@@ -3984,6 +4092,8 @@ type CstLirApiSettingsProps = {
 };
 
 function CstLirApiSettings(props: CstLirApiSettingsProps) {
+  const switchValue = (value: boolean | undefined) => value === false ? "Disabled" : "Enabled";
+  const setSwitch = (key: keyof CstConfigPayload, value: string) => props.onCstConfigForm({ ...props.cstConfigForm, [key]: value === "Enabled" });
   return (
     <Card>
       <CardHeader>
@@ -4003,8 +4113,63 @@ function CstLirApiSettings(props: CstLirApiSettingsProps) {
             <Badge variant={props.cstConfig?.token_cached ? "success" : "default"}>{props.cstConfig?.token_cached ? `Token cached until ${props.cstConfig.token_expires_at.slice(0, 19)}` : "No cached token"}</Badge>
           </div>
         </div>
-        <div className="grid gap-3 md:grid-cols-4">
-          <label className="grid gap-1">
+        <div className="grid gap-3 rounded-md border bg-muted/20 p-3">
+          <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+            <div>
+              <p className="font-semibold">CST LIR operation switches</p>
+              <p className="text-xs text-muted-foreground">Control whether CST jobs call the real API immediately, queue locally, or block selected operation types.</p>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <Badge variant={props.cstConfigForm.enabled === false ? "warning" : "success"}>{props.cstConfigForm.enabled === false ? "CST disabled" : "CST enabled"}</Badge>
+              <Badge variant={props.cstConfigForm.auto_execute === false ? "warning" : "success"}>{props.cstConfigForm.auto_execute === false ? "Queue only" : "Auto execute"}</Badge>
+            </div>
+          </div>
+          <div className="grid gap-3 md:grid-cols-6">
+            <label className="grid gap-1">
+              <span className="text-xs font-medium text-muted-foreground">Global CST sync</span>
+              <Select value={switchValue(props.cstConfigForm.enabled)} values={["Enabled", "Disabled"]} onChange={(value) => setSwitch("enabled", value)} />
+            </label>
+            <label className="grid gap-1">
+              <span className="text-xs font-medium text-muted-foreground">Auto execute</span>
+              <Select value={switchValue(props.cstConfigForm.auto_execute)} values={["Enabled", "Disabled"]} onChange={(value) => setSwitch("auto_execute", value)} />
+            </label>
+            <label className="grid gap-1">
+              <span className="text-xs font-medium text-muted-foreground">SendLIR</span>
+              <Select value={switchValue(props.cstConfigForm.send_enabled)} values={["Enabled", "Disabled"]} onChange={(value) => setSwitch("send_enabled", value)} />
+            </label>
+            <label className="grid gap-1">
+              <span className="text-xs font-medium text-muted-foreground">UpdateLIR</span>
+              <Select value={switchValue(props.cstConfigForm.update_enabled)} values={["Enabled", "Disabled"]} onChange={(value) => setSwitch("update_enabled", value)} />
+            </label>
+            <label className="grid gap-1">
+              <span className="text-xs font-medium text-muted-foreground">DeleteLIR</span>
+              <Select value={switchValue(props.cstConfigForm.delete_enabled)} values={["Enabled", "Disabled"]} onChange={(value) => setSwitch("delete_enabled", value)} />
+            </label>
+            <label className="grid gap-1">
+              <span className="text-xs font-medium text-muted-foreground">GetLIR</span>
+              <Select value={switchValue(props.cstConfigForm.get_enabled)} values={["Enabled", "Disabled"]} onChange={(value) => setSwitch("get_enabled", value)} />
+            </label>
+          </div>
+          <p className="text-xs text-muted-foreground">When auto execute is disabled, new CST jobs stay PENDING and do not call CST until you retry them manually from the CST Sync Monitor.</p>
+                </div>
+        <div className="grid gap-3 rounded-md border bg-muted/20 p-3">
+          <div>
+            <p className="font-semibold">CST push rate limit</p>
+            <p className="text-xs text-muted-foreground">Controls how many pending CST jobs can be submitted per run and how fast real CST API calls are paced.</p>
+          </div>
+          <div className="grid gap-3 md:grid-cols-2">
+            <label className="grid gap-1">
+              <span className="text-xs font-medium text-muted-foreground">Max jobs per push</span>
+              <Input min={1} type="number" value={String(props.cstConfigForm.batch_size_limit ?? 500)} onChange={(event) => props.onCstConfigForm({ ...props.cstConfigForm, batch_size_limit: Math.max(Number(event.target.value) || 500, 1) })} placeholder="500" />
+            </label>
+            <label className="grid gap-1">
+              <span className="text-xs font-medium text-muted-foreground">Max CST calls per hour</span>
+              <Input min={1} type="number" value={String(props.cstConfigForm.hourly_request_limit ?? 1000)} onChange={(event) => props.onCstConfigForm({ ...props.cstConfigForm, hourly_request_limit: Math.max(Number(event.target.value) || 1000, 1) })} placeholder="1000" />
+            </label>
+          </div>
+          <p className="text-xs text-muted-foreground">Example: 1000 per hour means about 3.6 seconds between real CST calls. Jobs skipped by validation or disabled CST settings are not delayed.</p>
+        </div>
+        <div className="grid gap-3 md:grid-cols-4">          <label className="grid gap-1">
             <span className="text-xs font-medium text-muted-foreground">Integration mode</span>
             <Input value="Real API" readOnly />
           </label>
@@ -4099,6 +4264,13 @@ function CstLirApiSettings(props: CstLirApiSettingsProps) {
 }
 
 function CstIntegrationMonitor(props: CstMonitorProps) {
+  const pendingCount = props.cstSummary?.pending_jobs ?? 0;
+  const configuredBatchLimit = Math.max(props.cstConfig?.batch_size_limit ?? 500, 1);
+  const [pendingPushLimit, setPendingPushLimit] = useState("");
+  const numericPendingPushLimit = Number(pendingPushLimit);
+  const pendingPushCount = Number.isFinite(numericPendingPushLimit) && numericPendingPushLimit > 0 ? Math.floor(numericPendingPushLimit) : 0;
+  const effectivePendingPushCount = pendingPushCount > 0 ? Math.min(pendingPushCount, configuredBatchLimit) : Math.min(pendingCount, configuredBatchLimit);
+  const pendingPushLabel = `Push ${effectivePendingPushCount} Pending`;
   return (
     <Card>
       <CardHeader>
@@ -4120,6 +4292,15 @@ function CstIntegrationMonitor(props: CstMonitorProps) {
               <Search className="h-4 w-4" />
               Reconcile
             </Button>
+            <label className="flex items-center gap-2 rounded-md border bg-muted/20 px-2 py-1">
+              <span className="text-xs font-medium text-muted-foreground">Submit</span>
+              <Input className="h-8 w-24" min={0} max={pendingCount || undefined} type="number" value={pendingPushLimit} onChange={(event) => setPendingPushLimit(event.target.value)} placeholder="All" />
+              <span className="text-xs text-muted-foreground">of {pendingCount}</span>
+            </label>
+            <Button variant="secondary" onClick={() => props.onPushPendingCstJobs(pendingPushCount)} disabled={pendingCount === 0}>
+              <Upload className="h-4 w-4" />
+              {pendingPushLabel}
+            </Button>
           </div>
         </div>
       </CardHeader>
@@ -4127,7 +4308,7 @@ function CstIntegrationMonitor(props: CstMonitorProps) {
         <div className="grid gap-3 md:grid-cols-4">
           <ReportMetric label="Transactions" value={String(props.cstSummary?.total_transactions ?? 0)} detail="Globally unique CST IDs" />
           <ReportMetric label="Jobs" value={String(props.cstSummary?.total_jobs ?? 0)} detail={`${props.cstSummary?.success_jobs ?? 0} success / ${props.cstSummary?.pending_jobs ?? 0} pending`} />
-          <ReportMetric label="Failed" value={String((props.cstSummary?.failed_jobs ?? 0) + (props.cstSummary?.blocked_jobs ?? 0))} detail="Failed or blocked local jobs" />
+          <ReportMetric label="Failed" value={String(props.cstSummary?.failed_jobs ?? 0)} detail="Failed local jobs" />
           <ReportMetric label="Last Batch" value={props.cstSummary?.last_batch_at ? props.cstSummary.last_batch_at.slice(0, 10) : "-"} detail="Latest CST transaction batch" />
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -4275,6 +4456,83 @@ function CstIntegrationMonitor(props: CstMonitorProps) {
 }
 
 
+function DatabaseConnectionSettings(props: {
+  status: DatabaseConnectionStatus | null;
+  form: DatabaseConnectionPayload;
+  onForm: (value: DatabaseConnectionPayload) => void;
+  onTest: () => void;
+}) {
+  const status = props.status;
+  const generatedUrl = `postgresql://${encodeURIComponent(props.form.username)}:${props.form.password ? "********" : "<password>"}@${props.form.host}:${props.form.port}/${encodeURIComponent(props.form.database)}?sslmode=${props.form.ssl_mode}`;
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Database Connection</CardTitle>
+        <CardDescription>Review the active application database and test PostgreSQL details before switching the API server.</CardDescription>
+      </CardHeader>
+      <CardContent className="grid gap-5">
+        <div className="grid gap-3 md:grid-cols-4">
+          <ReportMetric label="Current Engine" value={status?.current_engine ?? "Unknown"} detail={status?.database_url_configured ? "DATABASE_URL configured" : "DATABASE_URL not configured"} />
+          <ReportMetric label="PostgreSQL Driver" value={status?.postgres_driver_available ? "Available" : "Missing"} detail="Python psycopg package" />
+          <ReportMetric label="Runtime Switch" value={status?.postgres_runtime_supported ? "Enabled" : "Not active"} detail="Backend DATABASE_URL support" />
+          <ReportMetric label="SQLite DB" value={status?.sqlite_path ? "Configured" : "-"} detail={status?.sqlite_path ?? "No path returned"} />
+        </div>
+        <div className="rounded-md border bg-muted/20 p-3">
+          <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+            <div>
+              <p className="font-semibold">PostgreSQL readiness</p>
+              <p className="text-sm text-muted-foreground">{status?.message ?? "Database status is loading."}</p>
+              {status?.database_url_redacted ? <p className="mt-1 font-mono text-xs text-muted-foreground">{status.database_url_redacted}</p> : null}
+            </div>
+            <Badge variant={status?.postgres_runtime_supported ? "success" : "warning"}>{status?.postgres_runtime_supported ? "Switch supported" : "Restart/env required"}</Badge>
+          </div>
+        </div>
+        <div className="grid gap-3 md:grid-cols-4">
+          <label className="grid gap-1 md:col-span-2">
+            <span className="text-xs font-medium text-muted-foreground">PostgreSQL host</span>
+            <Input value={props.form.host} onChange={(event) => props.onForm({ ...props.form, host: event.target.value })} placeholder="localhost or DB server IP" />
+          </label>
+          <label className="grid gap-1">
+            <span className="text-xs font-medium text-muted-foreground">Port</span>
+            <Input value={String(props.form.port)} onChange={(event) => props.onForm({ ...props.form, port: Number(event.target.value) || 5432 })} placeholder="5432" />
+          </label>
+          <label className="grid gap-1">
+            <span className="text-xs font-medium text-muted-foreground">Database</span>
+            <Input value={props.form.database} onChange={(event) => props.onForm({ ...props.form, database: event.target.value })} placeholder="lir" />
+          </label>
+          <label className="grid gap-1 md:col-span-2">
+            <span className="text-xs font-medium text-muted-foreground">Username</span>
+            <Input value={props.form.username} onChange={(event) => props.onForm({ ...props.form, username: event.target.value })} placeholder="lir_app" />
+          </label>
+          <label className="grid gap-1 md:col-span-2">
+            <span className="text-xs font-medium text-muted-foreground">Password</span>
+            <Input name="postgres-db-password" autoComplete="new-password" type="password" value={props.form.password ?? ""} onChange={(event) => props.onForm({ ...props.form, password: event.target.value })} placeholder="PostgreSQL password" />
+          </label>
+          <label className="grid gap-1">
+            <span className="text-xs font-medium text-muted-foreground">SSL mode</span>
+            <Select value={props.form.ssl_mode} values={["prefer", "disable", "require", "verify-ca", "verify-full"]} onChange={(ssl_mode) => props.onForm({ ...props.form, ssl_mode })} />
+          </label>
+          <label className="grid gap-1">
+            <span className="text-xs font-medium text-muted-foreground">Timeout</span>
+            <Input value={String(props.form.connect_timeout)} onChange={(event) => props.onForm({ ...props.form, connect_timeout: Number(event.target.value) || 10 })} placeholder="Seconds" />
+          </label>
+          <label className="grid gap-1 md:col-span-2">
+            <span className="text-xs font-medium text-muted-foreground">DATABASE_URL preview</span>
+            <Input readOnly value={generatedUrl} />
+          </label>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button variant="secondary" onClick={props.onTest}>
+            <CheckCircle2 className="h-4 w-4" />
+            Test PostgreSQL connection
+          </Button>
+          <span className="text-xs text-muted-foreground">This test does not save the password. To switch the app, set DATABASE_URL on the API service and restart after PostgreSQL runtime support is active.</span>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
 function Administration(props: {
   stats: RegistryStats;
   users: User[];
@@ -4286,6 +4544,8 @@ function Administration(props: {
   ripeConfigForm: RipeConfigPayload;
   siebelConfig: SiebelConfig | null;
   siebelConfigForm: SiebelConfigPayload;
+  databaseConnectionStatus: DatabaseConnectionStatus | null;
+  databaseConnectionForm: DatabaseConnectionPayload;
   cstConfig: CstConfig | null;
   cstConfigForm: CstConfigPayload;
   ripePoolCsv: string;
@@ -4294,6 +4554,7 @@ function Administration(props: {
   onPasswordReset: (value: { userId: string; password: string }) => void;
   onRipeConfigForm: (value: RipeConfigPayload) => void;
   onSiebelConfigForm: (value: SiebelConfigPayload) => void;
+  onDatabaseConnectionForm: (value: DatabaseConnectionPayload) => void;
   onCstConfigForm: (value: CstConfigPayload) => void;
   onRipePoolCsv: (value: string) => void;
   onAddUser: () => void;
@@ -4302,6 +4563,7 @@ function Administration(props: {
   onSaveRipeConfig: () => void;
   onSaveSiebelConfig: () => void;
   onTestSiebelConnection: () => void;
+  onTestDatabaseConnection: () => void;
   onSaveCstConfig: () => void;
   onTestCstConnection: () => void;
   onRunSiebelDeltaSync: () => void;
@@ -4383,6 +4645,12 @@ function Administration(props: {
           </div>
         </CardContent>
       </Card> : null}
+      <DatabaseConnectionSettings
+        status={props.databaseConnectionStatus}
+        form={props.databaseConnectionForm}
+        onForm={props.onDatabaseConnectionForm}
+        onTest={props.onTestDatabaseConnection}
+      />
       <Card>
         <CardHeader>
           <CardTitle>RIPE Integration</CardTitle>
@@ -5726,8 +5994,16 @@ function normalizeAssignmentImportCsv(csvText: string) {
   const hasCidr = "cidr" in firstRow;
   const hasRange = "startip" in firstRow || "start_ip" in firstRow || "start" in firstRow || "endip" in firstRow || "end_ip" in firstRow || "end" in firstRow;
   if (!hasCidr && !hasRange) {
-    throw new Error("Assignment import requires either cidr,size,status,assignmentDate,customerName or startIp,endIp,size,status,assignmentDate,customerName headers.");
+    throw new Error("Assignment import requires either cidr or startIp/endIp/size headers plus CST assignment fields.");
   }
+  const valueOf = (row: Record<string, string>, ...keys: string[]) => keys.map((key) => row[key.toLowerCase()]).find((value) => value && value.trim())?.trim() ?? "";
+  const requireFields = (row: Record<string, string>, rowNumber: number, fields: Array<[string, string[]]>) => {
+    fields.forEach(([label, aliases]) => {
+      if (!valueOf(row, ...aliases)) {
+        throw new Error(`row ${rowNumber}: ${label} is required.`);
+      }
+    });
+  };
 
   rows.forEach((row, index) => {
     const normalized = normalizeCsvRecord(row);
@@ -5738,22 +6014,43 @@ function normalizeAssignmentImportCsv(csvText: string) {
     const sizeText = normalized.size || normalized.total;
     const status = normalized.status;
     const assignmentDate = normalized.assignmentdate || normalized.assignment_date;
-    const customerName = normalized.customername || normalized.customer_name;
+    const assignmentType = (normalized.assignmenttype || normalized.assignment_type || (status === "2" ? "INTERNAL" : "BUSINESS")).toUpperCase();
 
     if (!assignmentDate) {
       throw new Error(`row ${rowNumber}: assignmentDate is required.`);
     }
-    if (!status) {
-      throw new Error(`row ${rowNumber}: status is required. Use 1 Unassigned, 2 Internal, 3 Business, or 4 Individual.`);
+    if (!["BUSINESS", "INTERNAL"].includes(assignmentType)) {
+      throw new Error(`row ${rowNumber}: assignmentType must be BUSINESS or INTERNAL.`);
     }
-    if (!["1", "2", "3", "4"].includes(status)) {
-      throw new Error(`row ${rowNumber}: status must be 1 (Unassigned), 2 (Internal), 3 (Business), or 4 (Individual).`);
+    if (status && !["2", "3"].includes(status)) {
+      throw new Error(`row ${rowNumber}: status must be 2 (Internal) or 3 (Business) for CST migration import.`);
     }
-    if (status === "3" && !(normalized.serviceid || normalized.service_id)) {
-      throw new Error(`row ${rowNumber}: serviceId is required for Business rows.`);
+    if (assignmentType === "BUSINESS") {
+      requireFields(normalized, rowNumber, [
+        ["serviceId", ["serviceid", "service_id"]],
+        ["customerId", ["customerid", "customer_id", "bsscustomerid", "bss_customer_id"]],
+        ["organizationName", ["organizationname", "organization_name", "customername", "customer_name"]],
+        ["organizationId/commercialRegId/unifiedNumber", ["organizationid", "organization_id", "commercialregid", "commercial_reg_id", "unifiednumber", "unified_number"]],
+        ["customerTypeId", ["customertypeid", "customer_type_id"]],
+        ["regionId", ["regionid", "region_id"]],
+        ["fullName/contactName", ["fullname", "full_name", "contactname", "contact_name"]],
+        ["mobileNumber/contactNumber", ["mobilenumber", "mobile_number", "contactnumber", "contact_number"]],
+        ["idNumber", ["idnumber", "id_number", "customeridentity", "customer_identity"]],
+        ["email/contactEmail", ["email", "contactemail", "contact_email"]]
+      ]);
     }
-    if (status === "2" && !(normalized.servicedescription || normalized.service_description || normalized.service)) {
-      throw new Error(`row ${rowNumber}: serviceDescription is required for Internal rows.`);
+    if (assignmentType === "INTERNAL") {
+      requireFields(normalized, rowNumber, [
+        ["serviceDescription", ["servicedescription", "service_description", "service"]],
+        ["owner", ["owner"]],
+        ["assignmentPurpose", ["assignmentpurpose", "assignment_purpose", "purpose"]],
+        ["site/locationName", ["site", "locationname", "location_name"]],
+        ["regionId/region", ["regionid", "region_id", "region"]],
+        ["cityId/city", ["cityid", "city_id", "city"]],
+        ["fullName/contactName", ["fullname", "full_name", "contactname", "contact_name"]],
+        ["mobileNumber/contactNumber", ["mobilenumber", "mobile_number", "contactnumber", "contact_number"]],
+        ["email/contactEmail", ["email", "contactemail", "contact_email"]]
+      ]);
     }
     if (cidr) {
       const range = parseCidr(cidr);
