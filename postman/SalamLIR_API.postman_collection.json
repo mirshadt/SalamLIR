@@ -1,0 +1,1820 @@
+{
+  "info": {
+    "name": "Salam LIR API",
+    "description": "Generated from SalamLIR FastAPI OpenAPI schema. Set the baseUrl collection variable for local, staging, or server API.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Assignments",
+      "item": [
+        {
+          "name": "List Assignments",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/assignments",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "assignments"
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "Add Assignment",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/assignments",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "assignments"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"cidr\": \"string\",\n  \"assignment_status_id\": 3,\n  \"service_provider_id\": \"5\",\n  \"service_provider_name\": \"Salam\",\n  \"action_flag\": \"N\",\n  \"cst_sync_status\": \"PENDING\",\n  \"cst_sync_ready\": false,\n  \"cst_validation_status\": \"NOT_EVALUATED\",\n  \"cst_validation_errors\": \"\",\n  \"cst_validation_warnings\": \"\",\n  \"migration_conflict_status\": \"\",\n  \"migration_conflict_reason\": \"\",\n  \"migration_conflict_group\": \"\",\n  \"ripe_sync_status\": \"PENDING\",\n  \"assignment_target_type\": \"business_customer\",\n  \"assignment_name\": \"\",\n  \"assignment_description\": \"\",\n  \"resource_relationship_type\": \"ResourceAssignment\",\n  \"logical_resource_id\": \"\",\n  \"resource_specification_id\": \"RS-IP-SUBNET\",\n  \"resource_specification_name\": \"IPv4 Subnet Logical Resource\",\n  \"resource_type\": \"LogicalResource.IPSubnet\",\n  \"resource_category\": \"IP Subnet\",\n  \"resource_role\": \"AssignedSubnet\",\n  \"resource_lifecycle_state\": \"Active\",\n  \"resource_usage_state\": \"Allocated\",\n  \"resource_operational_state\": \"Enabled\",\n  \"resource_administrative_state\": \"Unlocked\",\n  \"service_specification_id\": \"\",\n  \"service_specification_name\": \"L3 Connectivity Service\",\n  \"service_specification_type\": \"CustomerFacingServiceSpecification\",\n  \"service_instance_id\": \"\",\n  \"service_id\": \"\",\n  \"service_instance_name\": \"\",\n  \"service_type\": \"CustomerFacingService\",\n  \"service_category\": \"L3 Service\",\n  \"service_order_id\": \"\",\n  \"siebel_order_number\": \"\",\n  \"bss_customer_id\": \"\",\n  \"siebel_last_sync_at\": \"\",\n  \"siebel_last_checked_at\": \"\",\n  \"siebel_payload_hash\": \"\",\n  \"siebel_payload_json\": \"\",\n  \"service_characteristics\": \"\",\n  \"product_specification_id\": \"\",\n  \"product_specification_name\": \"\",\n  \"product_offering_id\": \"\",\n  \"product_offering_name\": \"\",\n  \"product_instance_id\": \"\",\n  \"customer_id\": \"\",\n  \"customer_name\": \"string\",\n  \"customer_type\": \"Enterprise\",\n  \"organization_name\": \"\",\n  \"organization_id\": \"\",\n  \"customer_type_id\": \"\",\n  \"region_id\": \"\",\n  \"city_id\": \"\",\n  \"full_name\": \"\",\n  \"mobile_number\": \"\",\n  \"id_number\": \"\",\n  \"email\": \"\",\n  \"customer_account_id\": \"\",\n  \"customer_segment\": \"Enterprise\",\n  \"commercial_reg_id\": \"string\",\n  \"unified_number\": \"string\",\n  \"contact_number\": \"string\",\n  \"contact_email\": \"\",\n  \"city\": \"string\",\n  \"region\": \"string\",\n  \"contact_name\": \"string\",\n  \"internal_consumer_type\": \"\",\n  \"internal_business_unit\": \"\",\n  \"internal_application_id\": \"\",\n  \"internal_application_name\": \"\",\n  \"internal_environment\": \"\",\n  \"internal_owner_team\": \"\",\n  \"internal_cost_center\": \"\",\n  \"internal_project_code\": \"\",\n  \"internal_change_request_id\": \"\",\n  \"internal_justification\": \"\",\n  \"l3_service\": \"MPLS L3VPN\",\n  \"service\": \"L3 service allocation\",\n  \"owner\": \"Network service desk\",\n  \"site\": \"Unassigned site\",\n  \"site_id\": \"\",\n  \"location_name\": \"\",\n  \"latitude\": \"\",\n  \"longitude\": \"\",\n  \"vrf_name\": \"\",\n  \"vlan_id\": \"\",\n  \"asn\": \"\",\n  \"routing_domain\": \"\",\n  \"route_distinguisher\": \"\",\n  \"route_target\": \"\",\n  \"network_slice\": \"\",\n  \"security_zone\": \"\",\n  \"gateway_ip\": \"\",\n  \"dns_profile\": \"\",\n  \"dhcp_scope\": \"\",\n  \"nat_policy\": \"\",\n  \"qos_profile\": \"\",\n  \"access_technology_id\": \"\",\n  \"access_technology\": \"\",\n  \"service_description\": \"\",\n  \"requested_by\": \"\",\n  \"approved_by\": \"\",\n  \"approval_reference\": \"\",\n  \"reserved_until\": \"\",\n  \"assignment_purpose\": \"\",\n  \"environment\": \"Production\",\n  \"status\": \"Planned\",\n  \"assignment_date\": \"string\",\n  \"notes\": \"\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Bulk Add Assignments",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/assignments/bulk",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "assignments",
+                "bulk"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"csv_text\": \"string\",\n  \"file_name\": \"\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Retry Partial Reassignment",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/assignments/partial-reassign/:operation_id/retry",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "assignments",
+                "partial-reassign",
+                ":operation_id",
+                "retry"
+              ],
+              "variable": [
+                {
+                  "key": "operation_id",
+                  "value": "<operation_id>"
+                }
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "Unassign",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/assignments/:assignment_id",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "assignments",
+                ":assignment_id"
+              ],
+              "variable": [
+                {
+                  "key": "assignment_id",
+                  "value": "<assignment_id>"
+                }
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "Partial Reassign Assignment",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/assignments/:assignment_id/partial-reassign",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "assignments",
+                ":assignment_id",
+                "partial-reassign"
+              ],
+              "variable": [
+                {
+                  "key": "assignment_id",
+                  "value": "<assignment_id>"
+                }
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"cidr\": \"string\",\n  \"assignment_status_id\": 3,\n  \"service_provider_id\": \"5\",\n  \"service_provider_name\": \"Salam\",\n  \"action_flag\": \"N\",\n  \"cst_sync_status\": \"PENDING\",\n  \"cst_sync_ready\": false,\n  \"cst_validation_status\": \"NOT_EVALUATED\",\n  \"cst_validation_errors\": \"\",\n  \"cst_validation_warnings\": \"\",\n  \"migration_conflict_status\": \"\",\n  \"migration_conflict_reason\": \"\",\n  \"migration_conflict_group\": \"\",\n  \"ripe_sync_status\": \"PENDING\",\n  \"assignment_target_type\": \"business_customer\",\n  \"assignment_name\": \"\",\n  \"assignment_description\": \"\",\n  \"resource_relationship_type\": \"ResourceAssignment\",\n  \"logical_resource_id\": \"\",\n  \"resource_specification_id\": \"RS-IP-SUBNET\",\n  \"resource_specification_name\": \"IPv4 Subnet Logical Resource\",\n  \"resource_type\": \"LogicalResource.IPSubnet\",\n  \"resource_category\": \"IP Subnet\",\n  \"resource_role\": \"AssignedSubnet\",\n  \"resource_lifecycle_state\": \"Active\",\n  \"resource_usage_state\": \"Allocated\",\n  \"resource_operational_state\": \"Enabled\",\n  \"resource_administrative_state\": \"Unlocked\",\n  \"service_specification_id\": \"\",\n  \"service_specification_name\": \"L3 Connectivity Service\",\n  \"service_specification_type\": \"CustomerFacingServiceSpecification\",\n  \"service_instance_id\": \"\",\n  \"service_id\": \"\",\n  \"service_instance_name\": \"\",\n  \"service_type\": \"CustomerFacingService\",\n  \"service_category\": \"L3 Service\",\n  \"service_order_id\": \"\",\n  \"siebel_order_number\": \"\",\n  \"bss_customer_id\": \"\",\n  \"siebel_last_sync_at\": \"\",\n  \"siebel_last_checked_at\": \"\",\n  \"siebel_payload_hash\": \"\",\n  \"siebel_payload_json\": \"\",\n  \"service_characteristics\": \"\",\n  \"product_specification_id\": \"\",\n  \"product_specification_name\": \"\",\n  \"product_offering_id\": \"\",\n  \"product_offering_name\": \"\",\n  \"product_instance_id\": \"\",\n  \"customer_id\": \"\",\n  \"customer_name\": \"string\",\n  \"customer_type\": \"Enterprise\",\n  \"organization_name\": \"\",\n  \"organization_id\": \"\",\n  \"customer_type_id\": \"\",\n  \"region_id\": \"\",\n  \"city_id\": \"\",\n  \"full_name\": \"\",\n  \"mobile_number\": \"\",\n  \"id_number\": \"\",\n  \"email\": \"\",\n  \"customer_account_id\": \"\",\n  \"customer_segment\": \"Enterprise\",\n  \"commercial_reg_id\": \"string\",\n  \"unified_number\": \"string\",\n  \"contact_number\": \"string\",\n  \"contact_email\": \"\",\n  \"city\": \"string\",\n  \"region\": \"string\",\n  \"contact_name\": \"string\",\n  \"internal_consumer_type\": \"\",\n  \"internal_business_unit\": \"\",\n  \"internal_application_id\": \"\",\n  \"internal_application_name\": \"\",\n  \"internal_environment\": \"\",\n  \"internal_owner_team\": \"\",\n  \"internal_cost_center\": \"\",\n  \"internal_project_code\": \"\",\n  \"internal_change_request_id\": \"\",\n  \"internal_justification\": \"\",\n  \"l3_service\": \"MPLS L3VPN\",\n  \"service\": \"L3 service allocation\",\n  \"owner\": \"Network service desk\",\n  \"site\": \"Unassigned site\",\n  \"site_id\": \"\",\n  \"location_name\": \"\",\n  \"latitude\": \"\",\n  \"longitude\": \"\",\n  \"vrf_name\": \"\",\n  \"vlan_id\": \"\",\n  \"asn\": \"\",\n  \"routing_domain\": \"\",\n  \"route_distinguisher\": \"\",\n  \"route_target\": \"\",\n  \"network_slice\": \"\",\n  \"security_zone\": \"\",\n  \"gateway_ip\": \"\",\n  \"dns_profile\": \"\",\n  \"dhcp_scope\": \"\",\n  \"nat_policy\": \"\",\n  \"qos_profile\": \"\",\n  \"access_technology_id\": \"\",\n  \"access_technology\": \"\",\n  \"service_description\": \"\",\n  \"requested_by\": \"\",\n  \"approved_by\": \"\",\n  \"approval_reference\": \"\",\n  \"reserved_until\": \"\",\n  \"assignment_purpose\": \"\",\n  \"environment\": \"Production\",\n  \"status\": \"Planned\",\n  \"assignment_date\": \"string\",\n  \"notes\": \"\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Refresh Assignment From Siebel",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/assignments/:assignment_id/siebel-refresh",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "assignments",
+                ":assignment_id",
+                "siebel-refresh"
+              ],
+              "variable": [
+                {
+                  "key": "assignment_id",
+                  "value": "<assignment_id>"
+                }
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "Update Assignment Status",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/assignments/:assignment_id/status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "assignments",
+                ":assignment_id",
+                "status"
+              ],
+              "variable": [
+                {
+                  "key": "assignment_id",
+                  "value": "<assignment_id>"
+                }
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"status\": \"string\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Audit",
+      "item": [
+        {
+          "name": "List Audit Events",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/audit",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "audit"
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Authentication",
+      "item": [
+        {
+          "name": "Login",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/auth/login",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "auth",
+                "login"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"string\",\n  \"password\": \"string\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Bulk Operations",
+      "item": [
+        {
+          "name": "List Bulk Batches",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/bulk/batches",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "bulk",
+                "batches"
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "Get Bulk Batch",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/bulk/batches/:batch_id",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "bulk",
+                "batches",
+                ":batch_id"
+              ],
+              "variable": [
+                {
+                  "key": "batch_id",
+                  "value": "<batch_id>"
+                }
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "CST",
+      "item": [
+        {
+          "name": "List Cst Batches",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/cst/batches",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "cst",
+                "batches"
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "Retry Failed Cst Batch",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/cst/batches/:batch_id/retry-failed",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "cst",
+                "batches",
+                ":batch_id",
+                "retry-failed"
+              ],
+              "variable": [
+                {
+                  "key": "batch_id",
+                  "value": "<batch_id>"
+                }
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "Bootstrap Current Cst Resources",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/cst/bootstrap-current",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "cst",
+                "bootstrap-current"
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "Get Cst Config",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/cst/config",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "cst",
+                "config"
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "Update Cst Config",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/cst/config",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "cst",
+                "config"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"enabled\": false,\n  \"service_provider_id\": \"string\",\n  \"auto_execute\": false,\n  \"scheduled_sync_enabled\": false,\n  \"send_enabled\": false,\n  \"update_enabled\": false,\n  \"delete_enabled\": false,\n  \"get_enabled\": false,\n  \"integration_mode\": \"string\",\n  \"host\": \"string\",\n  \"port\": 0,\n  \"base_url\": \"string\",\n  \"token_path\": \"string\",\n  \"send_path\": \"string\",\n  \"update_path\": \"string\",\n  \"delete_path\": \"string\",\n  \"get_path\": \"string\",\n  \"auth_username\": \"string\",\n  \"auth_password\": \"string\",\n  \"api_access_key\": \"string\",\n  \"user_key\": \"string\",\n  \"accept_language\": \"string\",\n  \"verify_ssl\": false,\n  \"connection_timeout\": 0,\n  \"read_timeout\": 0,\n  \"token_refresh_buffer_seconds\": 0,\n  \"schedule_time\": \"string\",\n  \"schedule_timezone\": \"string\",\n  \"batch_size_limit\": 0,\n  \"hourly_request_limit\": 0\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Test Cst Token Connection",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/cst/config/test-token",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "cst",
+                "config",
+                "test-token"
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "List Cst Jobs",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/cst/jobs",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "cst",
+                "jobs"
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "Push Pending Cst Jobs",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/cst/jobs/push-pending",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "cst",
+                "jobs",
+                "push-pending"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "0",
+                  "description": "",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "Force Push Pending Cst Jobs",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/cst/jobs/push-pending/force",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "cst",
+                "jobs",
+                "push-pending",
+                "force"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "0",
+                  "description": "",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "Retry Cst Job",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/cst/jobs/:job_id/retry",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "cst",
+                "jobs",
+                ":job_id",
+                "retry"
+              ],
+              "variable": [
+                {
+                  "key": "job_id",
+                  "value": "<job_id>"
+                }
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "Create Manual Cst Migration Job",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/cst/migration-jobs/manual",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "cst",
+                "migration-jobs",
+                "manual"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"limit\": 0,\n  \"execute_immediately\": false,\n  \"force_api_override\": false,\n  \"include_existing_transactions\": false,\n  \"only_cst_ready\": true\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "List Cst Migration Job Stats",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/cst/migration-jobs/stats",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "cst",
+                "migration-jobs",
+                "stats"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "50",
+                  "description": "",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "Get Cst Migration Job Stats",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/cst/migration-jobs/:batch_id/stats",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "cst",
+                "migration-jobs",
+                ":batch_id",
+                "stats"
+              ],
+              "variable": [
+                {
+                  "key": "batch_id",
+                  "value": "<batch_id>"
+                }
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "Reconcile Cst Resources",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/cst/reconcile",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "cst",
+                "reconcile"
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "Run Cst Day Minus One Now",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/cst/schedule/run-day-minus-one",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "cst",
+                "schedule",
+                "run-day-minus-one"
+              ],
+              "query": [
+                {
+                  "key": "target_date",
+                  "value": "",
+                  "description": "",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "List Cst Scheduler Runs",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/cst/scheduler-runs",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "cst",
+                "scheduler-runs"
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "Get Cst Summary",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/cst/summary",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "cst",
+                "summary"
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "List Cst Transactions",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/cst/transactions",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "cst",
+                "transactions"
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Database",
+      "item": [
+        {
+          "name": "Database Connection Status",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/database/status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "database",
+                "status"
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "Test Postgres Connection",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/database/test-postgres",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "database",
+                "test-postgres"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"host\": \"localhost\",\n  \"port\": 5432,\n  \"database\": \"lir\",\n  \"username\": \"lir_app\",\n  \"password\": \"\",\n  \"ssl_mode\": \"prefer\",\n  \"connect_timeout\": 10\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "Health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/health",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "health"
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Integrity & Conflicts",
+      "item": [
+        {
+          "name": "List Conflicts",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/conflicts",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "conflicts"
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "Accept Conflicting Assignment",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/conflicts/assignments/:assignment_id/accept",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "conflicts",
+                "assignments",
+                ":assignment_id",
+                "accept"
+              ],
+              "variable": [
+                {
+                  "key": "assignment_id",
+                  "value": "<assignment_id>"
+                }
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "Reject Conflicting Assignment",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/conflicts/assignments/:assignment_id/reject",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "conflicts",
+                "assignments",
+                ":assignment_id",
+                "reject"
+              ],
+              "variable": [
+                {
+                  "key": "assignment_id",
+                  "value": "<assignment_id>"
+                }
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Pools",
+      "item": [
+        {
+          "name": "List Pools",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/pools",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "pools"
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "Add Pool",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/pools",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "pools"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"cidr\": \"string\",\n  \"name\": \"Imported allocation\",\n  \"region\": \"Unassigned region\",\n  \"description\": \"\",\n  \"category\": \"IP Subnet\",\n  \"lifecycle_state\": \"Active\",\n  \"resource_status\": \"Available\",\n  \"operational_state\": \"Enabled\",\n  \"administrative_state\": \"Unlocked\",\n  \"usage_state\": \"Idle\",\n  \"resource_specification_id\": \"RS-IP-SUBNET\",\n  \"resource_specification_name\": \"IPv4 Subnet Logical Resource\",\n  \"resource_type\": \"LogicalResource.IPSubnet\",\n  \"resource_role\": \"ParentPool\",\n  \"address_family\": \"IPv4\",\n  \"ip_version\": \"4\",\n  \"parent_resource_id\": \"\",\n  \"parent_cidr\": \"\",\n  \"allocation_policy\": \"Boundary partitioning\",\n  \"reservation_policy\": \"Manual approval\",\n  \"vrf_name\": \"\",\n  \"route_distinguisher\": \"\",\n  \"route_target\": \"\",\n  \"vlan_id\": \"\",\n  \"asn\": \"\",\n  \"site_id\": \"\",\n  \"site_name\": \"\",\n  \"location_name\": \"\",\n  \"owner\": \"IPAM\",\n  \"cost_center\": \"\",\n  \"security_zone\": \"\",\n  \"provider\": \"\",\n  \"source_system\": \"NetAtlas IPAM\",\n  \"external_id\": \"\",\n  \"href\": \"\",\n  \"version\": \"1.0\",\n  \"start_date\": \"\",\n  \"end_date\": \"\",\n  \"last_audit_at\": \"\",\n  \"tags\": \"\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Bulk Add Pools",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/pools/bulk",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "pools",
+                "bulk"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"csv_text\": \"string\",\n  \"file_name\": \"\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Join Pools",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/pools/join",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "pools",
+                "join"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"left_pool_id\": \"string\",\n  \"right_pool_id\": \"string\",\n  \"left_cidr\": \"string\",\n  \"right_cidr\": \"string\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Partition Pool",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/pools/partition",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "pools",
+                "partition"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"pool_id\": \"string\",\n  \"cidr\": \"string\",\n  \"target_prefix\": 0,\n  \"direction\": \"start\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Delete Pool",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/pools/:pool_id",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "pools",
+                ":pool_id"
+              ],
+              "variable": [
+                {
+                  "key": "pool_id",
+                  "value": "<pool_id>"
+                }
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "Update Pool",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/pools/:pool_id",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "pools",
+                ":pool_id"
+              ],
+              "variable": [
+                {
+                  "key": "pool_id",
+                  "value": "<pool_id>"
+                }
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"string\",\n  \"description\": \"string\",\n  \"status\": \"string\",\n  \"region\": \"string\",\n  \"lifecycle_state\": \"string\",\n  \"resource_status\": \"string\",\n  \"owner\": \"string\",\n  \"cost_center\": \"string\",\n  \"security_zone\": \"string\",\n  \"tags\": \"string\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "List Pool Ranges",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/pools/:pool_id/ranges",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "pools",
+                ":pool_id",
+                "ranges"
+              ],
+              "variable": [
+                {
+                  "key": "pool_id",
+                  "value": "<pool_id>"
+                }
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "RIPE",
+      "item": [
+        {
+          "name": "List Ripe Allocated Pools",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/ripe/allocated-pools",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "ripe",
+                "allocated-pools"
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "Create Ripe Allocated Pool",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/ripe/allocated-pools",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "ripe",
+                "allocated-pools"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"pool_name\": \"string\",\n  \"cidr\": \"string\",\n  \"start_ip\": \"\",\n  \"end_ip\": \"\",\n  \"allocation_type\": \"RIPE Allocated Pool\",\n  \"source\": \"RIPE Database\",\n  \"created_date\": \"\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Bulk Import Ripe Allocated Pools",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/ripe/allocated-pools/bulk",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "ripe",
+                "allocated-pools",
+                "bulk"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"csv_text\": \"string\",\n  \"file_name\": \"\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Push Assignment To Ripe",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/ripe/assignments/:assignment_id/push",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "ripe",
+                "assignments",
+                ":assignment_id",
+                "push"
+              ],
+              "variable": [
+                {
+                  "key": "assignment_id",
+                  "value": "<assignment_id>"
+                }
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "Get Ripe Config",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/ripe/config",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "ripe",
+                "config"
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "Update Ripe Config",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/ripe/config",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "ripe",
+                "config"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"base_url\": \"https://rest.db.ripe.net\",\n  \"auth_type\": \"Basic Authentication\",\n  \"username\": \"\",\n  \"password\": \"\",\n  \"connection_timeout\": 10,\n  \"read_timeout\": 30,\n  \"default_maintainer\": \"ITC-NOC-MNT\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Discover Ripe Root Pools",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/ripe/discovery/root-pools",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "ripe",
+                "discovery",
+                "root-pools"
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "Sync Ripe Root Pool To Cst",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/ripe/discovery/root-pools/cst-sync",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "ripe",
+                "discovery",
+                "root-pools",
+                "cst-sync"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"pool_name\": \"string\",\n  \"allocation_range\": \"\",\n  \"cidr\": \"string\",\n  \"start_ip\": \"string\",\n  \"end_ip\": \"string\",\n  \"ripe_maintainer\": \"string\",\n  \"ripe_status\": \"\",\n  \"object_href\": \"\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Sync Ripe Root Pool",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/ripe/discovery/root-pools/sync",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "ripe",
+                "discovery",
+                "root-pools",
+                "sync"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"pool_name\": \"string\",\n  \"allocation_range\": \"\",\n  \"cidr\": \"string\",\n  \"start_ip\": \"string\",\n  \"end_ip\": \"string\",\n  \"ripe_maintainer\": \"string\",\n  \"ripe_status\": \"\",\n  \"object_href\": \"\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Query Ripe Report",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/ripe/reports/query",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "ripe",
+                "reports",
+                "query"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"date_from\": \"\",\n  \"date_to\": \"\",\n  \"report_type\": \"RIPE Assignment Report\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Resources",
+      "item": [
+        {
+          "name": "List Resources",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/resources",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "resources"
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Siebel",
+      "item": [
+        {
+          "name": "Lookup Siebel Business Customer",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/siebel/business-customer",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "siebel",
+                "business-customer"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"service_id\": \"\",\n  \"order_number\": \"\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Get Siebel Config",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/siebel/config",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "siebel",
+                "config"
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "Update Siebel Config",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/siebel/config",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "siebel",
+                "config"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"LIR_USER\",\n  \"password\": \"\",\n  \"dsn\": \"172.31.23.101:1525/SIDB\",\n  \"connection_timeout\": 10,\n  \"query_sql\": \"\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Test Siebel Connection",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/siebel/config/test-connection",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "siebel",
+                "config",
+                "test-connection"
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "List Bss Delta Audit",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/siebel/delta-audit",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "siebel",
+                "delta-audit"
+              ],
+              "query": [
+                {
+                  "key": "limit",
+                  "value": "100",
+                  "description": "",
+                  "disabled": true
+                }
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "Run Siebel Delta Sync",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/siebel/delta-sync",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "siebel",
+                "delta-sync"
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Users",
+      "item": [
+        {
+          "name": "List Users",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/users",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "users"
+              ]
+            },
+            "description": ""
+          },
+          "response": []
+        },
+        {
+          "name": "Create User",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/users",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "users"
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"username\": \"string\",\n  \"password\": \"string\",\n  \"role\": \"operator\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Update User Password",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/users/:user_id/password",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "users",
+                ":user_id",
+                "password"
+              ],
+              "variable": [
+                {
+                  "key": "user_id",
+                  "value": "<user_id>"
+                }
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"password\": \"string\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Update User Status",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/users/:user_id/status",
+              "host": [
+                "{{baseUrl}}"
+              ],
+              "path": [
+                "users",
+                ":user_id",
+                "status"
+              ],
+              "variable": [
+                {
+                  "key": "user_id",
+                  "value": "<user_id>"
+                }
+              ]
+            },
+            "description": "",
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"status\": \"string\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "response": []
+        }
+      ]
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://127.0.0.1:3001",
+      "type": "string"
+    }
+  ]
+}

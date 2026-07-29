@@ -91,6 +91,7 @@ import {
   retryCstJob,
   retryFailedCstBatch,
   pushPendingCstJobs,
+  startPartialReassignment,
   runCstDayMinusOneSync,
   updateCstConfig,
   testCstConnection,
@@ -1171,7 +1172,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                 }}
                 onBootstrapCst={() => run(async () => {
                   const jobs = await bootstrapCurrentCstResources();
-                  setNotice({ title: "CST Migration Sent to CST", detail: `${jobs.length} CST transaction job(s) created and sent to the real CST API where data quality passed.` });
+                  setNotice({ title: jobs.length ? "CST Migration Jobs Created" : "No CST Migration Jobs Created", detail: jobs.length ? `${jobs.length} CST transaction job(s) created. Check CST Integration Monitor for success, pending, or failed status.` : "No eligible public CST resources were found. Load public pools/assignments first, or check CST readiness and existing transaction filters." });
                 })}
                 onReconcileCst={() => run(async () => {
                   const jobs = await reconcileCstResources();
@@ -1295,7 +1296,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                     title: resource.administrativeStatus === "RESERVED" ? "Remove reservation" : "Release assignment",
                     detail: resource.administrativeStatus === "RESERVED"
                       ? `Move ${resource.cidr} back to AVAILABLE?`
-                      : ["SUCCESS", "SYNCHRONIZED", "DECOMMISSION_PENDING"].includes(resource.ripeSyncStatus) ? `Move ${resource.cidr} to RIPE removal pending? CST DeleteLIRData will be sent now if this assignment was reported to CST.` : `Unassign ${resource.cidr} locally? If it was reported to CST, DeleteLIRData will be sent first; if never reported, no CST delete is required.`,
+                      : ["SUCCESS", "SYNCHRONIZED", "DECOMMISSION_PENDING"].includes(resource.ripeSyncStatus) ? `Move ${resource.cidr} to RIPE removal pending? CST UpdateLIRData will set assignmentStatusId to 1 Unassigned if this assignment was reported to CST.` : `Unassign ${resource.cidr} locally? If it was reported to CST, UpdateLIRData will mark it Unassigned; if never reported, no CST update is required.`,
                     destructive: true,
                     action: () => run(async () => {
                       if (resource.administrativeStatus === "RESERVED") {
@@ -1445,7 +1446,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                 })}
                 onRelease={(assignment) => setConfirm({
                   title: "Release assignment",
-                  detail: ["SUCCESS", "SYNCHRONIZED", "DECOMMISSION_PENDING"].includes(String(assignment.ripe_sync_status || "").toUpperCase()) ? `Move ${assignment.cidr} to RIPE removal pending? CST DeleteLIRData will be sent now if this assignment was reported to CST.` : `Unassign ${assignment.cidr} locally? If it was reported to CST, DeleteLIRData will be sent first; if never reported, no CST delete is required.`,
+                  detail: ["SUCCESS", "SYNCHRONIZED", "DECOMMISSION_PENDING"].includes(String(assignment.ripe_sync_status || "").toUpperCase()) ? `Move ${assignment.cidr} to RIPE removal pending? CST UpdateLIRData will set assignmentStatusId to 1 Unassigned if this assignment was reported to CST.` : `Unassign ${assignment.cidr} locally? If it was reported to CST, UpdateLIRData will mark it Unassigned; if never reported, no CST update is required.`,
                   destructive: true,
                   action: () => run(async () => {
                     if (["SUCCESS", "SYNCHRONIZED", "DECOMMISSION_PENDING"].includes(String(assignment.ripe_sync_status || "").toUpperCase())) {
@@ -1453,6 +1454,26 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                     } else {
                       await api.delete(`/assignments/${assignment.id}`);
                     }
+                  })
+                })}
+                onPartialReassign={(assignment, partialCidr) => setConfirm({
+                  title: "Partial LIR reassignment",
+                  detail: `Reassign ${partialCidr} from original block ${assignment.cidr}? CST will update the original to Unassigned, delete it, then send the assigned and remaining unassigned fragments.`,
+                  action: () => run(async () => {
+                    const payload = {
+                      ...assignmentForm,
+                      cidr: partialCidr,
+                      assignment_status_id: assignmentStatusByTarget[assignmentForm.assignment_target_type],
+                      status: "Active" as AssignmentStatus
+                    };
+                    const result = await startPartialReassignment(assignment.id, payload);
+                    void assignmentsQuery.refetch();
+                    void poolsQuery.refetch();
+                    void conflictsQuery.refetch();
+                    void cstJobsQuery.refetch();
+                    void cstBatchesQuery.refetch();
+                    void cstTransactionsQuery.refetch();
+                    setNotice({ title: "Partial LIR Reassignment", detail: `${result.status}: ${result.message || `${result.fragments.length} CST operation(s) tracked under ${result.id}`}` });
                   })
                 })}
                 onStatus={(assignment, status) => run(async () => { await api.patch(`/assignments/${assignment.id}/status`, { status }); })}
@@ -2567,6 +2588,8 @@ function ReservationManagement(props: {
   );
 }
 
+type AssignmentWorkflow = "assign" | "unassign" | "partial";
+
 function AssignmentManagement(props: {
   resources: ManagedResource[];
   assignments: Assignment[];
@@ -2576,14 +2599,19 @@ function AssignmentManagement(props: {
   onPoolDraft: (value: PoolAssignmentDraft) => void;
   onAssign: () => void;
   onRelease: (assignment: Assignment) => void;
+  onPartialReassign: (assignment: Assignment, partialCidr: string) => void;
   onStatus: (assignment: Assignment, status: AssignmentStatus) => void;
   onRefreshSiebelAssignment: (assignment: Assignment) => void;
   onLookupSiebelService: (serviceId: string) => void;
 }) {
+  const [workflow, setWorkflow] = useState<AssignmentWorkflow>("assign");
+  const [partialAssignmentId, setPartialAssignmentId] = useState("");
+  const [partialCidr, setPartialCidr] = useState("");
+  const [assignmentSearch, setAssignmentSearch] = useState("");
   const available = presentationResources(props.resources).filter((resource) => resource.administrativeStatus === "AVAILABLE" && resource.type === "Subnet");
   const parentPoolMatches = filterResources(available, props.poolDraft.poolSearch);
-  const selectedPool = available.find((resource) => resource.id === props.poolDraft.parentPoolId) ?? null;
   const assignmentSummary = assignmentDraftSummary(props.form, props.poolDraft, props.resources);
+  const partialAssignment = props.assignments.find((assignment) => assignment.id === partialAssignmentId) ?? null;
   const mergeForm = (patch: Partial<AssignmentPayload>) => props.onForm({ ...props.form, ...patch });
   const update = <Key extends keyof AssignmentPayload>(key: Key, value: AssignmentPayload[Key]) => mergeForm({ [key]: value } as Partial<AssignmentPayload>);
   const updatePoolDraft = (value: Partial<PoolAssignmentDraft>) => props.onPoolDraft({ ...props.poolDraft, ...value });
@@ -2591,19 +2619,149 @@ function AssignmentManagement(props: {
   const dynamicOwnerFields =
     targetType === "business_customer" ? businessBssFields : targetType === "individual" ? individualBssFields : internalAssignmentFields;
   const detailTitle = targetType === "business_customer" ? "Business customer details" : targetType === "individual" ? "Individual customer details" : "Internal assignment details";
+  const assignmentTableTitle = workflow === "partial" ? "Choose Original Assignment" : "Unassign Assignments";
+  const assignmentTableDescription = workflow === "partial"
+    ? "Select the existing CST-reported block that needs to be split and partially reassigned."
+    : "Release an assignment, refresh BSS details, or temporarily suspend operational use.";
+  const assignmentSearchTerm = assignmentSearch.trim().toLowerCase();
+  const filteredAssignments = assignmentSearchTerm
+    ? props.assignments.filter((assignment) => [
+        assignment.cidr,
+        assignment.customer_name,
+        assignment.internal_application_name,
+        assignment.service_id,
+        assignment.service_instance_id,
+        assignment.id,
+        assignment.status,
+        assignment.assignment_target_type,
+        assignment.organization_id,
+        assignment.mobile_number,
+        assignment.email
+      ].some((value) => String(value || "").toLowerCase().includes(assignmentSearchTerm)))
+    : props.assignments;
 
-  return (
-    <div className="grid gap-5">
-      <PageTitle title="Assignment Management" description="Create, modify, suspend, resume, and release allocations to supported resource owners." />
-      <Card>
-        <CardHeader>
-          <CardTitle>Create Assignment</CardTitle>
-          <CardDescription>Assignments consume a registry resource and attach owner, service, contact, and transaction context.</CardDescription>
-        </CardHeader>
-        <CardContent className="grid gap-3">
-          <AssignmentSteps currentStep={assignmentSummary.cidr ? (props.form.service_id || props.form.full_name || props.form.internal_application_name || props.form.requested_by ? 3 : 2) : 1} />
-          <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
-            <div className="grid gap-3">
+  const openWorkflow = (nextWorkflow: AssignmentWorkflow) => {
+    setWorkflow(nextWorkflow);
+    if (nextWorkflow !== "partial") {
+      setPartialAssignmentId("");
+      setPartialCidr("");
+    }
+  };
+
+  const selectPartialAssignment = (assignment: Assignment) => {
+    setWorkflow("partial");
+    setPartialAssignmentId(assignment.id);
+    setPartialCidr("");
+    props.onForm({
+      ...props.form,
+      ...assignment,
+      cidr: "",
+      assignment_date: props.form.assignment_date || today()
+    });
+  };
+
+  const workflowTiles: Array<{
+    id: AssignmentWorkflow;
+    title: string;
+    description: string;
+    metric: string;
+    icon: typeof Network;
+  }> = [
+    {
+      id: "assign",
+      title: "Assign IP",
+      description: "Create a new assignment from an available subnet or IP range.",
+      metric: `${available.length} available subnet${available.length === 1 ? "" : "s"}`,
+      icon: Network
+    },
+    {
+      id: "unassign",
+      title: "Unassign IP",
+      description: "Release an existing assignment without mixing it with creation steps.",
+      metric: `${props.assignments.length} current assignment${props.assignments.length === 1 ? "" : "s"}`,
+      icon: ArchiveRestore
+    },
+    {
+      id: "partial",
+      title: "Partial Reassign",
+      description: "Split one reported block into assigned and unassigned CST fragments.",
+      metric: partialAssignment ? `Selected ${partialAssignment.cidr}` : "Select original block",
+      icon: GitBranch
+    }
+  ];
+
+  const assignmentDetailsPanel = (
+    <div className="grid gap-3">
+      <div className="grid gap-3 rounded-md border bg-muted/20 p-3">
+        <div>
+          <p className="text-sm font-semibold">{workflow === "partial" ? "1. Assigned Fragment Details" : "2. Enter Details"}</p>
+          <p className="text-xs text-muted-foreground">Choose the assignment owner type, operational status, date, and required dynamic attributes.</p>
+        </div>
+        <div className="grid gap-3 md:grid-cols-4">
+          <label className="grid gap-1">
+            <span className="text-xs font-medium text-muted-foreground">Assigned to</span>
+            <Select
+              value={props.form.assignment_target_type}
+              values={assignedToOptions}
+              labels={assignmentTargetLabels}
+              onChange={(assignmentTarget) => mergeForm(assignmentDefaultsForTarget(assignmentTarget as AssignmentPayload["assignment_target_type"], props.form))}
+            />
+          </label>
+          <label className="grid gap-1">
+            <span className="text-xs font-medium text-muted-foreground">Operational status</span>
+            <Select value={operationalStatuses.includes(props.form.status) ? props.form.status : "Active"} values={operationalStatuses} onChange={(status) => update("status", status as AssignmentStatus)} />
+          </label>
+          <Input value={props.form.assignment_date} onChange={(event) => update("assignment_date", event.target.value)} placeholder="Assignment date" type="date" />
+          <Input value={props.form.requested_by} onChange={(event) => update("requested_by", event.target.value)} placeholder="Requested by" />
+          <Input value={props.form.approved_by} onChange={(event) => update("approved_by", event.target.value)} placeholder="Approved by" />
+          <Input value={props.form.approval_reference} onChange={(event) => update("approval_reference", event.target.value)} placeholder="Approval reference" />
+          <div className="flex flex-wrap items-center gap-2 md:col-span-4">
+            <Badge variant="default">Assignment lifecycle: ASSIGNED</Badge>
+            <Badge variant="default">CST assignmentStatusId: {assignmentStatusByTarget[targetType]}</Badge>
+            <Badge variant={props.form.status === "Blocked" ? "danger" : "success"}>Operational: {operationalStatuses.includes(props.form.status) ? props.form.status : "Active"}</Badge>
+          </div>
+        </div>
+        {targetType === "business_customer" ? (
+          <div className="grid gap-3 rounded-md border bg-background/40 p-3 md:grid-cols-[minmax(0,1fr)_auto]">
+            <label className="grid gap-1">
+              <span className="text-xs font-medium text-muted-foreground">BSS service ID</span>
+              <Input value={props.form.service_id} onChange={(event) => update("service_id", event.target.value)} placeholder="Service ID" />
+            </label>
+            <Button variant="secondary" onClick={() => props.onLookupSiebelService(props.form.service_id)} disabled={!props.form.service_id.trim()}>
+              <Search className="h-4 w-4" />
+              Query Siebel
+            </Button>
+            <p className="text-xs text-muted-foreground md:col-span-2">Fetch business customer details from Siebel by service ID and populate the fields below. Customer ID is synced as data, not used as the key.</p>
+          </div>
+        ) : null}
+        <AssignmentFieldGroup title={detailTitle} fields={dynamicOwnerFields} form={props.form} onChange={update} />
+      </div>
+
+      <div className="grid gap-3 rounded-md border bg-muted/20 p-3">
+        <div>
+          <p className="text-sm font-semibold">{workflow === "partial" ? "2. Notes" : "3. Notes"}</p>
+          <p className="text-xs text-muted-foreground">Optional operational notes for this assignment.</p>
+        </div>
+        <Textarea value={props.form.notes} onChange={(event) => update("notes", event.target.value)} placeholder="Assignment notes" />
+      </div>
+    </div>
+  );
+
+  const renderAssignmentForm = () => (
+    <Card>
+      <CardHeader>
+        <CardTitle>{workflow === "partial" ? "Partial Reassignment Details" : "Assign IP"}</CardTitle>
+        <CardDescription>
+          {workflow === "partial"
+            ? "Define the reassigned fragment and the owner details that will be sent to CST after the original block is retired."
+            : "Assignments consume a registry resource and attach owner, service, contact, and transaction context."}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="grid gap-3">
+        {workflow === "assign" ? <AssignmentSteps currentStep={assignmentSummary.cidr ? (props.form.service_id || props.form.full_name || props.form.internal_application_name || props.form.requested_by ? 3 : 2) : 1} /> : null}
+        <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
+          <div className="grid gap-3">
+            {workflow === "assign" ? (
               <div className="grid gap-3 rounded-md border bg-muted/20 p-3">
                 <div>
                   <p className="text-sm font-semibold">1. Select IP Range</p>
@@ -2651,110 +2809,152 @@ function AssignmentManagement(props: {
                 ) : null}
                 {visibleAssignmentError(assignmentSummary.error) ? <p className="rounded-md border border-amber-500/50 bg-amber-500/10 p-3 text-sm text-amber-100">{assignmentSummary.error}</p> : null}
               </div>
-
-              <div className="grid gap-3 rounded-md border bg-muted/20 p-3">
-                <div>
-                  <p className="text-sm font-semibold">2. Enter Details</p>
-                  <p className="text-xs text-muted-foreground">Choose the assignment owner type, operational status, date, and required dynamic attributes.</p>
+            ) : (
+              <div className="grid gap-3 rounded-md border bg-muted/20 p-3 md:grid-cols-[minmax(0,1fr)_260px] md:items-end">
+                <div className="text-sm">
+                  <p className="font-semibold">Original block: {partialAssignment?.cidr ?? "Select an assignment below"}</p>
+                  <p className="mt-1 text-muted-foreground">The requested fragment must be fully contained inside the original block. CST will receive UpdateLIRData, DeleteLIRData, then SendLIRData for each resulting block.</p>
                 </div>
-                <div className="grid gap-3 md:grid-cols-4">
-                  <label className="grid gap-1">
-                    <span className="text-xs font-medium text-muted-foreground">Assigned to</span>
-                    <Select
-                      value={props.form.assignment_target_type}
-                      values={assignedToOptions}
-                      labels={assignmentTargetLabels}
-                      onChange={(assignmentTarget) => mergeForm(assignmentDefaultsForTarget(assignmentTarget as AssignmentPayload["assignment_target_type"], props.form))}
-                    />
-                  </label>
-                  <label className="grid gap-1">
-                    <span className="text-xs font-medium text-muted-foreground">Operational status</span>
-                    <Select value={operationalStatuses.includes(props.form.status) ? props.form.status : "Active"} values={operationalStatuses} onChange={(status) => update("status", status as AssignmentStatus)} />
-                  </label>
-                  <Input value={props.form.assignment_date} onChange={(event) => update("assignment_date", event.target.value)} placeholder="Assignment date" type="date" />
-                  <Input value={props.form.requested_by} onChange={(event) => update("requested_by", event.target.value)} placeholder="Requested by" />
-                  <Input value={props.form.approved_by} onChange={(event) => update("approved_by", event.target.value)} placeholder="Approved by" />
-                  <Input value={props.form.approval_reference} onChange={(event) => update("approval_reference", event.target.value)} placeholder="Approval reference" />
-                  <div className="flex flex-wrap items-center gap-2 md:col-span-4">
-                    <Badge variant="default">Assignment lifecycle: ASSIGNED</Badge>
-                    <Badge variant="default">CST assignmentStatusId: {assignmentStatusByTarget[targetType]}</Badge>
-                    <Badge variant={props.form.status === "Blocked" ? "danger" : "success"}>Operational: {operationalStatuses.includes(props.form.status) ? props.form.status : "Active"}</Badge>
-                  </div>
-                </div>
-                {targetType === "business_customer" ? (
-                  <div className="grid gap-3 rounded-md border bg-background/40 p-3 md:grid-cols-[minmax(0,1fr)_auto]">
-                    <label className="grid gap-1">
-                      <span className="text-xs font-medium text-muted-foreground">BSS service ID</span>
-                      <Input value={props.form.service_id} onChange={(event) => update("service_id", event.target.value)} placeholder="Service ID" />
-                    </label>
-                    <Button variant="secondary" onClick={() => props.onLookupSiebelService(props.form.service_id)} disabled={!props.form.service_id.trim()}>
-                      <Search className="h-4 w-4" />
-                      Query Siebel
-                    </Button>
-                    <p className="text-xs text-muted-foreground md:col-span-2">Fetch business customer details from Siebel by service ID and populate the fields below. Customer ID is synced as data, not used as the key.</p>
-                  </div>
-                ) : null}
-                <AssignmentFieldGroup title={detailTitle} fields={dynamicOwnerFields} form={props.form} onChange={update} />
+                <label className="grid gap-1">
+                  <span className="text-xs font-medium text-muted-foreground">Requested reassignment CIDR</span>
+                  <Input value={partialCidr} onChange={(event) => setPartialCidr(event.target.value)} placeholder="e.g. 172.20.40.0/24" />
+                </label>
               </div>
-
-              <div className="grid gap-3 rounded-md border bg-muted/20 p-3">
-                <div>
-                  <p className="text-sm font-semibold">3. Notes</p>
-                  <p className="text-xs text-muted-foreground">Optional operational notes for this assignment.</p>
-                </div>
-                <Textarea value={props.form.notes} onChange={(event) => update("notes", event.target.value)} placeholder="Assignment notes" />
-              </div>
-            </div>
+            )}
+            {assignmentDetailsPanel}
+          </div>
+          {workflow === "assign" ? (
             <AssignmentReviewCard summary={assignmentSummary} form={props.form} onAssign={props.onAssign} />
+          ) : (
+            <aside className="grid content-start gap-4 rounded-md border bg-muted/20 p-4">
+              <div>
+                <p className="text-lg font-semibold">Partial Summary</p>
+                <p className="text-sm text-muted-foreground">Review before running the CST split workflow.</p>
+              </div>
+              <DetailRows rows={[
+                ["Original Block", partialAssignment?.cidr ?? "-"],
+                ["Requested Fragment", partialCidr || "-"],
+                ["Assigned To", assignmentTargetLabels[targetType]],
+                ["CST Status", String(assignmentStatusByTarget[targetType])],
+                ["Service", props.form.service_id || props.form.service_description || props.form.internal_application_name || "-"]
+              ]} />
+              <p className="rounded-md border border-amber-500/50 bg-amber-500/10 p-3 text-sm text-amber-100">
+                Local reassignment completes only after all mandatory CST calls succeed. Failed fragments remain retryable under the same operation.
+              </p>
+              <Button type="button" disabled={!partialAssignment || !partialCidr.trim()} onClick={() => partialAssignment && props.onPartialReassign(partialAssignment, partialCidr.trim())}>Run Partial Reassignment</Button>
+            </aside>
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  );
+
+  const renderAssignmentTable = () => (
+    <Card>
+      <CardHeader>
+        <CardTitle>{assignmentTableTitle}</CardTitle>
+        <CardDescription>{assignmentTableDescription}</CardDescription>
+      </CardHeader>
+      <CardContent className="grid gap-3">
+        <div className="grid gap-3 rounded-md border bg-muted/20 p-3 md:grid-cols-[minmax(0,1fr)_auto] md:items-end">
+          <label className="grid gap-1">
+            <span className="text-xs font-medium text-muted-foreground">Search assignments</span>
+            <Input value={assignmentSearch} onChange={(event) => setAssignmentSearch(event.target.value)} placeholder="Search CIDR, owner, service ID, status, contact" />
+          </label>
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge variant="muted">{filteredAssignments.length} of {props.assignments.length}</Badge>
+            {assignmentSearch ? <Button type="button" variant="outline" onClick={() => setAssignmentSearch("")}>Clear</Button> : null}
           </div>
-        </CardContent>
-      </Card>
-      <Card>
-        <CardHeader>
-          <CardTitle>Current Assignments</CardTitle>
-          <CardDescription>Assignments and reservations stored in the registry.</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="max-h-[520px] overflow-auto rounded-md border">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>CIDR</TableHead>
-                  <TableHead>Owner</TableHead>
-                  <TableHead>Status</TableHead>
-                  <TableHead>Transaction</TableHead>
-                  <TableHead>BSS Sync</TableHead>
-                  <TableHead />
+        </div>
+        <div className="max-h-[520px] overflow-auto rounded-md border">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>CIDR</TableHead>
+                <TableHead>Owner</TableHead>
+                <TableHead>Status</TableHead>
+                <TableHead>Transaction</TableHead>
+                <TableHead>BSS Sync</TableHead>
+                <TableHead />
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {filteredAssignments.length ? filteredAssignments.map((assignment) => (
+                <TableRow key={assignment.id}>
+                  <TableCell className="font-semibold">{assignment.cidr}</TableCell>
+                  <TableCell>{assignment.customer_name || assignment.internal_application_name}</TableCell>
+                  <TableCell><Badge variant={assignment.status === "Blocked" ? "danger" : assignment.status === "Reserved" ? "warning" : "success"}>{assignment.status}</Badge></TableCell>
+                  <TableCell>{assignment.service_instance_id || assignment.id}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">{assignment.siebel_last_sync_at ? formatDateTime(assignment.siebel_last_sync_at) : assignment.siebel_last_checked_at ? `Checked ${formatDateTime(assignment.siebel_last_checked_at)}` : "Not synced"}</TableCell>
+                  <TableCell>
+                    <div className="flex flex-wrap gap-2">
+                      {workflow === "partial" ? (
+                        <Button size="sm" variant={partialAssignmentId === assignment.id ? "default" : "secondary"} onClick={() => selectPartialAssignment(assignment)}>{partialAssignmentId === assignment.id ? "Selected" : "Use for Partial"}</Button>
+                      ) : (
+                        <>
+                          {assignment.assignment_target_type === "business_customer" && assignment.service_id ? (
+                            <Button size="sm" variant="secondary" onClick={() => props.onRefreshSiebelAssignment(assignment)}>Refresh BSS</Button>
+                          ) : null}
+                          <Button size="sm" variant="outline" onClick={() => props.onStatus(assignment, assignment.status === "Blocked" ? "Active" : "Blocked")}>{assignment.status === "Blocked" ? "Resume" : "Suspend"}</Button>
+                          <Button size="sm" variant="secondary" onClick={() => selectPartialAssignment(assignment)}>Partial Reassign</Button>
+                          <Button size="sm" variant="destructive" onClick={() => props.onRelease(assignment)}>Unassign</Button>
+                        </>
+                      )}
+                    </div>
+                  </TableCell>
                 </TableRow>
-              </TableHeader>
-              <TableBody>
-                {props.assignments.map((assignment) => (
-                  <TableRow key={assignment.id}>
-                    <TableCell className="font-semibold">{assignment.cidr}</TableCell>
-                    <TableCell>{assignment.customer_name || assignment.internal_application_name}</TableCell>
-                    <TableCell><Badge variant={assignment.status === "Blocked" ? "danger" : assignment.status === "Reserved" ? "warning" : "success"}>{assignment.status}</Badge></TableCell>
-                    <TableCell>{assignment.service_instance_id || assignment.id}</TableCell>
-                    <TableCell className="text-xs text-muted-foreground">{assignment.siebel_last_sync_at ? formatDateTime(assignment.siebel_last_sync_at) : assignment.siebel_last_checked_at ? `Checked ${formatDateTime(assignment.siebel_last_checked_at)}` : "Not synced"}</TableCell>
-                    <TableCell>
-                      <div className="flex flex-wrap gap-2">
-                        {assignment.assignment_target_type === "business_customer" && assignment.service_id ? (
-                          <Button size="sm" variant="secondary" onClick={() => props.onRefreshSiebelAssignment(assignment)}>Refresh BSS</Button>
-                        ) : null}
-                        <Button size="sm" variant="outline" onClick={() => props.onStatus(assignment, assignment.status === "Blocked" ? "Active" : "Blocked")}>{assignment.status === "Blocked" ? "Resume" : "Suspend"}</Button>
-                        <Button size="sm" variant="destructive" onClick={() => props.onRelease(assignment)}>Unassign</Button>
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </div>
-        </CardContent>
-      </Card>
+              )) : (
+                <TableRow>
+                  <TableCell colSpan={6} className="py-8 text-center text-sm text-muted-foreground">{props.assignments.length ? "No assignments match the search." : "No assignments found."}</TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+          </Table>
+        </div>
+      </CardContent>
+    </Card>
+  );
+
+  return (
+    <div className="grid gap-5">
+      <PageTitle title="Assignment Management" description="Choose one assignment workflow, then complete it in a focused page." />
+      <div className="grid gap-3 lg:grid-cols-3">
+        {workflowTiles.map((tile) => {
+          const Icon = tile.icon;
+          const active = workflow === tile.id;
+          return (
+            <button
+              key={tile.id}
+              type="button"
+              onClick={() => openWorkflow(tile.id)}
+              className={cn(
+                "rounded-md border bg-card p-4 text-left transition hover:border-primary/70 hover:bg-muted/20",
+                active && "border-primary bg-primary/10 shadow-sm"
+              )}
+            >
+              <div className="flex items-start justify-between gap-3">
+                <span className={cn("rounded-md border p-2", active ? "border-primary/50 bg-primary/15 text-primary" : "bg-muted/20 text-muted-foreground")}>
+                  <Icon className="h-5 w-5" />
+                </span>
+                <Badge variant={active ? "default" : "muted"}>{tile.metric}</Badge>
+              </div>
+              <p className="mt-4 text-base font-semibold">{tile.title}</p>
+              <p className="mt-1 text-sm text-muted-foreground">{tile.description}</p>
+            </button>
+          );
+        })}
+      </div>
+      {workflow === "assign" ? renderAssignmentForm() : null}
+      {workflow === "unassign" ? renderAssignmentTable() : null}
+      {workflow === "partial" ? (
+        <>
+          {partialAssignment ? renderAssignmentForm() : null}
+          {renderAssignmentTable()}
+        </>
+      ) : null}
     </div>
   );
 }
-
 function DynamicResourceList({ resources, selectedId, onSelect }: { resources: ManagedResource[]; selectedId: string; onSelect: (resource: ManagedResource) => void }) {
   const displayResources = presentationResources(resources);
   if (!displayResources.length) {

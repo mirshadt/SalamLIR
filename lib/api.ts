@@ -533,6 +533,42 @@ export type CstSyncJob = {
 };
 
 
+export type CstManualMigrationRequest = {
+  limit?: number;
+  execute_immediately?: boolean;
+  force_api_override?: boolean;
+  include_existing_transactions?: boolean;
+  only_cst_ready?: boolean;
+};
+
+export type CstMigrationJobStats = {
+  batch_id: string;
+  workflow_type: string;
+  status: string;
+  total_jobs: number;
+  pending_jobs: number;
+  running_jobs: number;
+  success_jobs: number;
+  failed_jobs: number;
+  blocked_jobs: number;
+  not_required_jobs: number;
+  external_api_calls: number;
+  total_transactions: number;
+  created_at: string;
+  completed_at: string;
+  last_error: string;
+};
+
+export type CstManualMigrationResult = {
+  batch_id: string;
+  created_jobs: number;
+  processed_jobs: number;
+  eligible_resources: number;
+  skipped_resources: number;
+  message: string;
+  stats: CstMigrationJobStats | null;
+  jobs: CstSyncJob[];
+};
 export type CstPendingPushResult = {
   started_at: string;
   completed_at: string;
@@ -547,6 +583,7 @@ export type CstPendingPushResult = {
   batch_size_limit: number;
   hourly_request_limit: number;
   rate_delay_seconds: number;
+  force_api_override: boolean;
   jobs: CstSyncJob[];
 };
 export type CstSchedulerRun = {
@@ -684,6 +721,36 @@ export type AssignmentDetailRecord = {
 
 export type PartitionDirection = "start" | "end";
 
+export type PartialReassignmentFragment = {
+  id: string;
+  operation_id: string;
+  kind: string;
+  cidr: string;
+  cst_operation: string;
+  transaction_id: string;
+  resource_uuid: string;
+  cst_job_id: string;
+  status: string;
+  last_error: string;
+  created_at: string;
+  updated_at: string;
+};
+
+export type PartialReassignmentResult = {
+  id: string;
+  original_assignment_id: string;
+  original_cidr: string;
+  requested_cidr: string;
+  status: string;
+  original_transaction_id: string;
+  assigned_transaction_id: string;
+  message: string;
+  created_at: string;
+  updated_at: string;
+  completed_at: string;
+  fragments: PartialReassignmentFragment[];
+  jobs: CstSyncJob[];
+};
 export type PartitionResult = {
   allocated: Assignment;
   remaining: {
@@ -799,6 +866,15 @@ export async function getPools() {
   return data;
 }
 
+export async function startPartialReassignment(assignmentId: string, payload: AssignmentPayload) {
+  const { data } = await api.post<PartialReassignmentResult>(`/assignments/${assignmentId}/partial-reassign`, payload);
+  return data;
+}
+
+export async function retryPartialReassignment(operationId: string) {
+  const { data } = await api.post<PartialReassignmentResult>(`/assignments/partial-reassign/${operationId}/retry`);
+  return data;
+}
 export async function getAssignments() {
   const { data } = await api.get<Assignment[]>("/assignments");
   return data;
@@ -912,6 +988,20 @@ export async function getCstTransactions() {
   return data;
 }
 
+export async function createManualCstMigrationJob(payload: CstManualMigrationRequest = {}) {
+  const { data } = await api.post<CstManualMigrationResult>("/cst/migration-jobs/manual", payload);
+  return data;
+}
+
+export async function getCstMigrationJobStats(batchId: string) {
+  const { data } = await api.get<CstMigrationJobStats>(`/cst/migration-jobs/${batchId}/stats`);
+  return data;
+}
+
+export async function listCstMigrationJobStats(limit = 50) {
+  const { data } = await api.get<CstMigrationJobStats[]>("/cst/migration-jobs/stats", { params: { limit } });
+  return data;
+}
 export async function bootstrapCurrentCstResources() {
   const { data } = await api.post<CstSyncJob[]>("/cst/bootstrap-current");
   return data;
@@ -927,6 +1017,11 @@ export async function pushPendingCstJobs(limit = 0) {
   const { data } = await api.post<CstPendingPushResult>("/cst/jobs/push-pending", null, { params: limit > 0 ? { limit } : undefined });
   return data;
 }
+export async function forcePushPendingCstJobs(limit = 0) {
+  const { data } = await api.post<CstPendingPushResult>("/cst/jobs/push-pending/force", null, { params: limit > 0 ? { limit } : undefined });
+  return data;
+}
+
 export async function retryCstJob(jobId: string) {
   const { data } = await api.post<CstSyncJob>(`/cst/jobs/${jobId}/retry`);
   return data;

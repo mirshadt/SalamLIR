@@ -1,0 +1,2 @@
+﻿Ip Address	Order Number	Product Type	CustomerSpecific	ProductClass	CustomerName	CustomerNumber	CustomerType	Subnet Type	Number of IpAddress	Status	Subnet Mask	Sequence Number	VRF Name	RD	RT IMPORT	RT EXPORT	ASN	ShipToAddress	Remark	CIDR	InetNum	PublicIP
+128.127.225.0	10,649,831	BDI		BDI(1:1)	Chedid and Associates	29700	CORP	LAN1	4	Reserved	255.255.255.252	115					0	Test Address		128.127.225.0/30	128.127.225.0 - 128.127.225.3	Yes

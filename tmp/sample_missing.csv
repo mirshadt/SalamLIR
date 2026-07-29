@@ -1,0 +1,2 @@
+﻿ASN,CIDR,CustomerName,CustomerNumber,CustomerSpecific,CustomerType,InetNum,Ip Address,Number of IpAddress,Order Number,Product Type,ProductClass,PublicIP,RD,RT EXPORT,RT IMPORT,Remark,Sequence Number,ShipToAddress,Status,Subnet Mask,Subnet Type,VRF Name,missingReason,normalizedJoinKey
+0,128.127.225.0/30,MINISTRY OF HEALTH (MOH),33690,,CORP,128.127.225.0 - 128.127.225.3,128.127.225.0,4,"1,000,010,108,656",BDI,BDI(1:1),Yes,,,,,115,Test Address,Reserved,255.255.255.252,LAN1,,No Siebel row found using SERIAL_NUM=1000010108656,1000010108656
