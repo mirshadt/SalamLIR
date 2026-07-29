@@ -2093,6 +2093,30 @@ def cst_delete_succeeded(jobs: list[CstSyncJob]) -> bool:
     return bool(jobs) and all(job.operation == "DELETE" and job.status == "SUCCESS" for job in jobs)
 
 
+def cst_jobs_succeeded(jobs: list[CstSyncJob], operation: str) -> bool:
+    return bool(jobs) and all(job.operation == operation and job.status == "SUCCESS" for job in jobs)
+
+
+def cst_unassigned_update_resource(resource: ResourceRecord) -> ResourceRecord:
+    return resource.model_copy(update={
+        "assignment_status_id": 1,
+        "ownership_type": "POOL",
+        "status": "AVAILABLE",
+        "customer_name": "",
+        "organization_name": "",
+        "organization_id": "",
+        "customer_type_id": "",
+        "full_name": "",
+        "mobile_number": "",
+        "id_number": "",
+        "email": "",
+        "assignment_date": "",
+        "service_description": "",
+        "description": resource.description or f"{resource.cidr} unassigned locally",
+        "action_flag": "U",
+    })
+
+
 def cst_get_lir_page_resource(config: CstConfig, page_number: int = 1) -> ResourceRecord:
     timestamp = now_iso()
     service_provider_id = str(config.service_provider_id or DEFAULT_SERVICE_PROVIDER_ID)
@@ -2125,16 +2149,16 @@ def cst_transaction_id_for_resource(connection: sqlite3.Connection, resource: Re
         """
         SELECT transaction_id, retired_at
         FROM cst_transaction_ledger
-        WHERE resource_uuid = ?
-        ORDER BY first_used_at DESC
+        WHERE resource_uuid = ? OR cidr = ?
+        ORDER BY CASE WHEN resource_uuid = ? THEN 0 ELSE 1 END, first_used_at DESC
         LIMIT 1
         """,
-        (resource.resource_uuid,),
+        (resource.resource_uuid, resource.cidr, resource.resource_uuid),
     ).fetchone()
-    if existing and operation != "SEND":
-        return str(existing["transaction_id"])
     if existing and not str(existing["retired_at"] or ""):
         return str(existing["transaction_id"])
+    if operation != "SEND" and str(resource.transaction_id or "").strip():
+        return str(resource.transaction_id).strip()
 
     service_provider_id = resource.service_provider_id or DEFAULT_SERVICE_PROVIDER_ID
     while True:
@@ -2242,16 +2266,66 @@ def cst_payload_for_resource(resource: ResourceRecord, operation: str, transacti
             "data": [record],
         }
     if operation == "UPDATE":
+        today_text = datetime.now(timezone.utc).date().isoformat()
+        status_id = cst_int_value(resource.assignment_status_id, 1)
+        record = {
+            "transactionId": transaction_id,
+            "assignmentStatusId": status_id,
+        }
+        if status_id == 3:
+            organization_name = (resource.organization_name or resource.customer_name or "").strip()
+            if organization_name:
+                record["organizationName"] = organization_name
+            if str(resource.organization_id or "").strip():
+                record["organizationId"] = str(resource.organization_id).strip()
+            customer_type_id = cst_int_value(resource.customer_type_id)
+            if customer_type_id is not None:
+                record["customerTypeId"] = customer_type_id
+            region_id = cst_int_value(resource.region_id)
+            if region_id is not None:
+                record["regionId"] = region_id
+            city_id = cst_int_value(resource.city_id)
+            if city_id is not None:
+                record["cityId"] = city_id
+            contact = {
+                "fullName": str(resource.full_name or "").strip(),
+                "mobileNumber": normalize_cst_mobile_number(resource.mobile_number) or CST_FALLBACK_PHONE_NUMBER,
+                "idNumber": normalize_cst_id_number(resource.id_number) or CST_FALLBACK_ID_NUMBER,
+                "email": normalize_cst_email(resource.email) or str(resource.email or "").strip(),
+            }
+            record["contact"] = {key: value for key, value in contact.items() if value}
+            record["assignmentDate"] = cst_date_value(resource.assignment_date, today_text)
+            record["updateDate"] = cst_date_value(resource.update_date, today_text)
+        elif status_id == 2:
+            record["serviceDescription"] = resource.service_description or resource.description or "Internal IP assignment"
+            if str(resource.description or "").strip():
+                record["description"] = str(resource.description).strip()
+        elif status_id == 4:
+            region_id = cst_int_value(resource.region_id)
+            if region_id is not None:
+                record["regionId"] = region_id
+            city_id = cst_int_value(resource.city_id)
+            if city_id is not None:
+                record["cityId"] = city_id
+            access_technology_id = cst_int_value(resource.access_technology_id)
+            if access_technology_id is not None:
+                record["accessTechnologyId"] = access_technology_id
+            contact = {
+                "fullName": str(resource.full_name or "").strip(),
+                "mobileNumber": normalize_cst_mobile_number(resource.mobile_number) or CST_FALLBACK_PHONE_NUMBER,
+                "idNumber": normalize_cst_id_number(resource.id_number) or CST_FALLBACK_ID_NUMBER,
+                "email": normalize_cst_email(resource.email) or str(resource.email or "").strip(),
+            }
+            contact = {key: value for key, value in contact.items() if value}
+            if contact:
+                record["contact"] = contact
+        if status_id != 2 and str(resource.service_description or "").strip():
+            record["serviceDescription"] = str(resource.service_description).strip()
+        if str(resource.description or "").strip():
+            record["description"] = str(resource.description).strip()
         return {
-            "serviceProviderId": service_provider_id,
-            "data": [
-                {
-                    "transactionId": transaction_id,
-                    "assignmentStatusId": str(resource.assignment_status_id),
-                    "serviceDescription": resource.service_description or resource.description or "",
-                    "asaan": resource.asn or DEFAULT_ASN,
-                }
-            ],
+            "serviceProviderId": cst_int_value(service_provider_id, cst_int_value(DEFAULT_SERVICE_PROVIDER_ID, 1)),
+            "data": [record],
         }
     if operation == "GET":
         return {
@@ -2359,12 +2433,26 @@ def cst_data_quality_issues(resource: ResourceRecord, operation: str, payload: d
     assignment_status_id = cst_int_value(record.get("assignmentStatusId"), resource.assignment_status_id)
     ownership_type = (resource.ownership_type or "").upper()
     issues: list[str] = []
-    if assignment_status_id == 3 or ownership_type == "BUSINESS":
+    if assignment_status_id == 1:
+        return issues
+    if assignment_status_id == 3:
         issues.extend(cst_business_data_quality_issues(resource, record))
-    elif assignment_status_id == 2 or ownership_type == "INTERNAL":
+    elif assignment_status_id == 2:
         if not str(record.get("serviceDescription") or resource.service_description or "").strip():
             issues.append("serviceDescription is required for Internal assignment")
-    elif assignment_status_id == 4 or ownership_type == "INDIVIDUAL":
+    elif assignment_status_id == 4:
+        region_id = record.get("regionId")
+        access_technology_id = record.get("accessTechnologyId")
+        if region_id not in {item_id for item_id, _name in CST_REGION_ROWS}:
+            issues.append("regionId is required and must map to a CST region for Individual assignment")
+        if access_technology_id not in CST_ACCESS_TECHNOLOGY_BY_ID:
+            issues.append("accessTechnologyId is required for Individual assignment")
+    elif ownership_type == "BUSINESS":
+        issues.extend(cst_business_data_quality_issues(resource, record))
+    elif ownership_type == "INTERNAL":
+        if not str(record.get("serviceDescription") or resource.service_description or "").strip():
+            issues.append("serviceDescription is required for Internal assignment")
+    elif ownership_type == "INDIVIDUAL":
         region_id = record.get("regionId")
         access_technology_id = record.get("accessTechnologyId")
         if region_id not in {item_id for item_id, _name in CST_REGION_ROWS}:
@@ -2645,6 +2733,9 @@ def create_cst_assignment_create_jobs(
     for row in active_cst_containers_for_network(connection, assigned_network):
         container_resource = cst_resource_from_ledger(row)
         container_network = normalize_network(str(row["cidr"]))
+        if container_network == assigned_network:
+            operations.append((assignment_resource, "UPDATE"))
+            return create_cst_sync_jobs(connection, operations, workflow_type)
         operations.append((container_resource, "DELETE"))
         for fragment in remaining_networks_after_subtract(container_network, assigned_network):
             fragment_uuid = stable_uuid("cst-fragment", str(row["transaction_id"]), assignment.id, str(fragment))
@@ -2690,7 +2781,7 @@ def create_cst_sync_jobs(
     for sequence_no, (resource, operation) in enumerate(eligible, start=1):
         transaction_id = cst_transaction_id_for_resource(connection, resource, operation, batch_id, correlation_id)
         payload = cst_payload_for_resource(resource, operation, transaction_id, correlation_id)
-        validation_payload = payload if operation == "SEND" else cst_payload_for_resource(resource, "SEND", transaction_id, correlation_id)
+        validation_payload = payload if operation in {"SEND", "UPDATE"} else cst_payload_for_resource(resource, "SEND", transaction_id, correlation_id)
         quality_issues = cst_data_quality_issues(resource, operation, validation_payload)
         if not config.enabled:
             status = "PENDING"
@@ -2750,13 +2841,14 @@ def create_cst_sync_jobs(
         connection.execute(
             """
             UPDATE cst_transaction_ledger
-            SET cidr = ?, last_status = ?, retired_at = COALESCE(NULLIF(?, ''), retired_at),
+            SET cidr = ?, resource_uuid = ?, service_provider_id = ?, last_status = ?,
+                retired_at = COALESCE(NULLIF(?, ''), retired_at),
                 retired_reason = COALESCE(NULLIF(?, ''), retired_reason), batch_id = ?, correlation_id = ?
             WHERE transaction_id = ?
             """,
-            (resource.cidr, status, retired_at, retired_reason, batch_id, correlation_id, transaction_id),
+            (resource.cidr, resource.resource_uuid, resource.service_provider_id or DEFAULT_SERVICE_PROVIDER_ID, status, retired_at, retired_reason, batch_id, correlation_id, transaction_id),
         )
-        action_flag = "D" if operation == "DELETE" and status == "SUCCESS" else "S" if status == "SUCCESS" else "F" if status in {"FAILED"} else "U"
+        action_flag = "D" if operation == "DELETE" and status == "SUCCESS" else "U" if operation == "UPDATE" and status == "SUCCESS" else "S" if status == "SUCCESS" else "F" if status in {"FAILED"} else "U"
         connection.execute(
             """
             UPDATE ip_resources
@@ -2800,9 +2892,9 @@ def retry_cst_jobs(connection: sqlite3.Connection, job_rows: list[sqlite3.Row]) 
             resource = cst_get_lir_page_resource(config, page_number)
         updated_at = now_iso()
         payload = cst_payload_for_resource(resource, job.operation, job.transaction_id, job.batch_id) if resource else stored_payload
-        validation_payload = cst_payload_for_resource(resource, "SEND", job.transaction_id, job.batch_id) if resource and job.operation not in {"SEND", "GET"} else payload
+        validation_payload = cst_payload_for_resource(resource, "SEND", job.transaction_id, job.batch_id) if resource and job.operation not in {"SEND", "UPDATE", "GET"} else payload
         quality_issues = cst_data_quality_issues(resource, job.operation, validation_payload) if resource else []
-        retry_without_resource = resource is None and job.operation == "DELETE" and bool(payload)
+        retry_without_resource = resource is None and job.operation in {"DELETE", "UPDATE"} and bool(payload)
         if quality_issues:
             status = "PENDING"
             last_error = cst_quality_message(quality_issues)
@@ -2868,16 +2960,20 @@ def retry_cst_jobs(connection: sqlite3.Connection, job_rows: list[sqlite3.Row]) 
             "UPDATE cst_transaction_ledger SET last_status = ?, batch_id = ? WHERE transaction_id = ?",
             (status, job.batch_id, job.transaction_id),
         )
-        action_flag = "D" if job.operation == "DELETE" and status == "SUCCESS" else "S" if status == "SUCCESS" else "F" if status in {"FAILED"} else "U"
+        action_flag = "D" if job.operation == "DELETE" and status == "SUCCESS" else "U" if job.operation == "UPDATE" and status == "SUCCESS" else "S" if status == "SUCCESS" else "F" if status in {"FAILED"} else "U"
         retired_at = updated_at if job.operation == "DELETE" and status == "SUCCESS" else ""
         retired_reason = "Removed from CST LIR registry" if retired_at else ""
+        ledger_resource_uuid = resource.resource_uuid if resource else job.resource_uuid
+        ledger_cidr = resource.cidr if resource else job.cidr
+        ledger_service_provider_id = resource.service_provider_id if resource else job.service_provider_id
         connection.execute(
             """
             UPDATE cst_transaction_ledger
-            SET retired_at = COALESCE(NULLIF(?, ''), retired_at), retired_reason = COALESCE(NULLIF(?, ''), retired_reason)
+            SET cidr = ?, resource_uuid = ?, service_provider_id = ?, last_status = ?,
+                retired_at = COALESCE(NULLIF(?, ''), retired_at), retired_reason = COALESCE(NULLIF(?, ''), retired_reason)
             WHERE transaction_id = ?
             """,
-            (retired_at, retired_reason, job.transaction_id),
+            (ledger_cidr, ledger_resource_uuid, ledger_service_provider_id, status, retired_at, retired_reason, job.transaction_id),
         )
         connection.execute(
             "UPDATE ip_resources SET cst_sync_status = ?, transaction_id = ?, action_flag = ?, updated_at = ? WHERE resource_uuid = ?",
@@ -5865,7 +5961,7 @@ def update_assignment_status(assignment_id: str, payload: StatusUpdate) -> Assig
         resource = sync_assignment_resource(connection, after)
         if payload.status == "Retiring":
             if cst_resource_reported_to_cst(connection, resource) and not cst_resource_deleted_from_cst(connection, resource):
-                create_cst_sync_jobs(connection, [(resource, "DELETE")], "ASSIGNMENT_RELEASE")
+                create_cst_sync_jobs(connection, [(cst_unassigned_update_resource(resource), "UPDATE")], "ASSIGNMENT_RELEASE")
             else:
                 connection.execute(
                     "UPDATE assignments SET cst_sync_status = ?, action_flag = ? WHERE id = ?",
@@ -5887,10 +5983,10 @@ def unassign(assignment_id: str) -> None:
     assignment = find_assignment(assignment_id)
     with connect() as connection:
         resource = find_resource_by_source(connection, "assignment", assignment_id)
-        cst_delete_required = cst_resource_reported_to_cst(connection, resource) and not cst_resource_deleted_from_cst(connection, resource)
+        cst_delete_required = cst_resource_reported_to_cst(connection, resource)
         if resource and resource.status == "RETIRED":
-            audit_action = "Retired Resource Deletion" if not cst_delete_required else "CST Assignment Removal"
-            audit_new_value = "Deleted retired resource" if not cst_delete_required else "Removed from CST and released locally"
+            audit_action = "Retired Resource Deletion" if not cst_delete_required else "CST Assignment Status Update"
+            audit_new_value = "Deleted retired resource" if not cst_delete_required else "Set CST LIR assignmentStatusId to 1 Unassigned and released locally"
         else:
             assert_resource_can_change(connection, "assignment", assignment_id)
             audit_action = "Subnet Release"
@@ -5899,20 +5995,20 @@ def unassign(assignment_id: str) -> None:
         if cst_delete_required:
             connection.execute(
                 "UPDATE assignments SET status = ?, action_flag = ? WHERE id = ?",
-                ("Retiring", "D", assignment_id),
+                ("Retiring", "U", assignment_id),
             )
             retiring_assignment = assignment_from_row(connection.execute("SELECT * FROM assignments WHERE id = ?", (assignment_id,)).fetchone())
             resource = sync_assignment_resource(connection, retiring_assignment)
-            jobs = create_cst_sync_jobs(connection, [(resource, "DELETE")], "ASSIGNMENT_UNASSIGN")
-            if cst_delete_succeeded(jobs):
-                audit_action = "CST Assignment Removal"
-                audit_new_value = "Removed from CST and released locally"
+            jobs = create_cst_sync_jobs(connection, [(cst_unassigned_update_resource(resource), "UPDATE")], "ASSIGNMENT_UNASSIGN")
+            if cst_jobs_succeeded(jobs, "UPDATE"):
+                audit_action = "CST Assignment Status Update"
+                audit_new_value = "Set CST LIR assignmentStatusId to 1 Unassigned and released locally"
             else:
                 failed = next((job for job in jobs if job.status != "SUCCESS"), None)
-                detail = failed.last_error if failed and failed.last_error else "CST DeleteLIRData queued for later retry"
-                record_audit(connection, "CST Assignment Removal Deferred", "assignment", assignment_id, assignment.model_dump_json(), detail)
+                detail = failed.last_error if failed and failed.last_error else "CST UpdateLIRData to Unassigned queued for later retry"
+                record_audit(connection, "CST Assignment Status Update Deferred", "assignment", assignment_id, assignment.model_dump_json(), detail)
                 audit_action = "Subnet Release"
-                audit_new_value = f"Released locally; CST DeleteLIRData deferred: {detail}"
+                audit_new_value = f"Released locally; CST UpdateLIRData to Unassigned deferred: {detail}"
 
         result = connection.execute("DELETE FROM assignments WHERE id = ?", (assignment_id,))
         if result.rowcount == 0:
