@@ -789,11 +789,11 @@ video {
 .max-w-md {
   max-width: 28rem;
 }
-.shrink-0 {
-  flex-shrink: 0;
-}
 .shrink {
   flex-shrink: 1;
+}
+.shrink-0 {
+  flex-shrink: 0;
 }
 .caption-bottom {
   caption-side: bottom;

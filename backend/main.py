@@ -2364,17 +2364,30 @@ def cst_transaction_id_for_resource(connection: sqlite3.Connection, resource: Re
     ).fetchone()
     if existing and not str(existing["retired_at"] or ""):
         return str(existing["transaction_id"])
-    if operation != "SEND" and str(resource.transaction_id or "").strip():
-        return str(resource.transaction_id).strip()
+    preferred_transaction_id = str(resource.transaction_id or "").strip()
+    if operation != "SEND" and preferred_transaction_id:
+        return preferred_transaction_id
 
     service_provider_id = resource.service_provider_id or DEFAULT_SERVICE_PROVIDER_ID
-    while True:
-        candidate = str(uuid4())
+    if operation == "SEND" and preferred_transaction_id:
         duplicate = connection.execute(
             "SELECT 1 FROM cst_transaction_ledger WHERE transaction_id = ?",
-            (candidate,),
+            (preferred_transaction_id,),
         ).fetchone()
         if duplicate is None:
+            candidate = preferred_transaction_id
+        else:
+            candidate = ""
+    else:
+        candidate = ""
+    while not candidate:
+        generated = str(uuid4())
+        duplicate = connection.execute(
+            "SELECT 1 FROM cst_transaction_ledger WHERE transaction_id = ?",
+            (generated,),
+        ).fetchone()
+        if duplicate is None:
+            candidate = generated
             break
     created_at = now_iso()
     connection.execute(
@@ -2534,6 +2547,11 @@ def cst_payload_for_resource(resource: ResourceRecord, operation: str, transacti
             "serviceProviderId": cst_int_value(service_provider_id, cst_int_value(DEFAULT_SERVICE_PROVIDER_ID, 1)),
             "data": [record],
         }
+    if operation == "DELETE":
+        return {
+            "serviceProviderId": cst_int_value(service_provider_id, cst_int_value(DEFAULT_SERVICE_PROVIDER_ID, 1)),
+            "data": [{"transactionId": transaction_id}],
+        }
     if operation == "GET":
         return {
             "serviceProviderId": cst_int_value(service_provider_id, cst_int_value(DEFAULT_SERVICE_PROVIDER_ID, 1)),
@@ -2571,6 +2589,18 @@ def cst_payload_for_resource(resource: ResourceRecord, operation: str, transacti
         "sourceEntityId": resource.source_entity_id,
     }
 
+
+
+def cst_delete_payload(transaction_id: str, service_provider_id: object = "") -> dict:
+    return {
+        "serviceProviderId": cst_int_value(service_provider_id or DEFAULT_SERVICE_PROVIDER_ID, cst_int_value(DEFAULT_SERVICE_PROVIDER_ID, 1)),
+        "data": [{"transactionId": transaction_id}],
+    }
+
+
+def cst_payload_has_data_array(payload: dict) -> bool:
+    data = payload.get("data") if isinstance(payload, dict) else None
+    return isinstance(data, list) and bool(data)
 
 
 def cst_payload_record(payload: dict) -> dict:
@@ -3100,25 +3130,132 @@ def create_cst_assignment_create_jobs(
     operations.append((assignment_resource, "SEND"))
     return create_cst_sync_jobs(connection, operations, workflow_type)
 
+def cst_exception_message(exc: Exception) -> str:
+    if isinstance(exc, HTTPException):
+        return str(exc.detail)
+    return str(exc)
+
+
+def queue_cst_sync_jobs_best_effort(
+    connection: sqlite3.Connection,
+    resource_operations: list[tuple[ResourceRecord, str]],
+    workflow_type: str,
+    audit_entity_type: str,
+    audit_entity_id: str,
+    old_value: str = "",
+) -> list[CstSyncJob]:
+    if not resource_operations:
+        return []
+    try:
+        return create_cst_sync_jobs(connection, resource_operations, workflow_type)
+    except Exception as exc:
+        message = cst_exception_message(exc)
+        record_audit(
+            connection,
+            "CST Sync Queue Deferred",
+            audit_entity_type,
+            audit_entity_id,
+            old_value,
+            json.dumps({"workflowType": workflow_type, "error": message, "operationCount": len(resource_operations)}),
+        )
+        return []
+
+
+def queue_cst_assignment_create_jobs_best_effort(
+    connection: sqlite3.Connection,
+    assignment: Assignment,
+    assignment_resource: ResourceRecord,
+    workflow_type: str,
+) -> list[CstSyncJob]:
+    try:
+        return create_cst_assignment_create_jobs(connection, assignment, assignment_resource, workflow_type)
+    except Exception as exc:
+        message = cst_exception_message(exc)
+        record_audit(
+            connection,
+            "CST Sync Queue Deferred",
+            "assignment",
+            assignment.id,
+            assignment.model_dump_json(),
+            json.dumps({"workflowType": workflow_type, "cidr": assignment.cidr, "error": message}),
+        )
+        connection.execute(
+            "UPDATE assignments SET cst_sync_status = ?, action_flag = ? WHERE id = ?",
+            ("PENDING", assignment.action_flag or "S", assignment.id),
+        )
+        connection.execute(
+            "UPDATE ip_resources SET cst_sync_status = ?, action_flag = ?, updated_at = ? WHERE resource_uuid = ?",
+            ("PENDING", assignment_resource.action_flag or "S", now_iso(), assignment_resource.resource_uuid),
+        )
+        return []
+
+
+def queue_partial_cst_jobs_best_effort(
+    connection: sqlite3.Connection,
+    operation_id: str,
+    workflow_type: str,
+    operations: list[tuple[str, ResourceRecord, str]],
+    old_value: str = "",
+) -> list[CstSyncJob]:
+    if not operations:
+        return []
+    try:
+        jobs = create_cst_sync_jobs(connection, [(resource, operation) for _kind, resource, operation in operations], workflow_type)
+    except Exception as exc:
+        message = cst_exception_message(exc)
+        record_audit(
+            connection,
+            "CST Partial Reassignment Queue Deferred",
+            "partial_reassignment",
+            operation_id,
+            old_value,
+            json.dumps({"workflowType": workflow_type, "error": message, "operationCount": len(operations)}),
+        )
+        return []
+    for (kind, resource, operation), job in zip(operations, jobs):
+        record_partial_fragment_job(connection, operation_id, kind, resource, operation, job)
+    return jobs
+
+
 def cst_waiting_for_prior_delete_message() -> str:
-    return "Waiting for earlier CST DeleteLIRData job in this batch to succeed before sending split child records"
+    return "Waiting for earlier CST operation in this batch to succeed before continuing dependent LIR changes"
+
+
+def cst_batch_requires_strict_sequence(connection: sqlite3.Connection, batch_id: str) -> bool:
+    row = connection.execute("SELECT workflow_type FROM cst_sync_batches WHERE id = ?", (batch_id,)).fetchone()
+    workflow_type = str(row["workflow_type"] or "") if row else ""
+    return workflow_type.startswith("PARTIAL_REASSIGNMENT")
 
 
 def cst_job_waiting_for_prior_delete(connection: sqlite3.Connection, job: CstSyncJob) -> bool:
-    if job.operation == "DELETE":
+    strict_sequence = cst_batch_requires_strict_sequence(connection, job.batch_id)
+    if not strict_sequence and job.operation == "DELETE":
         return False
-    row = connection.execute(
-        """
-        SELECT 1
-        FROM cst_sync_jobs
-        WHERE batch_id = ?
-          AND sequence_no < ?
-          AND operation = 'DELETE'
-          AND status != 'SUCCESS'
-        LIMIT 1
-        """,
-        (job.batch_id, job.sequence_no),
-    ).fetchone()
+    if strict_sequence:
+        row = connection.execute(
+            """
+            SELECT 1
+            FROM cst_sync_jobs
+            WHERE batch_id = ?
+              AND sequence_no < ?
+              AND status != 'SUCCESS'
+            LIMIT 1
+            """,
+            (job.batch_id, job.sequence_no),
+        ).fetchone()
+    else:
+        row = connection.execute(
+            """
+            SELECT 1
+            FROM cst_sync_jobs
+            WHERE batch_id = ?
+              AND sequence_no < ?
+              AND operation = 'DELETE'
+              AND status != 'SUCCESS'
+            LIMIT 1
+            """,
+            (job.batch_id, job.sequence_no),
+        ).fetchone()
     return row is not None
 
 def create_cst_sync_jobs(
@@ -3147,12 +3284,18 @@ def create_cst_sync_jobs(
 
     jobs: list[CstSyncJob] = []
     prior_delete_unresolved = False
+    strict_sequence = workflow_type.startswith("PARTIAL_REASSIGNMENT")
+    prior_sequence_unresolved = False
     for sequence_no, (resource, operation) in enumerate(eligible, start=1):
         transaction_id = cst_transaction_id_for_resource(connection, resource, operation, batch_id, correlation_id)
         payload = cst_payload_for_resource(resource, operation, transaction_id, correlation_id)
         validation_payload = payload if operation in {"SEND", "UPDATE"} else cst_payload_for_resource(resource, "SEND", transaction_id, correlation_id)
         quality_issues = [*cst_resource_integrity_issues(connection, resource), *cst_data_quality_issues(resource, operation, validation_payload)]
-        if prior_delete_unresolved and operation != "DELETE":
+        if prior_sequence_unresolved:
+            status = "PENDING"
+            last_error = cst_waiting_for_prior_delete_message()
+            response = {"temporaryStorage": True, "externalApiCalled": False, "accepted": False, "message": last_error}
+        elif prior_delete_unresolved and operation != "DELETE":
             status = "PENDING"
             last_error = cst_waiting_for_prior_delete_message()
             response = {"temporaryStorage": True, "externalApiCalled": False, "accepted": False, "message": last_error}
@@ -3237,6 +3380,8 @@ def create_cst_sync_jobs(
             )
         if operation == "DELETE" and status != "SUCCESS":
             prior_delete_unresolved = True
+        if strict_sequence and status != "SUCCESS":
+            prior_sequence_unresolved = True
         jobs.append(job)
 
     reconcile_cst_success_resource_statuses(connection)
@@ -3268,6 +3413,8 @@ def retry_cst_jobs(connection: sqlite3.Connection, job_rows: list[sqlite3.Row], 
             resource = cst_get_lir_page_resource(config, page_number)
         updated_at = now_iso()
         payload = cst_payload_for_resource(resource, job.operation, job.transaction_id, job.batch_id) if resource else stored_payload
+        if job.operation == "DELETE" and not cst_payload_has_data_array(payload):
+            payload = cst_delete_payload(job.transaction_id, stored_payload.get("serviceProviderId") if isinstance(stored_payload, dict) else DEFAULT_SERVICE_PROVIDER_ID)
         validation_payload = cst_payload_for_resource(resource, "SEND", job.transaction_id, job.batch_id) if resource and job.operation not in {"SEND", "UPDATE", "GET"} else payload
         quality_issues = [*cst_resource_integrity_issues(connection, resource), *(cst_data_quality_issues(resource, job.operation, validation_payload) if resource else [])]
         retry_without_resource = resource is None and job.operation in {"DELETE", "UPDATE", "SEND"} and bool(payload)
@@ -6913,6 +7060,70 @@ def partial_non_success_fragments_for_resource(connection: sqlite3.Connection, o
     ).fetchall()
 
 
+def partial_reassignment_mode(original_network: IPv4Network, requested_network: IPv4Network, affected_resources: list[ResourceRecord]) -> str:
+    if requested_network.subnet_of(original_network):
+        return "SHRINK"
+    return "EXPAND_REPLACE" if affected_resources else "EXPAND_APPEND"
+
+
+def adjacent_expansion_fragments(original_network: IPv4Network, requested_network: IPv4Network) -> list[IPv4Network]:
+    if not original_network.subnet_of(requested_network):
+        return []
+    fragments = network_difference(requested_network, original_network)
+    if not fragments:
+        return []
+    original_start = int(original_network.network_address)
+    original_end = int(original_network.broadcast_address)
+    for fragment in fragments:
+        fragment_start = int(fragment.network_address)
+        fragment_end = int(fragment.broadcast_address)
+        if fragment_end + 1 == original_start or fragment_start == original_end + 1:
+            continue
+        raise HTTPException(status_code=409, detail=f"Expansion range {fragment} is not adjacent to original assignment {original_network}")
+    return fragments
+
+
+def partial_assigned_networks_for_mode(original_network: IPv4Network, requested_network: IPv4Network, mode: str) -> list[IPv4Network]:
+    if mode == "EXPAND_APPEND":
+        return adjacent_expansion_fragments(original_network, requested_network)
+    return [requested_network]
+
+
+def partial_find_cst_affected_resources(
+    connection: sqlite3.Connection,
+    original_resource: ResourceRecord,
+    original_network: IPv4Network,
+    requested_network: IPv4Network,
+) -> list[ResourceRecord]:
+    expansion_networks = network_difference(requested_network, original_network)
+    if not expansion_networks:
+        return []
+    rows = connection.execute(
+        """
+        SELECT *
+        FROM ip_resources
+        WHERE ip_type = 'PUBLIC'
+          AND status != 'RETIRED'
+          AND resource_uuid != ?
+        ORDER BY prefix ASC, start_ip ASC
+        """,
+        (original_resource.resource_uuid,),
+    ).fetchall()
+    resources: list[ResourceRecord] = []
+    seen: set[str] = set()
+    for row in rows:
+        resource = resource_from_row(row)
+        if resource.resource_uuid in seen or not cst_resource_reported_to_cst(connection, resource):
+            continue
+        if normalize_assignment_status_id(resource.assignment_status_id, None) != 1:
+            continue
+        resource_network = normalize_network(resource.cidr)
+        if any(resource_network.overlaps(fragment) for fragment in expansion_networks):
+            resources.append(resource)
+            seen.add(resource.resource_uuid)
+    return resources
+
+
 def partial_cst_unassigned_delete_resources(
     connection: sqlite3.Connection,
     original_resource: ResourceRecord,
@@ -6970,11 +7181,15 @@ def validate_partial_reassignment_scope(
 ) -> None:
     if requested_network == original_network:
         raise HTTPException(status_code=400, detail="Partial reassignment requires a different CIDR than the current assignment")
-    if not (requested_network.subnet_of(original_network) or original_network.subnet_of(requested_network)):
+    is_shrink = requested_network.subnet_of(original_network)
+    is_expansion = original_network.subnet_of(requested_network)
+    if not (is_shrink or is_expansion):
         raise HTTPException(
             status_code=409,
             detail=f"{requested_network} must either shrink within or expand around original assignment {original_assignment.cidr}",
         )
+    if is_expansion:
+        adjacent_expansion_fragments(original_network, requested_network)
     parent = root_pool_for_network(original_network, connection)
     if parent is None:
         raise HTTPException(status_code=409, detail=f"Original assignment {original_assignment.cidr} is outside managed parent pools")
@@ -7107,6 +7322,116 @@ def partial_assignment_payload(operation_row: sqlite3.Row) -> AssignmentCreate:
     return AssignmentCreate.model_validate(json.loads(str(operation_row["assigned_payload_json"] or "{}")))
 
 
+def upsert_partial_unassigned_fragments_from_jobs(
+    connection: sqlite3.Connection,
+    operation_id: str,
+    original_resource: ResourceRecord,
+) -> list[ResourceRecord]:
+    rows = connection.execute(
+        """
+        SELECT *
+        FROM partial_reassignment_fragments
+        WHERE operation_id = ?
+          AND kind = 'UNASSIGNED'
+        ORDER BY cidr
+        """,
+        (operation_id,),
+    ).fetchall()
+    resources: list[ResourceRecord] = []
+    for row in rows:
+        fragment_network = normalize_network(str(row["cidr"]))
+        status = str(row["status"] or "PENDING")
+        resource = partial_resource_from_network(original_resource, fragment_network, operation_id, "UNASSIGNED").model_copy(update={
+            "resource_uuid": str(row["resource_uuid"]),
+            "transaction_id": str(row["transaction_id"]),
+            "cst_sync_status": status,
+            "action_flag": "S" if status == "SUCCESS" else "U",
+            "cst_sync_ready": True,
+            "cst_validation_status": "READY",
+        })
+        upsert_resource_record(connection, resource)
+        resources.append(resource)
+    return resources
+
+
+def complete_partial_reassignment_locally(
+    connection: sqlite3.Connection,
+    operation_id: str,
+    original_assignment: Assignment,
+    original_resource: ResourceRecord,
+    requested_network: IPv4Network,
+    assigned_transaction_id: str,
+    replaced_unassigned_resources: list[ResourceRecord],
+    local_cst_sync_status: str = "PENDING",
+    rebind_cst_transaction: bool = True,
+) -> Assignment:
+    op = connection.execute("SELECT * FROM partial_reassignment_operations WHERE id = ?", (operation_id,)).fetchone()
+    if op is None:
+        raise HTTPException(status_code=404, detail="Partial reassignment operation not found")
+    payload = partial_assignment_payload(op)
+    payload.logical_resource_id = assigned_transaction_id
+    payload.cst_sync_status = local_cst_sync_status if resource_requires_cst(original_resource) else "NOT_REQUIRED"
+    payload.action_flag = "S"
+    assignment = assignment_from_network(requested_network, payload)
+    insert_assignment(connection, assignment)
+    resource = sync_assignment_resource(connection, assignment)
+    if rebind_cst_transaction:
+        connection.execute(
+            """
+            UPDATE cst_transaction_ledger
+            SET resource_uuid = ?, cidr = ?
+            WHERE transaction_id = ?
+            """,
+            (resource.resource_uuid, resource.cidr, assigned_transaction_id),
+        )
+        connection.execute(
+            """
+            UPDATE cst_sync_jobs
+            SET resource_uuid = ?, cidr = ?
+            WHERE transaction_id = ?
+            """,
+            (resource.resource_uuid, resource.cidr, assigned_transaction_id),
+        )
+        connection.execute(
+            """
+            UPDATE partial_reassignment_fragments
+            SET resource_uuid = ?, updated_at = ?
+            WHERE operation_id = ? AND kind = 'ASSIGNED'
+            """,
+            (resource.resource_uuid, now_iso(), operation_id),
+        )
+    unassigned_resources = upsert_partial_unassigned_fragments_from_jobs(connection, operation_id, original_resource)
+    connection.execute("DELETE FROM assignments WHERE id = ?", (original_assignment.id,))
+    connection.execute("DELETE FROM assignment_details WHERE resource_uuid = ?", (original_resource.resource_uuid,))
+    connection.execute("DELETE FROM ip_resources WHERE resource_uuid = ?", (original_resource.resource_uuid,))
+    delete_replaced_partial_unassigned_resources(connection, replaced_unassigned_resources)
+    materialize_bulk_unassigned_fragments(connection)
+    completion_message = "Partial reassignment completed after required CST transactions succeeded" if local_cst_sync_status == "SUCCESS" else "Local partial reassignment completed; CST synchronization was not required"
+    set_partial_operation_status(
+        connection,
+        operation_id,
+        "COMPLETED",
+        completion_message,
+        completed=True,
+    )
+    record_audit(
+        connection,
+        "Partial LIR Reassignment Completed",
+        "partial_reassignment",
+        operation_id,
+        original_assignment.model_dump_json(),
+        json.dumps({
+            "newAssignmentId": assignment.id,
+            "resourceUuid": resource.resource_uuid,
+            "requestedCidr": assignment.cidr,
+            "assignedTransactionId": assigned_transaction_id,
+            "unassignedFragments": [item.cidr for item in unassigned_resources],
+            "deletedExpansionResources": [item.cidr for item in replaced_unassigned_resources],
+        }),
+    )
+    return assignment
+
+
 def finalize_partial_reassignment(connection: sqlite3.Connection, operation_id: str) -> None:
     op = connection.execute("SELECT * FROM partial_reassignment_operations WHERE id = ?", (operation_id,)).fetchone()
     if op is None:
@@ -7192,6 +7517,58 @@ def finalize_partial_reassignment(connection: sqlite3.Connection, operation_id: 
     )
 
 
+def partial_assigned_resource_for_network(
+    connection: sqlite3.Connection,
+    operation_id: str,
+    network: IPv4Network,
+    payload: AssignmentCreate,
+    original_resource: ResourceRecord,
+    transaction_id: str = "",
+) -> ResourceRecord:
+    assignment_payload = payload.model_copy(update={
+        "cidr": str(network),
+        "logical_resource_id": transaction_id or str(uuid4()),
+        "cst_sync_status": "PENDING",
+        "action_flag": "S",
+    })
+    assignment = assignment_from_network(network, assignment_payload)
+    return resource_record_for_assignment(assignment, connection=connection).model_copy(update={
+        "transaction_id": assignment_payload.logical_resource_id,
+        "ip_type": original_resource.ip_type,
+        "root_pool_uuid": original_resource.root_pool_uuid,
+        "parent_resource_uuid": original_resource.parent_resource_uuid,
+        "parent_version_uuid": original_resource.parent_version_uuid,
+    })
+
+
+def partial_ensure_fragment_job(
+    connection: sqlite3.Connection,
+    operation_id: str,
+    kind: str,
+    resource: ResourceRecord,
+    cst_operation: str,
+) -> list[CstSyncJob]:
+    row = connection.execute(
+        """
+        SELECT *
+        FROM partial_reassignment_fragments
+        WHERE operation_id = ?
+          AND kind = ?
+          AND cidr = ?
+          AND cst_operation = ?
+          AND resource_uuid = ?
+        ORDER BY created_at, id
+        LIMIT 1
+        """,
+        (operation_id, kind, resource.cidr, cst_operation, resource.resource_uuid),
+    ).fetchone()
+    if row is None:
+        return [create_partial_cst_job(connection, operation_id, kind, resource, cst_operation)]
+    if str(row["status"] or "") == "SUCCESS":
+        return []
+    return [retry_partial_fragment_job(connection, row)]
+
+
 def continue_partial_reassignment(connection: sqlite3.Connection, operation_id: str) -> PartialReassignmentResult:
     op = connection.execute("SELECT * FROM partial_reassignment_operations WHERE id = ?", (operation_id,)).fetchone()
     if op is None:
@@ -7217,108 +7594,142 @@ def continue_partial_reassignment(connection: sqlite3.Connection, operation_id: 
     except HTTPException as exc:
         set_partial_operation_status(connection, operation_id, "LOCAL_CONFLICT", str(exc.detail))
         return partial_result_from_db(connection, operation_id, jobs)
-    expansion_delete_resources = partial_cst_unassigned_delete_resources(connection, original_resource, original_network, requested_network)
 
-    original_status_id = normalize_assignment_status_id(original_assignment.assignment_status_id, original_assignment)
-    if original_status_id != 1 and not partial_fragment_success(connection, operation_id, "ORIGINAL_UPDATE_UNASSIGNED"):
-        pending = partial_non_success_fragments(connection, operation_id, {"ORIGINAL_UPDATE_UNASSIGNED"})
-        if pending:
-            jobs.extend(retry_partial_fragment_job(connection, row) for row in pending)
-        else:
-            jobs.append(create_partial_cst_job(connection, operation_id, "ORIGINAL_UPDATE_UNASSIGNED", cst_unassigned_update_resource(original_resource), "UPDATE"))
-        if not partial_fragment_success(connection, operation_id, "ORIGINAL_UPDATE_UNASSIGNED"):
-            status = "PENDING" if any(job.status == "PENDING" for job in jobs) else "FAILED"
-            set_partial_operation_status(connection, operation_id, status, "Original CST record has not yet been updated to Unassigned")
-            return partial_result_from_db(connection, operation_id, jobs)
+    payload = partial_assignment_payload(op)
+    affected_resources = partial_find_cst_affected_resources(connection, original_resource, original_network, requested_network)
+    mode = partial_reassignment_mode(original_network, requested_network, affected_resources)
+    original_reported_to_cst = cst_resource_reported_to_cst(connection, original_resource)
+    cst_required = original_resource.ip_type == "PUBLIC" and (original_reported_to_cst or bool(affected_resources))
 
-    if not partial_fragment_success(connection, operation_id, "ORIGINAL_DELETE"):
-        pending = partial_non_success_fragments(connection, operation_id, {"ORIGINAL_DELETE"})
-        if pending:
-            jobs.extend(retry_partial_fragment_job(connection, row) for row in pending)
-        else:
-            jobs.append(create_partial_cst_job(connection, operation_id, "ORIGINAL_DELETE", original_resource, "DELETE"))
-        if not partial_fragment_success(connection, operation_id, "ORIGINAL_DELETE"):
-            status = "PENDING" if any(job.status == "PENDING" for job in jobs) else "FAILED"
-            set_partial_operation_status(connection, operation_id, status, "Original CST record has not yet been deleted")
-            return partial_result_from_db(connection, operation_id, jobs)
+    if not cst_required:
+        assigned_transaction_id = str(op["assigned_transaction_id"] or "") or str(uuid4())
+        connection.execute("UPDATE partial_reassignment_operations SET assigned_transaction_id = ? WHERE id = ?", (assigned_transaction_id, operation_id))
+        complete_partial_reassignment_locally(
+            connection,
+            operation_id,
+            original_assignment,
+            original_resource,
+            requested_network,
+            assigned_transaction_id,
+            [],
+            "NOT_REQUIRED",
+        )
+        return partial_result_from_db(connection, operation_id, jobs)
 
-    for delete_resource in expansion_delete_resources:
-        if partial_fragment_success_for_resource(connection, operation_id, "EXPANSION_DELETE", delete_resource.resource_uuid):
-            continue
-        pending = partial_non_success_fragments_for_resource(connection, operation_id, "EXPANSION_DELETE", delete_resource.resource_uuid)
-        if pending:
-            jobs.extend(retry_partial_fragment_job(connection, row) for row in pending)
-        else:
-            jobs.append(create_partial_cst_job(connection, operation_id, "EXPANSION_DELETE", delete_resource, "DELETE"))
+    delete_resources: list[tuple[str, ResourceRecord]] = []
+    if mode == "SHRINK" and original_reported_to_cst:
+        delete_resources.append(("ORIGINAL_DELETE", original_resource))
+    elif mode == "EXPAND_REPLACE":
+        delete_resources.extend(("EXPANSION_DELETE", resource) for resource in affected_resources)
 
-    unresolved_expansion_deletes = [
-        resource for resource in expansion_delete_resources
-        if not partial_fragment_success_for_resource(connection, operation_id, "EXPANSION_DELETE", resource.resource_uuid)
+    for kind, resource in delete_resources:
+        jobs.extend(partial_ensure_fragment_job(connection, operation_id, kind, resource, "DELETE"))
+
+    unresolved_deletes = [
+        resource for kind, resource in delete_resources
+        if not partial_fragment_success_for_resource(connection, operation_id, kind, resource.resource_uuid)
     ]
-    if unresolved_expansion_deletes:
+    if unresolved_deletes:
         status = "PENDING" if any(job.status == "PENDING" for job in jobs) else "FAILED"
         set_partial_operation_status(
             connection,
             operation_id,
             status,
-            f"{len(unresolved_expansion_deletes)} CST unassigned expansion record(s) must be deleted before sending revised fragments",
+            f"{len(unresolved_deletes)} CST DeleteLIRData operation(s) must succeed before local partial reassignment is committed",
         )
         return partial_result_from_db(connection, operation_id, jobs)
 
-    payload = partial_assignment_payload(op)
-    assigned_assignment = assignment_from_network(requested_network, payload)
-    assigned_resource = resource_record_for_assignment(assigned_assignment, connection=connection).model_copy(update={
-        "ip_type": original_resource.ip_type,
-        "root_pool_uuid": original_resource.root_pool_uuid,
-    })
-    if not partial_fragment_success(connection, operation_id, "ASSIGNED") and not connection.execute(
-        "SELECT 1 FROM partial_reassignment_fragments WHERE operation_id = ? AND kind = 'ASSIGNED' LIMIT 1",
-        (operation_id,),
-    ).fetchone():
-        jobs.append(create_partial_cst_job(connection, operation_id, "ASSIGNED", assigned_resource, "SEND"))
-        connection.execute("UPDATE partial_reassignment_operations SET assigned_transaction_id = ? WHERE id = ?", (jobs[-1].transaction_id, operation_id))
-
-    for fragment_network in partial_unassigned_networks_after_reassignment(original_network, requested_network, expansion_delete_resources):
-        cidr = str(fragment_network)
-        exists = connection.execute(
-            "SELECT 1 FROM partial_reassignment_fragments WHERE operation_id = ? AND kind = 'UNASSIGNED' AND cidr = ? LIMIT 1",
-            (operation_id, cidr),
+    assigned_networks = partial_assigned_networks_for_mode(original_network, requested_network, mode)
+    for index, assigned_network in enumerate(assigned_networks, start=1):
+        existing_fragment = connection.execute(
+            """
+            SELECT transaction_id
+            FROM partial_reassignment_fragments
+            WHERE operation_id = ?
+              AND kind = 'ASSIGNED'
+              AND cidr = ?
+            LIMIT 1
+            """,
+            (operation_id, str(assigned_network)),
         ).fetchone()
-        if exists:
-            continue
-        fragment_resource = partial_resource_from_network(original_resource, fragment_network, operation_id, "UNASSIGNED")
-        jobs.append(create_partial_cst_job(connection, operation_id, "UNASSIGNED", fragment_resource, "SEND"))
+        transaction_id = str(existing_fragment["transaction_id"]) if existing_fragment else (str(op["assigned_transaction_id"] or "") if index == 1 else "")
+        assigned_resource = partial_assigned_resource_for_network(connection, operation_id, assigned_network, payload, original_resource, transaction_id)
+        jobs.extend(partial_ensure_fragment_job(connection, operation_id, "ASSIGNED", assigned_resource, "SEND"))
+        if index == 1:
+            connection.execute(
+                "UPDATE partial_reassignment_operations SET assigned_transaction_id = ? WHERE id = ?",
+                (assigned_resource.transaction_id, operation_id),
+            )
 
-    for row in partial_non_success_fragments(connection, operation_id, {"ASSIGNED", "UNASSIGNED"}):
-        jobs.append(retry_partial_fragment_job(connection, row))
+    unassigned_networks: list[IPv4Network] = []
+    if mode == "SHRINK":
+        unassigned_networks = network_difference(original_network, requested_network)
+    elif mode == "EXPAND_REPLACE":
+        for resource in affected_resources:
+            resource_network = normalize_network(resource.cidr)
+            assigned_inside_resource = [network for network in assigned_networks if network.overlaps(resource_network)]
+            unassigned_networks.extend(subtract_allocated_networks(resource_network, assigned_inside_resource))
+        unassigned_networks = normalize_network_list(unassigned_networks)
+
+    for fragment_network in unassigned_networks:
+        fragment_resource = partial_resource_from_network(original_resource, fragment_network, operation_id, "UNASSIGNED")
+        jobs.extend(partial_ensure_fragment_job(connection, operation_id, "UNASSIGNED", fragment_resource, "SEND"))
 
     remaining = partial_non_success_fragments(connection, operation_id)
     if remaining:
-        status = "PARTIAL" if partial_fragment_success(connection, operation_id, "ORIGINAL_DELETE") else "FAILED"
-        message = f"{len(remaining)} CST fragment operation(s) still require retry"
-        set_partial_operation_status(connection, operation_id, status, message)
+        status = "PENDING" if any(str(row["status"] or "") == "PENDING" for row in remaining) else "FAILED"
+        set_partial_operation_status(
+            connection,
+            operation_id,
+            status,
+            f"{len(remaining)} CST transaction(s) must succeed before local partial reassignment is committed",
+        )
         return partial_result_from_db(connection, operation_id, jobs)
 
-    finalize_partial_reassignment(connection, operation_id)
+    assigned_transaction_id = str(op["assigned_transaction_id"] or "")
+    if not assigned_transaction_id:
+        row = connection.execute(
+            "SELECT transaction_id FROM partial_reassignment_fragments WHERE operation_id = ? AND kind = 'ASSIGNED' ORDER BY created_at, id LIMIT 1",
+            (operation_id,),
+        ).fetchone()
+        assigned_transaction_id = str(row["transaction_id"] if row else uuid4())
+    local_transaction_id = str(op["original_transaction_id"] or original_resource.transaction_id or assigned_transaction_id) if mode.startswith("EXPAND") else assigned_transaction_id
+    complete_partial_reassignment_locally(
+        connection,
+        operation_id,
+        original_assignment,
+        original_resource,
+        requested_network,
+        local_transaction_id,
+        affected_resources if mode == "EXPAND_REPLACE" else [],
+        "SUCCESS",
+        not mode.startswith("EXPAND"),
+    )
     return partial_result_from_db(connection, operation_id, jobs)
+
 
 @app.post("/assignments/{assignment_id}/partial-reassign", response_model=PartialReassignmentResult, status_code=202)
 def partial_reassign_assignment(assignment_id: str, payload: PartialReassignmentRequest) -> PartialReassignmentResult:
     original = find_assignment(assignment_id)
     original_network = network_of(original)
     requested_network = normalize_network(payload.cidr)
+    if str(payload.cidr or "").strip() != str(requested_network):
+        raise HTTPException(status_code=400, detail=f"{payload.cidr} is not CIDR-aligned. Choose {requested_network} or a valid boundary.")
 
     payload.assignment_status_id = normalize_assignment_status_id(payload.assignment_status_id, payload)
-    validate_cst_lir_assignment(payload)
     operation_id = f"partial-reassign-{uuid4().hex[:12]}"
     with connect() as connection:
         validate_partial_reassignment_scope(connection, original, original_network, requested_network)
         original_resource = find_resource_by_source(connection, "assignment", assignment_id)
         if original_resource is None:
             raise HTTPException(status_code=404, detail="Original assignment resource not found")
-        if original_resource.ip_type != "PUBLIC":
-            raise HTTPException(status_code=409, detail="Partial LIR reassignment requires a public CST-reported resource")
-        original_transaction_id = cst_active_transaction_for_resource(connection, original_resource)
+
+        original_transaction_id = ""
+        if cst_resource_reported_to_cst(connection, original_resource):
+            original_transaction_id = cst_active_transaction_for_resource(connection, original_resource)
+        else:
+            original_transaction_id = str(original_resource.transaction_id or "").strip()
+
         timestamp = now_iso()
         connection.execute(
             """
@@ -7355,7 +7766,15 @@ def partial_reassign_assignment(assignment_id: str, payload: PartialReassignment
 @app.post("/assignments/partial-reassign/{operation_id}/retry", response_model=PartialReassignmentResult)
 def retry_partial_reassignment(operation_id: str) -> PartialReassignmentResult:
     with connect() as connection:
-        result = continue_partial_reassignment(connection, operation_id)
+        op = connection.execute("SELECT * FROM partial_reassignment_operations WHERE id = ?", (operation_id,)).fetchone()
+        if op is None:
+            raise HTTPException(status_code=404, detail="Partial reassignment operation not found")
+        jobs: list[CstSyncJob] = []
+        if str(op["status"] or "") == "COMPLETED":
+            jobs = [retry_partial_fragment_job(connection, row) for row in partial_non_success_fragments(connection, operation_id)]
+            result = partial_result_from_db(connection, operation_id, jobs)
+        else:
+            result = continue_partial_reassignment(connection, operation_id)
         record_audit(
             connection,
             "Partial LIR Reassignment Retry",
@@ -7369,14 +7788,14 @@ def retry_partial_reassignment(operation_id: str) -> PartialReassignmentResult:
 @app.post("/assignments", response_model=Assignment, status_code=201)
 def add_assignment(payload: AssignmentCreate) -> Assignment:
     network = normalize_network(payload.cidr)
-    validate_cst_lir_assignment(payload)
+    payload.assignment_status_id = normalize_assignment_status_id(payload.assignment_status_id, payload)
     validate_assignment(network)
     assignment = assignment_from_network(network, payload)
     with connect() as connection:
         insert_assignment(connection, assignment)
         resource = sync_assignment_resource(connection, assignment)
         if resource_requires_cst(resource):
-            create_cst_assignment_create_jobs(connection, assignment, resource, "ASSIGNMENT_CREATE")
+            queue_cst_assignment_create_jobs_best_effort(connection, assignment, resource, "ASSIGNMENT_CREATE")
         record_audit(connection, "Subnet Allocation", "assignment", assignment.id, "", assignment.model_dump_json())
     return assignment
 
@@ -7597,7 +8016,7 @@ def update_assignment_status(assignment_id: str, payload: StatusUpdate) -> Assig
         resource = sync_assignment_resource(connection, after)
         if payload.status == "Retiring":
             if cst_resource_reported_to_cst(connection, resource) and not cst_resource_deleted_from_cst(connection, resource):
-                create_cst_sync_jobs(connection, [(cst_unassigned_update_resource(resource), "UPDATE")], "ASSIGNMENT_RELEASE")
+                queue_cst_sync_jobs_best_effort(connection, [(cst_unassigned_update_resource(resource), "UPDATE")], "ASSIGNMENT_RELEASE", "assignment", assignment_id, before.model_dump_json())
             else:
                 connection.execute(
                     "UPDATE assignments SET cst_sync_status = ?, action_flag = ? WHERE id = ?",
@@ -7608,7 +8027,7 @@ def update_assignment_status(assignment_id: str, payload: StatusUpdate) -> Assig
                     ("NOT_REQUIRED", before.action_flag or "D", now_iso(), resource.resource_uuid),
                 )
         elif resource_requires_cst(resource) and str(after.cst_sync_status or "").upper() != "SUCCESS":
-            create_cst_sync_jobs(connection, [(resource, "UPDATE")], "ASSIGNMENT_STATUS_CHANGE")
+            queue_cst_sync_jobs_best_effort(connection, [(resource, "UPDATE")], "ASSIGNMENT_STATUS_CHANGE", "assignment", assignment_id, before.model_dump_json())
         after = assignment_from_row(connection.execute("SELECT * FROM assignments WHERE id = ?", (assignment_id,)).fetchone())
         record_audit(connection, "Assignment Changes", "assignment", assignment_id, before.model_dump_json(), after.model_dump_json())
     return after
@@ -7635,7 +8054,7 @@ def unassign(assignment_id: str) -> None:
             )
             retiring_assignment = assignment_from_row(connection.execute("SELECT * FROM assignments WHERE id = ?", (assignment_id,)).fetchone())
             resource = sync_assignment_resource(connection, retiring_assignment)
-            jobs = create_cst_sync_jobs(connection, [(cst_unassigned_update_resource(resource), "UPDATE")], "ASSIGNMENT_UNASSIGN")
+            jobs = queue_cst_sync_jobs_best_effort(connection, [(cst_unassigned_update_resource(resource), "UPDATE")], "ASSIGNMENT_UNASSIGN", "assignment", assignment_id, assignment.model_dump_json())
             if cst_jobs_succeeded(jobs, "UPDATE"):
                 audit_action = "CST Assignment Status Update"
                 audit_new_value = "Set CST LIR assignmentStatusId to 1 Unassigned and released locally"
