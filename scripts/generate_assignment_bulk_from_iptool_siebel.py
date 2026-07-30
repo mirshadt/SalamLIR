@@ -217,6 +217,129 @@ def map_lookup(mapping: dict[str, str], value: str) -> str:
     return mapping.get(normalized_header(value), "") if value else ""
 
 
+CST_REGION_BY_NAME = {
+    "riyadh": "1",
+    "riyadhregion": "1",
+    "qassim": "2",
+    "makkah": "3",
+    "makkahregion": "3",
+    "almadinah": "4",
+    "madinah": "4",
+    "madinahregion": "4",
+    "easternregion": "5",
+    "easternprovince": "5",
+    "aljouf": "6",
+    "jouf": "6",
+    "tabuk": "7",
+    "northernborder": "8",
+    "thenorthernborder": "8",
+    "hail": "9",
+    "asir": "10",
+    "najran": "11",
+    "baha": "12",
+    "jazan": "13",
+    "jizan": "13",
+    "central": "14",
+    "centralregion": "14",
+    "western": "15",
+    "westernregion": "15",
+    "eastern": "16",
+    "east": "16",
+}
+
+CST_CITY_BY_NAME = {
+    "riyadh": "41",
+    "alriyadh": "41",
+    "makkah": "11",
+    "mecca": "11",
+    "jeddah": "65",
+    "madinah": "54",
+    "medina": "54",
+    "almadinah": "54",
+    "dammam": "61",
+    "khobar": "95",
+    "alkhobar": "95",
+    "dhahran": "154",
+    "aldhahran": "154",
+    "jubail": "37",
+    "aljubail": "37",
+    "qatif": "70",
+    "qateef": "70",
+    "ahsa": "56",
+    "alhasa": "56",
+    "hasa": "56",
+    "buraidah": "40",
+    "buraydah": "40",
+    "hail": "2",
+    "haiel": "2",
+    "khamismushait": "45",
+    "khamiesmushait": "45",
+    "najran": "78",
+    "abha": "83",
+    "tabuk": "16",
+    "jazan": "20",
+    "jizan": "20",
+    "sakaka": "10",
+    "arar": "112",
+    "hafralbatin": "81",
+    "yanbu": "6",
+    "taif": "13",
+    "taief": "13",
+    "algurayat": "5",
+    "alqurayat": "5",
+    "qurayat": "5",
+    "gurayat": "5",
+}
+
+CST_CITY_REGION_BY_ID = {
+    "41": "1",
+    "11": "3",
+    "65": "3",
+    "54": "4",
+    "61": "5",
+    "95": "5",
+    "154": "10",
+    "37": "5",
+    "70": "5",
+    "56": "5",
+    "40": "2",
+    "2": "9",
+    "45": "10",
+    "78": "11",
+    "83": "10",
+    "16": "7",
+    "20": "13",
+    "10": "6",
+    "112": "8",
+    "81": "5",
+    "6": "4",
+    "13": "3",
+    "5": "6",
+}
+
+
+def lookup_builtin(mapping: dict[str, str], value: str) -> str:
+    key = normalized_header(value)
+    if not key:
+        return ""
+    if key.isdigit():
+        return key
+    return mapping.get(key, "")
+
+
+def resolve_region_id(region_text: str, city_id: str, region_map: dict[str, str], default_region_id: str) -> str:
+    return (
+        map_lookup(region_map, region_text)
+        or lookup_builtin(CST_REGION_BY_NAME, region_text)
+        or CST_CITY_REGION_BY_ID.get(city_id, "")
+        or default_region_id
+    )
+
+
+def resolve_city_id(city_text: str, city_map: dict[str, str], default_city_id: str) -> str:
+    return map_lookup(city_map, city_text) or lookup_builtin(CST_CITY_BY_NAME, city_text) or default_city_id or "1"
+
+
 def siebel_score(row: dict[str, str]) -> int:
     score = 0
     product = row_get(row, "PRODUCT_NAME")
@@ -282,7 +405,10 @@ def make_bulk_row(
 
     email = normalized_email(row_get(siebel, "CON_EMAIL")) or normalized_email(row_get(siebel, "MAIN_EMAIL_ADDR"))
     customer_name = row_get(siebel, "ACCOUNT_NAME") or row_get(iptool, "CustomerName", "Customer Name")
-    org_id = organization_identifier(siebel, iptool)
+    customer_id = row_get(siebel, "ACCOUNT_NUMBER") or row_get(iptool, "CustomerNumber", "Customer Number")
+    org_id = organization_identifier(siebel, iptool) or customer_id
+    if org_id == customer_id:
+        warnings.append("organizationId/commercialRegId/unifiedNumber missing; customerId was used as organizationId for CST upload")
     commercial_reg = valid_10_digit(row_get(siebel, "X_ITC_B2B_COMMERCIAL_REGIS_NUM"))
     unified = valid_10_digit(row_get(siebel, "X_ITC_B2B_UNIFIED_NUMBER"))
     region_text = row_get(siebel, "ACCOUNT_REGION") or row_get(iptool, "region", "Region")
@@ -291,14 +417,8 @@ def make_bulk_row(
     service_description = row_get(siebel, "PRODUCT_NAME") or row_get(iptool, "Product Type", "ProductClass")
     site = row_get(siebel, "ADDR_NAME") or row_get(iptool, "ShipToAddress")
     name = contact_name(siebel)
-
-    notes_parts = []
-    for column in IPTOOL_NOTE_COLUMNS:
-        value = row_get(iptool, column)
-        if value:
-            notes_parts.append(f"{column}={value}")
-    if warnings:
-        notes_parts.append("warnings=" + " | ".join(warnings))
+    city_id = resolve_city_id(city_text, city_map, args.city_id)
+    region_id = resolve_region_id(region_text, city_id, region_map, args.region_id)
 
     return {
         "assignmentType": "BUSINESS",
@@ -314,8 +434,8 @@ def make_bulk_row(
         "commercialRegId": commercial_reg,
         "unifiedNumber": unified,
         "customerTypeId": args.customer_type_id,
-        "regionId": map_lookup(region_map, region_text) or args.region_id,
-        "cityId": map_lookup(city_map, city_text) or args.city_id,
+        "regionId": region_id,
+        "cityId": city_id,
         "fullName": name,
         "mobileNumber": phone,
         "idNumber": digits_only(row_get(siebel, "CONTACT_ID_NUM")) or args.default_id_number,
@@ -323,7 +443,7 @@ def make_bulk_row(
         "contactName": name,
         "contactNumber": main_phone or phone,
         "contactEmail": email,
-        "customerId": row_get(siebel, "ACCOUNT_NUMBER") or row_get(iptool, "CustomerNumber", "Customer Number"),
+        "customerId": customer_id,
         "serviceId": service_id,
         "serviceDescription": service_description,
         "accessTechnologyId": args.access_technology_id,
@@ -332,7 +452,7 @@ def make_bulk_row(
         "site": site,
         "city": city_text,
         "region": region_text,
-        "notes": "; ".join(notes_parts),
+        "notes": ""
     }
 
 
@@ -361,7 +481,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--assignment-status", default="3", help="CST LIRAssignmentStatusId. Default 3 Business")
     parser.add_argument("--customer-type-id", default="2")
     parser.add_argument("--region-id", default="", help="Default CST regionId if no region map match")
-    parser.add_argument("--city-id", default="", help="Default CST cityId if no city map match")
+    parser.add_argument("--city-id", default="1", help="Default CST cityId if no city map match. Default 1.")
     parser.add_argument("--region-map", type=Path, help="Optional CSV map with source,id columns")
     parser.add_argument("--city-map", type=Path, help="Optional CSV map with source,id columns")
     parser.add_argument("--access-technology-id", default="1")
@@ -415,7 +535,7 @@ def main() -> int:
             continue
         try:
             output = make_bulk_row(iptool, siebel, args, region_map, city_map)
-            output["notes"] = f"joinType={join_type}; joinKey={join_key}; " + output.get("notes", "")
+            output["notes"] = ""
             output_rows.append(output)
         except Exception as exc:
             missing = dict(iptool)

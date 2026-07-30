@@ -42,13 +42,17 @@ import {
   AssignmentPayload,
   AssignmentStatus,
   AuditEvent,
-  bootstrapCurrentCstResources,
+  createCstMigrationJobFromReview,
+  createManualCstMigrationJob,
   BssDeltaSyncResponse,
   BulkBatch,
   BulkResult,
   Conflict,
   CstConfig,
   CstConfigPayload,
+  CstMigrationReviewCreateResult,
+  CstMigrationReviewResponse,
+  CstResourceScope,
   CstSyncBatch,
   CstSyncJob,
   CstSyncSummary,
@@ -91,6 +95,7 @@ import {
   retryCstJob,
   retryFailedCstBatch,
   pushPendingCstJobs,
+  reviewCstMigrationJobs,
   startPartialReassignment,
   runCstDayMinusOneSync,
   updateCstConfig,
@@ -171,6 +176,7 @@ type ResourceType = "LIR" | "Allocation" | "Subnet" | "IP Address";
 type ResourceRole = "PUBLIC" | "PRIVATE";
 type AdministrativeStatus = "AVAILABLE" | "RESERVED" | "ASSIGNED" | "RETIRED" | "HISTORICAL";
 type RipeSyncStatus = "PENDING" | "SUBMITTED" | "SYNCHRONIZED" | "SUCCESS" | "FAILED" | "DECOMMISSION_PENDING" | "EXCLUDED" | "NOT_REQUIRED";
+type CstSyncStatus = "NOT_CONFIGURED" | "NOT_REQUIRED" | "PENDING" | "RUNNING" | "SUCCESS" | "FAILED" | "BLOCKED" | "SYNCHRONIZED";
 type ResourceOwner = "Salam LIR" | "Business Customer" | "Residential Customer" | "Internal" | "Infrastructure" | "Datacenter" | "Peering" | "Cloud Services";
 
 type ManagedResource = {
@@ -211,7 +217,7 @@ type ManagedResource = {
   administrativeStatus: AdministrativeStatus;
   ripeSyncRequired: boolean;
   ripeSyncStatus: RipeSyncStatus;
-  cstSyncStatus: RipeSyncStatus;
+  cstSyncStatus: CstSyncStatus;
   actionFlag: string;
   accessTechnologyId: string;
   accessTechnology: string;
@@ -255,6 +261,7 @@ type SearchFilterField =
   | "owner"
   | "administrativeStatus"
   | "ripeSyncStatus"
+  | "cstSyncStatus"
   | "transactionId"
   | "netname"
   | "description";
@@ -294,6 +301,8 @@ function salamLogoForTheme(theme: AppTheme) {
   return theme === "default" ? "/salam-logo-white.png" : "/salam-logo.png";
 }
 
+const CST_SYNC_STATUS_OPTIONS: CstSyncStatus[] = ["PENDING", "RUNNING", "SUCCESS", "FAILED", "BLOCKED", "NOT_REQUIRED", "NOT_CONFIGURED", "SYNCHRONIZED"];
+
 const SEARCH_FILTER_FIELDS: Array<{ value: SearchFilterField; label: string; mode: "select" | "text" }> = [
   { value: "cidr", label: "CIDR", mode: "text" },
   { value: "id", label: "Resource ID", mode: "text" },
@@ -306,6 +315,7 @@ const SEARCH_FILTER_FIELDS: Array<{ value: SearchFilterField; label: string; mod
   { value: "owner", label: "Owner", mode: "select" },
   { value: "administrativeStatus", label: "Status", mode: "select" },
   { value: "ripeSyncStatus", label: "RIPE Status", mode: "select" },
+  { value: "cstSyncStatus", label: "CST Sync Status", mode: "select" },
   { value: "transactionId", label: "Transaction ID", mode: "text" },
   { value: "netname", label: "Netname", mode: "text" },
   { value: "description", label: "Description", mode: "text" }
@@ -806,6 +816,15 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   const [ripeConfigForm, setRipeConfigForm] = useState<RipeConfigPayload>({ base_url: "https://rest.db.ripe.net", auth_type: "Basic Authentication", username: "", password: "", connection_timeout: 10, read_timeout: 30, default_maintainer: "ITC-NOC-MNT" });
   const [siebelConfigForm, setSiebelConfigForm] = useState<SiebelConfigPayload>({ username: "LIR_USER", password: "", dsn: "172.31.23.101:1525/SIDB", connection_timeout: 10, query_sql: DEFAULT_SIEBEL_QUERY });
   const [databaseConnectionForm, setDatabaseConnectionForm] = useState<DatabaseConnectionPayload>({ host: "localhost", port: 5432, database: "lir", username: "lir_app", password: "", ssl_mode: "prefer", connect_timeout: 10 });
+  const [cstResourceScope, setCstResourceScope] = useState<CstResourceScope>("assigned");
+  const [cstMigrationReviewOpen, setCstMigrationReviewOpen] = useState(false);
+  const [cstMigrationReview, setCstMigrationReview] = useState<CstMigrationReviewResponse | null>(null);
+  const [cstMigrationReviewLoading, setCstMigrationReviewLoading] = useState(false);
+  const [cstMigrationReviewPage, setCstMigrationReviewPage] = useState(1);
+  const [cstMigrationReviewFilters, setCstMigrationReviewFilters] = useState({ search: "", assignment_status: "all", transaction_type: "all", validation_status: "all", created_from: "", created_to: "" });
+  const [cstReviewSelectedIds, setCstReviewSelectedIds] = useState<string[]>([]);
+  const [cstReviewExcludedIds, setCstReviewExcludedIds] = useState<string[]>([]);
+  const [cstReviewCreateResult, setCstReviewCreateResult] = useState<CstMigrationReviewCreateResult | null>(null);
   const [cstConfigForm, setCstConfigForm] = useState<CstConfigPayload>({
     enabled: true,
     auto_execute: true,
@@ -1043,6 +1062,52 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
     }
   }, [routeReady, selectedResourceId, view]);
 
+  useEffect(() => {
+    if (!cstMigrationReviewOpen) {
+      return;
+    }
+    let cancelled = false;
+    setCstMigrationReviewLoading(true);
+    reviewCstMigrationJobs({
+      page: cstMigrationReviewPage,
+      page_size: 25,
+      resource_scope: cstResourceScope,
+      search: cstMigrationReviewFilters.search,
+      assignment_status: cstMigrationReviewFilters.assignment_status,
+      transaction_type: cstMigrationReviewFilters.transaction_type,
+      validation_status: cstMigrationReviewFilters.validation_status,
+      created_from: cstMigrationReviewFilters.created_from,
+      created_to: cstMigrationReviewFilters.created_to,
+    })
+      .then((review) => {
+        if (!cancelled) {
+          setCstMigrationReview(review);
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          window.alert(errorMessage(error));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setCstMigrationReviewLoading(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    cstMigrationReviewOpen,
+    cstMigrationReviewPage,
+    cstResourceScope,
+    cstMigrationReviewFilters.search,
+    cstMigrationReviewFilters.assignment_status,
+    cstMigrationReviewFilters.transaction_type,
+    cstMigrationReviewFilters.validation_status,
+    cstMigrationReviewFilters.created_from,
+    cstMigrationReviewFilters.created_to,
+  ]);
   const mutation = useMutation({
     mutationFn: async (operation: () => Promise<unknown>) => operation(),
     onSuccess: refresh,
@@ -1162,6 +1227,8 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                 cstSchedulerRuns={cstSchedulerRuns}
                 cstTransactions={cstTransactions}
                 cstBusy={cstConfigQuery.isFetching || cstSummaryQuery.isFetching || cstBatchesQuery.isFetching || cstJobsQuery.isFetching || cstSchedulerRunsQuery.isFetching || cstTransactionsQuery.isFetching}
+                cstResourceScope={cstResourceScope}
+                onCstResourceScope={setCstResourceScope}
                 onRefreshCst={() => {
                   void cstConfigQuery.refetch();
                   void cstSummaryQuery.refetch();
@@ -1170,10 +1237,13 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                   void cstSchedulerRunsQuery.refetch();
                   void cstTransactionsQuery.refetch();
                 }}
-                onBootstrapCst={() => run(async () => {
-                  const jobs = await bootstrapCurrentCstResources();
-                  setNotice({ title: jobs.length ? "CST Migration Jobs Created" : "No CST Migration Jobs Created", detail: jobs.length ? `${jobs.length} CST transaction job(s) created. Check CST Integration Monitor for success, pending, or failed status.` : "No eligible public CST resources were found. Load public pools/assignments first, or check CST readiness and existing transaction filters." });
-                })}
+                onBootstrapCst={() => {
+                  setCstMigrationReviewOpen(true);
+                  setCstMigrationReviewPage(1);
+                  setCstReviewSelectedIds([]);
+                  setCstReviewExcludedIds([]);
+                  setCstReviewCreateResult(null);
+                }}
                 onReconcileCst={() => run(async () => {
                   const jobs = await reconcileCstResources();
                   setNotice({ title: "CST GetLIR Sent", detail: `${jobs.length} provider-wide GetLIR API job(s) created. GetLIR pulls CST data using pageNumber/pageSize, not per-subnet filtering.` });
@@ -1191,12 +1261,12 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                   setNotice({ title: "CST Batch Retry", detail: `${jobs.length} pending/failed job(s) retried against the real CST API.` });
                 })}
                 onPushPendingCstJobs={(limit) => run(async () => {
-                  const result = await pushPendingCstJobs(limit);
+                  const result = await pushPendingCstJobs(limit, cstResourceScope);
                   void cstSummaryQuery.refetch();
                   void cstJobsQuery.refetch();
                   void cstBatchesQuery.refetch();
                   void cstTransactionsQuery.refetch();
-                  setNotice({ title: "CST Pending Push", detail: `${result.processed_jobs}/${result.requested_jobs} pending job(s) processed sequentially. Success: ${result.success_jobs}, failed: ${result.failed_jobs}, still pending: ${result.pending_jobs}. Batch limit: ${result.batch_size_limit}, hourly limit: ${result.hourly_request_limit}.` });
+                  setNotice({ title: "CST Pending Push", detail: `${result.processed_jobs}/${result.requested_jobs} pending job(s) processed sequentially for ${cstScopeLabel(result.resource_scope)}. Success: ${result.success_jobs}, failed: ${result.failed_jobs}, still pending: ${result.pending_jobs}. Batch limit: ${result.batch_size_limit}, hourly limit: ${result.hourly_request_limit}.` });
                 })}
                 onToggleCstEnabled={(enabled) => run(async () => { await updateCstConfig({ enabled }); })}
                 onToggleCstAutoExecute={(auto_execute) => run(async () => { await updateCstConfig({ auto_execute }); })}
@@ -1616,6 +1686,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                 databaseConnectionForm={databaseConnectionForm}
                 cstConfig={cstConfig}
                 cstConfigForm={cstConfigForm}
+                cstResourceScope={cstResourceScope}
                 ripePoolCsv={ripePoolCsv}
                 ripeAllocatedPools={ripeAllocatedPools}
                 onNewUser={setNewUser}
@@ -1624,6 +1695,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                 onSiebelConfigForm={setSiebelConfigForm}
                 onDatabaseConnectionForm={setDatabaseConnectionForm}
                 onCstConfigForm={setCstConfigForm}
+                onCstResourceScope={setCstResourceScope}
                 onRipePoolCsv={setRipePoolCsv}
                 onAddUser={() => run(async () => { await api.post("/users", newUser); setNewUser({ username: "", password: "", role: "operator" }); })}
                 onSetPassword={() => run(async () => { await api.patch(`/users/${passwordReset.userId}/password`, { password: passwordReset.password }); setPasswordReset((current) => ({ ...current, password: "" })); })}
@@ -1665,6 +1737,47 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
         </div>
       </div>
 
+      <CstMigrationReviewDialog
+        open={cstMigrationReviewOpen}
+        review={cstMigrationReview}
+        loading={cstMigrationReviewLoading}
+        page={cstMigrationReviewPage}
+        filters={cstMigrationReviewFilters}
+        selectedIds={cstReviewSelectedIds}
+        excludedIds={cstReviewExcludedIds}
+        result={cstReviewCreateResult}
+        resourceScope={cstResourceScope}
+        onOpenChange={setCstMigrationReviewOpen}
+        onPage={setCstMigrationReviewPage}
+        onFilters={(filters) => { setCstMigrationReviewFilters(filters); setCstMigrationReviewPage(1); }}
+        onSelectedIds={setCstReviewSelectedIds}
+        onExcludedIds={setCstReviewExcludedIds}
+        onCreate={(includedIds, excludedIds) => run(async () => {
+          if (!includedIds.length) {
+            return;
+          }
+          if (!window.confirm(`Create CST migration job with ${includedIds.length} included transaction(s)?`)) {
+            return;
+          }
+          const result = await createCstMigrationJobFromReview({
+            included_review_ids: includedIds,
+            excluded_review_ids: excludedIds,
+            resource_scope: cstResourceScope,
+            final_confirmed: true,
+            created_by: signedInUser,
+          });
+          setCstReviewCreateResult(result);
+          setCstReviewSelectedIds([]);
+          void cstSummaryQuery.refetch();
+          void cstJobsQuery.refetch();
+          void cstBatchesQuery.refetch();
+          void cstTransactionsQuery.refetch();
+          setNotice({
+            title: result.batch_id ? "CST Migration Job Created" : "CST Migration Job Not Created",
+            detail: `${result.message}\nJob ID: ${result.batch_id || "-"}\nIncluded: ${result.included_transactions}\nRejected/skipped: ${result.rejected_count + result.skipped_count}\nCreated: ${result.created_at.slice(0, 19)}\nCreated by: ${result.created_by}${result.rejected.length ? `\n\nRejected:\n${result.rejected.map((item) => `${item.review_id} ${item.cidr}: ${item.reason}`).join("\n")}` : ""}`
+          });
+        })}
+      />
       <Dialog open={Boolean(confirm)} onOpenChange={() => setConfirm(null)}>
         <DialogContent>
           <DialogHeader>
@@ -1855,6 +1968,8 @@ type CstMonitorProps = {
   cstSchedulerRuns: CstSchedulerRun[];
   cstTransactions: CstTransactionLedger[];
   cstBusy: boolean;
+  cstResourceScope: CstResourceScope;
+  onCstResourceScope: (scope: CstResourceScope) => void;
   onRefreshCst: () => void;
   onBootstrapCst: () => void;
   onReconcileCst: () => void;
@@ -2813,7 +2928,7 @@ function AssignmentManagement(props: {
               <div className="grid gap-3 rounded-md border bg-muted/20 p-3 md:grid-cols-[minmax(0,1fr)_260px] md:items-end">
                 <div className="text-sm">
                   <p className="font-semibold">Original block: {partialAssignment?.cidr ?? "Select an assignment below"}</p>
-                  <p className="mt-1 text-muted-foreground">The requested fragment must be fully contained inside the original block. CST will receive UpdateLIRData, DeleteLIRData, then SendLIRData for each resulting block.</p>
+                  <p className="mt-1 text-muted-foreground">The requested CIDR can shrink within the original block or expand around it when the added addresses are free in the same managed pool. CST will receive UpdateLIRData, DeleteLIRData, then SendLIRData for each revised block.</p>
                 </div>
                 <label className="grid gap-1">
                   <span className="text-xs font-medium text-muted-foreground">Requested reassignment CIDR</span>
@@ -3782,7 +3897,7 @@ function GlobalSearch({
 
   return (
     <div className="grid gap-5">
-      <PageTitle title="Global Search" description="Search by IP address, CIDR, Resource ID, Transaction ID, owner, status, netname, and selected filter criteria." />
+      <PageTitle title="Global Search" description="Search by IP address, CIDR, Resource ID, Transaction ID, owner, status, RIPE/CST sync status, netname, and selected filter criteria." />
       <Card>
         <CardContent className="grid gap-3 pt-5">
           <div className="flex flex-col gap-2 md:flex-row">
@@ -3853,7 +3968,10 @@ function GlobalSearch({
                   <span className="block font-semibold">{resource.cidr}</span>
                   <span className="text-sm text-muted-foreground">{resource.uuid} / {resource.transactionId} / {resource.netname}</span>
                 </span>
-                <Badge variant={badgeForResource(resource)}>{resource.status}</Badge>
+                <span className="flex flex-wrap items-center gap-2">
+                  <Badge variant={badgeForResource(resource)}>{resource.status}</Badge>
+                  <Badge variant={resource.cstSyncStatus === "SUCCESS" || resource.cstSyncStatus === "SYNCHRONIZED" ? "success" : resource.cstSyncStatus === "FAILED" ? "danger" : resource.cstSyncStatus === "PENDING" || resource.cstSyncStatus === "RUNNING" ? "warning" : "muted"}>CST {resource.cstSyncStatus || "-"}</Badge>
+                </span>
               </button>
             ))}
             {!results.length ? <p className="p-3 text-sm text-muted-foreground">No matching resources.</p> : null}
@@ -4283,17 +4401,68 @@ function shouldLoadNextReportBatch(event: UIEvent<HTMLDivElement>, visibleRows: 
 }
 
 
+const CST_RESOURCE_SCOPE_OPTIONS: CstResourceScope[] = ["assigned", "all", "unassigned"];
+const CST_RESOURCE_SCOPE_LABELS: Record<CstResourceScope, string> = {
+  assigned: "Assignments only",
+  all: "All LIR data",
+  unassigned: "Unassigned only"
+};
+
+function cstScopeLabel(scope: CstResourceScope) {
+  return CST_RESOURCE_SCOPE_LABELS[scope] ?? CST_RESOURCE_SCOPE_LABELS.all;
+}
+
+function ToggleSwitch({ label, description, checked, onChange }: { label: string; description?: string; checked: boolean; onChange: (checked: boolean) => void }) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      className={cn("flex min-h-14 items-center justify-between gap-3 rounded-md border px-3 py-2 text-left transition", checked ? "border-primary/50 bg-primary/10" : "bg-muted/20 hover:bg-muted/35")}
+      onClick={() => onChange(!checked)}
+    >
+      <span className="min-w-0">
+        <span className="block text-sm font-semibold">{label}</span>
+        {description ? <span className="mt-0.5 block text-xs text-muted-foreground">{description}</span> : null}
+      </span>
+      <span className={cn("relative h-6 w-11 shrink-0 rounded-full border transition", checked ? "border-primary bg-primary" : "border-border bg-muted")}> 
+        <span className={cn("absolute top-1/2 h-4 w-4 -translate-y-1/2 rounded-full bg-background shadow transition", checked ? "left-6" : "left-1")} />
+      </span>
+    </button>
+  );
+}
+
+function CstResourceScopeSelector({ value, onChange }: { value: CstResourceScope; onChange: (scope: CstResourceScope) => void }) {
+  return (
+    <div className="grid gap-1">
+      <span className="text-xs font-medium text-muted-foreground">CST report scope</span>
+      <div className="flex flex-wrap gap-1 rounded-md border bg-muted/20 p-1">
+        {CST_RESOURCE_SCOPE_OPTIONS.map((scope) => (
+          <button
+            key={scope}
+            type="button"
+            className={cn("rounded px-3 py-1.5 text-xs font-semibold transition", value === scope ? "bg-primary text-primary-foreground shadow-sm" : "text-muted-foreground hover:bg-muted hover:text-foreground")}
+            onClick={() => onChange(scope)}
+          >
+            {cstScopeLabel(scope)}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
 type CstLirApiSettingsProps = {
   cstConfig: CstConfig | null;
   cstConfigForm: CstConfigPayload;
+  cstResourceScope: CstResourceScope;
   onCstConfigForm: (value: CstConfigPayload) => void;
+  onCstResourceScope: (scope: CstResourceScope) => void;
   onSaveCstConfig: () => void;
   onTestCstConnection: () => void;
 };
 
 function CstLirApiSettings(props: CstLirApiSettingsProps) {
-  const switchValue = (value: boolean | undefined) => value === false ? "Disabled" : "Enabled";
-  const setSwitch = (key: keyof CstConfigPayload, value: string) => props.onCstConfigForm({ ...props.cstConfigForm, [key]: value === "Enabled" });
+  const setSwitch = (key: keyof CstConfigPayload, checked: boolean) => props.onCstConfigForm({ ...props.cstConfigForm, [key]: checked });
   return (
     <Card>
       <CardHeader>
@@ -4324,32 +4493,15 @@ function CstLirApiSettings(props: CstLirApiSettingsProps) {
               <Badge variant={props.cstConfigForm.auto_execute === false ? "warning" : "success"}>{props.cstConfigForm.auto_execute === false ? "Queue only" : "Auto execute"}</Badge>
             </div>
           </div>
-          <div className="grid gap-3 md:grid-cols-6">
-            <label className="grid gap-1">
-              <span className="text-xs font-medium text-muted-foreground">Global CST sync</span>
-              <Select value={switchValue(props.cstConfigForm.enabled)} values={["Enabled", "Disabled"]} onChange={(value) => setSwitch("enabled", value)} />
-            </label>
-            <label className="grid gap-1">
-              <span className="text-xs font-medium text-muted-foreground">Auto execute</span>
-              <Select value={switchValue(props.cstConfigForm.auto_execute)} values={["Enabled", "Disabled"]} onChange={(value) => setSwitch("auto_execute", value)} />
-            </label>
-            <label className="grid gap-1">
-              <span className="text-xs font-medium text-muted-foreground">SendLIR</span>
-              <Select value={switchValue(props.cstConfigForm.send_enabled)} values={["Enabled", "Disabled"]} onChange={(value) => setSwitch("send_enabled", value)} />
-            </label>
-            <label className="grid gap-1">
-              <span className="text-xs font-medium text-muted-foreground">UpdateLIR</span>
-              <Select value={switchValue(props.cstConfigForm.update_enabled)} values={["Enabled", "Disabled"]} onChange={(value) => setSwitch("update_enabled", value)} />
-            </label>
-            <label className="grid gap-1">
-              <span className="text-xs font-medium text-muted-foreground">DeleteLIR</span>
-              <Select value={switchValue(props.cstConfigForm.delete_enabled)} values={["Enabled", "Disabled"]} onChange={(value) => setSwitch("delete_enabled", value)} />
-            </label>
-            <label className="grid gap-1">
-              <span className="text-xs font-medium text-muted-foreground">GetLIR</span>
-              <Select value={switchValue(props.cstConfigForm.get_enabled)} values={["Enabled", "Disabled"]} onChange={(value) => setSwitch("get_enabled", value)} />
-            </label>
+          <div className="grid gap-3 md:grid-cols-3">
+            <ToggleSwitch label="Global CST sync" description="Allow CST jobs to call the gateway." checked={props.cstConfigForm.enabled !== false} onChange={(checked) => setSwitch("enabled", checked)} />
+            <ToggleSwitch label="Auto execute" description="Call CST when jobs are created." checked={props.cstConfigForm.auto_execute !== false} onChange={(checked) => setSwitch("auto_execute", checked)} />
+            <ToggleSwitch label="SendLIR" description="Create or report LIR records." checked={props.cstConfigForm.send_enabled !== false} onChange={(checked) => setSwitch("send_enabled", checked)} />
+            <ToggleSwitch label="UpdateLIR" description="Update existing LIR records." checked={props.cstConfigForm.update_enabled !== false} onChange={(checked) => setSwitch("update_enabled", checked)} />
+            <ToggleSwitch label="DeleteLIR" description="Delete CST records when required." checked={props.cstConfigForm.delete_enabled !== false} onChange={(checked) => setSwitch("delete_enabled", checked)} />
+            <ToggleSwitch label="GetLIR" description="Read paged LIR data from CST." checked={props.cstConfigForm.get_enabled !== false} onChange={(checked) => setSwitch("get_enabled", checked)} />
           </div>
+          <CstResourceScopeSelector value={props.cstResourceScope} onChange={props.onCstResourceScope} />
           <p className="text-xs text-muted-foreground">When auto execute is disabled, new CST jobs stay PENDING and do not call CST until you retry them manually from the CST Sync Monitor.</p>
                 </div>
         <div className="grid gap-3 rounded-md border bg-muted/20 p-3">
@@ -4463,6 +4615,165 @@ function CstLirApiSettings(props: CstLirApiSettingsProps) {
   );
 }
 
+type CstMigrationReviewFilters = {
+  search: string;
+  assignment_status: string;
+  transaction_type: string;
+  validation_status: string;
+  created_from: string;
+  created_to: string;
+};
+
+function CstMigrationReviewDialog(props: {
+  open: boolean;
+  review: CstMigrationReviewResponse | null;
+  loading: boolean;
+  page: number;
+  filters: CstMigrationReviewFilters;
+  selectedIds: string[];
+  excludedIds: string[];
+  result: CstMigrationReviewCreateResult | null;
+  resourceScope: CstResourceScope;
+  onOpenChange: (open: boolean) => void;
+  onPage: (page: number) => void;
+  onFilters: (filters: CstMigrationReviewFilters) => void;
+  onSelectedIds: (ids: string[]) => void;
+  onExcludedIds: (ids: string[]) => void;
+  onCreate: (includedIds: string[], excludedIds: string[]) => void;
+}) {
+  const review = props.review;
+  const selectedSet = new Set(props.selectedIds);
+  const excludedSet = new Set(props.excludedIds);
+  const matchingIds = review?.all_matching_review_ids ?? [];
+  const includedIds = matchingIds.filter((id) => !excludedSet.has(id));
+  const visibleIds = review?.items.map((item) => item.review_id) ?? [];
+  const validCount = review?.counts.valid ?? 0;
+  const invalidCount = review?.counts.invalid ?? 0;
+  const selectedCount = props.selectedIds.length;
+  const totalPages = review ? Math.max(Math.ceil(review.total / review.page_size), 1) : 1;
+  const setFilter = (key: keyof CstMigrationReviewFilters, value: string) => props.onFilters({ ...props.filters, [key]: value });
+  const mergeSelected = (ids: string[]) => props.onSelectedIds(Array.from(new Set([...props.selectedIds, ...ids])));
+  const removeSelected = (ids: string[]) => props.onSelectedIds(props.selectedIds.filter((id) => !ids.includes(id)));
+  const excludeSelected = () => {
+    props.onExcludedIds(Array.from(new Set([...props.excludedIds, ...props.selectedIds])));
+    props.onSelectedIds([]);
+  };
+  const includeSelected = () => {
+    props.onExcludedIds(props.excludedIds.filter((id) => !selectedSet.has(id)));
+    props.onSelectedIds([]);
+  };
+  return (
+    <Dialog open={props.open} onOpenChange={props.onOpenChange}>
+      <DialogContent className="max-w-6xl">
+        <DialogHeader>
+          <DialogTitle>Review Pending CST Transactions</DialogTitle>
+          <DialogDescription>Review, filter, exclude, and confirm CST LIR records before creating a migration job. Scope: {cstScopeLabel(props.resourceScope)}.</DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-4">
+          <div className="grid gap-3 md:grid-cols-6">
+            <label className="grid gap-1 md:col-span-2">
+              <span className="text-xs font-medium text-muted-foreground">Search</span>
+              <Input value={props.filters.search} onChange={(event) => setFilter("search", event.target.value)} placeholder="CIDR, IP, customer, service, transaction" />
+            </label>
+            <label className="grid gap-1">
+              <span className="text-xs font-medium text-muted-foreground">Assignment status</span>
+              <Select value={props.filters.assignment_status} values={["all", "1", "2", "3", "4"]} labels={{ all: "All", "1": "Unassigned", "2": "Internal", "3": "Business", "4": "Individual" }} onChange={(value) => setFilter("assignment_status", value)} />
+            </label>
+            <label className="grid gap-1">
+              <span className="text-xs font-medium text-muted-foreground">Transaction type</span>
+              <Select value={props.filters.transaction_type} values={["all", "SEND", "UPDATE", "DELETE"]} labels={{ all: "All" }} onChange={(value) => setFilter("transaction_type", value)} />
+            </label>
+            <label className="grid gap-1">
+              <span className="text-xs font-medium text-muted-foreground">Validation</span>
+              <Select value={props.filters.validation_status} values={["all", "VALID", "INVALID"]} labels={{ all: "All" }} onChange={(value) => setFilter("validation_status", value)} />
+            </label>
+            <label className="grid gap-1">
+              <span className="text-xs font-medium text-muted-foreground">Created from</span>
+              <Input type="date" value={props.filters.created_from} onChange={(event) => setFilter("created_from", event.target.value)} />
+            </label>
+            <label className="grid gap-1">
+              <span className="text-xs font-medium text-muted-foreground">Created to</span>
+              <Input type="date" value={props.filters.created_to} onChange={(event) => setFilter("created_to", event.target.value)} />
+            </label>
+          </div>
+          <div className="grid gap-2 md:grid-cols-5">
+            <ReportMetric label="Included" value={String(includedIds.length)} detail="Will be submitted" />
+            <ReportMetric label="Excluded" value={String(props.excludedIds.length)} detail="Kept pending for later" />
+            <ReportMetric label="Selected" value={String(selectedCount)} detail="Current selection" />
+            <ReportMetric label="Valid" value={String(validCount)} detail="Server validation passed" />
+            <ReportMetric label="Invalid" value={String(invalidCount)} detail="Rejected on create" />
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <Button size="sm" variant="outline" onClick={() => mergeSelected(visibleIds)} disabled={!visibleIds.length}>Select All on Page</Button>
+            <Button size="sm" variant="outline" onClick={() => props.onSelectedIds(matchingIds)} disabled={!matchingIds.length}>Select All Matching Results</Button>
+            <Button size="sm" variant="secondary" onClick={excludeSelected} disabled={!selectedCount}>Exclude Selected</Button>
+            <Button size="sm" variant="secondary" onClick={includeSelected} disabled={!selectedCount}>Include Selected</Button>
+            <Button size="sm" variant="outline" onClick={() => props.onSelectedIds([])} disabled={!selectedCount}>Clear Selection</Button>
+          </div>
+          <div className="max-h-[48vh] overflow-auto rounded-md border bg-background/40">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead></TableHead>
+                  <TableHead>State</TableHead>
+                  <TableHead>Type</TableHead>
+                  <TableHead>CIDR</TableHead>
+                  <TableHead>Range</TableHead>
+                  <TableHead>Customer</TableHead>
+                  <TableHead>Service</TableHead>
+                  <TableHead>Transaction</TableHead>
+                  <TableHead>Validation</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {props.loading ? (
+                  <TableRow><TableCell colSpan={9}>Loading pending CST transactions...</TableCell></TableRow>
+                ) : review?.items.length ? review.items.map((item) => {
+                  const isSelected = selectedSet.has(item.review_id);
+                  const isExcluded = excludedSet.has(item.review_id);
+                  return (
+                    <TableRow key={item.review_id} className={isExcluded ? "opacity-55" : ""}>
+                      <TableCell>
+                        <input type="checkbox" checked={isSelected} onChange={(event) => event.target.checked ? mergeSelected([item.review_id]) : removeSelected([item.review_id])} aria-label={`Select ${item.cidr}`} />
+                      </TableCell>
+                      <TableCell><Badge variant={isExcluded ? "warning" : "success"}>{isExcluded ? "Excluded" : "Included"}</Badge></TableCell>
+                      <TableCell>{item.operation}</TableCell>
+                      <TableCell>{item.cidr}</TableCell>
+                      <TableCell>{item.start_ip} - {item.end_ip}</TableCell>
+                      <TableCell>{item.customer_name || item.customer_id || "-"}</TableCell>
+                      <TableCell>{item.service_id || "-"}</TableCell>
+                      <TableCell className="max-w-[180px] truncate" title={item.transaction_id}>{item.transaction_id}</TableCell>
+                      <TableCell><Badge variant={item.validation_status === "VALID" ? "success" : "danger"}>{item.validation_status}</Badge>{item.reason ? <p className="mt-1 max-w-[240px] text-xs text-muted-foreground">{item.reason}</p> : null}</TableCell>
+                    </TableRow>
+                  );
+                }) : (
+                  <TableRow><TableCell colSpan={9}>No matching CST transactions found.</TableCell></TableRow>
+                )}
+              </TableBody>
+            </Table>
+          </div>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <Button variant="outline" size="sm" onClick={() => props.onPage(Math.max(props.page - 1, 1))} disabled={props.page <= 1}>Previous</Button>
+              <span className="text-xs text-muted-foreground">Page {props.page} of {totalPages}</span>
+              <Button variant="outline" size="sm" onClick={() => props.onPage(Math.min(props.page + 1, totalPages))} disabled={props.page >= totalPages}>Next</Button>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <Button variant="outline" onClick={() => props.onOpenChange(false)}>Cancel</Button>
+              <Button onClick={() => props.onCreate(includedIds, props.excludedIds)} disabled={!includedIds.length}>Create Migration Job ({includedIds.length})</Button>
+            </div>
+          </div>
+          {props.result ? (
+            <div className="rounded-md border bg-muted/20 p-3 text-sm">
+              <p className="font-semibold">Last job summary</p>
+              <p className="text-muted-foreground">Job ID: {props.result.batch_id || "-"} | Included: {props.result.included_transactions} | Rejected: {props.result.rejected_count} | Created by: {props.result.created_by}</p>
+            </div>
+          ) : null}
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}
 function CstIntegrationMonitor(props: CstMonitorProps) {
   const pendingCount = props.cstSummary?.pending_jobs ?? 0;
   const configuredBatchLimit = Math.max(props.cstConfig?.batch_size_limit ?? 500, 1);
@@ -4484,6 +4795,9 @@ function CstIntegrationMonitor(props: CstMonitorProps) {
               {props.cstBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCcw className="h-4 w-4" />}
               Refresh
             </Button>
+            <div className="min-w-[260px]">
+              <CstResourceScopeSelector value={props.cstResourceScope} onChange={props.onCstResourceScope} />
+            </div>
             <Button variant="secondary" onClick={props.onBootstrapCst}>
               <Database className="h-4 w-4" />
               Create Migration Jobs
@@ -4748,6 +5062,7 @@ function Administration(props: {
   databaseConnectionForm: DatabaseConnectionPayload;
   cstConfig: CstConfig | null;
   cstConfigForm: CstConfigPayload;
+  cstResourceScope: CstResourceScope;
   ripePoolCsv: string;
   ripeAllocatedPools: RipeAllocatedPool[];
   onNewUser: (value: { username: string; password: string; role: User["role"] }) => void;
@@ -4756,6 +5071,7 @@ function Administration(props: {
   onSiebelConfigForm: (value: SiebelConfigPayload) => void;
   onDatabaseConnectionForm: (value: DatabaseConnectionPayload) => void;
   onCstConfigForm: (value: CstConfigPayload) => void;
+  onCstResourceScope: (scope: CstResourceScope) => void;
   onRipePoolCsv: (value: string) => void;
   onAddUser: () => void;
   onSetPassword: () => void;
@@ -4956,7 +5272,9 @@ function Administration(props: {
       <CstLirApiSettings
         cstConfig={props.cstConfig}
         cstConfigForm={props.cstConfigForm}
+        cstResourceScope={props.cstResourceScope}
         onCstConfigForm={props.onCstConfigForm}
+        onCstResourceScope={props.onCstResourceScope}
         onSaveCstConfig={props.onSaveCstConfig}
         onTestCstConnection={props.onTestCstConnection}
       />
@@ -5574,7 +5892,7 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
         administrativeStatus: assignmentToAdministrativeStatus(assignment),
         ripeSyncRequired: classifyCidr(assignment.cidr) === "PUBLIC",
         ripeSyncStatus: ripeStatusForAssignment(assignment, classifyCidr(assignment.cidr) === "PUBLIC"),
-        cstSyncStatus: assignment.cst_sync_status === "SUCCESS" ? "SUCCESS" : assignment.cst_sync_status === "FAILED" ? "FAILED" : assignment.cst_sync_status === "NOT_REQUIRED" ? "NOT_REQUIRED" : "PENDING",
+        cstSyncStatus: normalizeCstSyncStatus(assignment.cst_sync_status),
         actionFlag: assignment.action_flag || "N",
         accessTechnologyId: assignment.access_technology_id,
         accessTechnology: assignment.access_technology || accessTechnologyLabels[assignment.access_technology_id] || "",
@@ -5695,7 +6013,7 @@ function buildRegistryStats(resources: ManagedResource[], conflicts: Conflict[])
 function filterResources(resources: ManagedResource[], query: string, filters: SearchFilterCriterion[] = []) {
   const normalized = query.trim().toLowerCase();
   return resources.filter((resource) => {
-    const textMatch = !normalized || [resource.id, resource.uuid, resource.parentId, resource.cidr, resource.startIp, resource.endIp, resource.type, resource.classification, resource.owner, resource.administrativeStatus, resource.ripeSyncStatus, resource.transactionId, resource.netname, resource.description]
+    const textMatch = !normalized || [resource.id, resource.uuid, resource.parentId, resource.cidr, resource.startIp, resource.endIp, resource.type, resource.classification, resource.owner, resource.administrativeStatus, resource.ripeSyncStatus, resource.cstSyncStatus, resource.transactionId, resource.netname, resource.description]
       .some((value) => String(value ?? "").toLowerCase().includes(normalized))
     return textMatch && filters.every((filter) => searchCriterionMatches(resource, filter));
   });
@@ -5729,6 +6047,9 @@ function filterOptionsForField(field: SearchFilterField, resources: ManagedResou
   }
   if (field === "classification") {
     return ["PUBLIC", "PRIVATE"];
+  }
+  if (field === "cstSyncStatus") {
+    return uniqueSorted([...CST_SYNC_STATUS_OPTIONS, ...resources.map((resource) => String(resource.cstSyncStatus ?? ""))]);
   }
   return uniqueSorted(resources.map((resource) => String(resourceValueForSearchField(resource, field) ?? "")));
 }
@@ -6230,9 +6551,9 @@ function normalizeAssignmentImportCsv(csvText: string) {
         ["serviceId", ["serviceid", "service_id"]],
         ["customerId", ["customerid", "customer_id", "bsscustomerid", "bss_customer_id"]],
         ["organizationName", ["organizationname", "organization_name", "customername", "customer_name"]],
-        ["organizationId/commercialRegId/unifiedNumber", ["organizationid", "organization_id", "commercialregid", "commercial_reg_id", "unifiednumber", "unified_number"]],
-        ["customerTypeId", ["customertypeid", "customer_type_id"]],
-        ["regionId", ["regionid", "region_id"]],
+        ["organizationId/commercialRegId/unifiedNumber/customerId", ["organizationid", "organization_id", "commercialregid", "commercial_reg_id", "unifiednumber", "unified_number", "customerid", "customer_id", "bsscustomerid", "bss_customer_id"]],
+        ["customerTypeId", ["customertypeid", "customer_type_id", "customertype", "customer_type"]],
+        ["regionId/region", ["regionid", "region_id", "region"]],
         ["fullName/contactName", ["fullname", "full_name", "contactname", "contact_name"]],
         ["mobileNumber/contactNumber", ["mobilenumber", "mobile_number", "contactnumber", "contact_number"]],
         ["idNumber", ["idnumber", "id_number", "customeridentity", "customer_identity"]],
@@ -6246,7 +6567,6 @@ function normalizeAssignmentImportCsv(csvText: string) {
         ["assignmentPurpose", ["assignmentpurpose", "assignment_purpose", "purpose"]],
         ["site/locationName", ["site", "locationname", "location_name"]],
         ["regionId/region", ["regionid", "region_id", "region"]],
-        ["cityId/city", ["cityid", "city_id", "city"]],
         ["fullName/contactName", ["fullname", "full_name", "contactname", "contact_name"]],
         ["mobileNumber/contactNumber", ["mobilenumber", "mobile_number", "contactnumber", "contact_number"]],
         ["email/contactEmail", ["email", "contactemail", "contact_email"]]
@@ -6534,6 +6854,11 @@ function detectIntegrityIssues(resources: ManagedResource[]) {
     issues.push({ severity: "Minor", title: "Duplicate resource representation", detail: `${duplicate.cidr} appears more than once for type ${duplicate.type}.` });
   }
   return issues;
+}
+
+function normalizeCstSyncStatus(value: string | undefined | null): CstSyncStatus {
+  const normalized = String(value || "PENDING").trim().toUpperCase();
+  return CST_SYNC_STATUS_OPTIONS.includes(normalized as CstSyncStatus) ? normalized as CstSyncStatus : "PENDING";
 }
 
 function assignmentOwner(assignment: Assignment): ResourceOwner | string {

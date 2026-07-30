@@ -533,14 +533,100 @@ export type CstSyncJob = {
 };
 
 
+export type CstResourceScope = "all" | "assigned" | "unassigned";
+
 export type CstManualMigrationRequest = {
   limit?: number;
   execute_immediately?: boolean;
   force_api_override?: boolean;
   include_existing_transactions?: boolean;
   only_cst_ready?: boolean;
+  resource_scope?: CstResourceScope;
 };
 
+export type CstMigrationReviewRequest = {
+  page?: number;
+  page_size?: number;
+  search?: string;
+  assignment_status?: string;
+  transaction_type?: string;
+  validation_status?: string;
+  created_from?: string;
+  created_to?: string;
+  resource_scope?: CstResourceScope;
+  include_existing_transactions?: boolean;
+};
+
+export type CstMigrationReviewItem = {
+  review_id: string;
+  resource_uuid: string;
+  operation: string;
+  cidr: string;
+  start_ip: string;
+  end_ip: string;
+  customer_name: string;
+  customer_id: string;
+  service_id: string;
+  transaction_id: string;
+  assignment_status_id: number;
+  assignment_status: string;
+  validation_status: string;
+  validation_errors: string[];
+  cst_sync_status: string;
+  source_entity_type: string;
+  created_at: string;
+  eligible: boolean;
+  reason: string;
+};
+
+export type CstMigrationReviewCounts = {
+  total_matching: number;
+  included_default: number;
+  excluded: number;
+  selected: number;
+  valid: number;
+  invalid: number;
+};
+
+export type CstMigrationReviewResponse = {
+  page: number;
+  page_size: number;
+  total: number;
+  resource_scope: CstResourceScope;
+  generated_at: string;
+  items: CstMigrationReviewItem[];
+  all_matching_review_ids: string[];
+  counts: CstMigrationReviewCounts;
+};
+
+export type CstMigrationReviewCreateRequest = {
+  included_review_ids: string[];
+  excluded_review_ids?: string[];
+  resource_scope?: CstResourceScope;
+  final_confirmed: boolean;
+  created_by?: string;
+};
+
+export type CstMigrationReviewRejectedItem = {
+  review_id: string;
+  resource_uuid: string;
+  cidr: string;
+  operation: string;
+  reason: string;
+};
+
+export type CstMigrationReviewCreateResult = {
+  batch_id: string;
+  created_jobs: number;
+  included_transactions: number;
+  rejected_count: number;
+  skipped_count: number;
+  created_at: string;
+  created_by: string;
+  message: string;
+  rejected: CstMigrationReviewRejectedItem[];
+  jobs: CstSyncJob[];
+};
 export type CstMigrationJobStats = {
   batch_id: string;
   workflow_type: string;
@@ -584,6 +670,7 @@ export type CstPendingPushResult = {
   hourly_request_limit: number;
   rate_delay_seconds: number;
   force_api_override: boolean;
+  resource_scope: CstResourceScope;
   jobs: CstSyncJob[];
 };
 export type CstSchedulerRun = {
@@ -988,6 +1075,15 @@ export async function getCstTransactions() {
   return data;
 }
 
+export async function reviewCstMigrationJobs(payload: CstMigrationReviewRequest = {}) {
+  const { data } = await api.post<CstMigrationReviewResponse>("/cst/migration-jobs/review", payload);
+  return data;
+}
+
+export async function createCstMigrationJobFromReview(payload: CstMigrationReviewCreateRequest) {
+  const { data } = await api.post<CstMigrationReviewCreateResult>("/cst/migration-jobs/review/create", payload);
+  return data;
+}
 export async function createManualCstMigrationJob(payload: CstManualMigrationRequest = {}) {
   const { data } = await api.post<CstManualMigrationResult>("/cst/migration-jobs/manual", payload);
   return data;
@@ -1013,12 +1109,14 @@ export async function reconcileCstResources() {
 }
 
 
-export async function pushPendingCstJobs(limit = 0) {
-  const { data } = await api.post<CstPendingPushResult>("/cst/jobs/push-pending", null, { params: limit > 0 ? { limit } : undefined });
+export async function pushPendingCstJobs(limit = 0, resourceScope: CstResourceScope = "all") {
+  const params = { ...(limit > 0 ? { limit } : {}), resource_scope: resourceScope };
+  const { data } = await api.post<CstPendingPushResult>("/cst/jobs/push-pending", null, { params });
   return data;
 }
-export async function forcePushPendingCstJobs(limit = 0) {
-  const { data } = await api.post<CstPendingPushResult>("/cst/jobs/push-pending/force", null, { params: limit > 0 ? { limit } : undefined });
+export async function forcePushPendingCstJobs(limit = 0, resourceScope: CstResourceScope = "all") {
+  const params = { ...(limit > 0 ? { limit } : {}), resource_scope: resourceScope };
+  const { data } = await api.post<CstPendingPushResult>("/cst/jobs/push-pending/force", null, { params });
   return data;
 }
 

@@ -7,7 +7,7 @@ import json
 from io import StringIO
 from urllib import error as urllib_error, parse as urllib_parse, request as urllib_request
 import ssl
-from ipaddress import IPv4Address, IPv4Network, ip_network, summarize_address_range
+from ipaddress import IPv4Address, IPv4Network, collapse_addresses, ip_network, summarize_address_range
 import os
 from pathlib import Path
 import re
@@ -55,6 +55,7 @@ CST_FALLBACK_PHONE_NUMBER = "0000000000"
 CST_FALLBACK_ID_NUMBER = "0000000000"
 CST_DEFAULT_ACCEPT_LANGUAGE = "EN"
 CST_API_TIMEZONE = timezone(timedelta(hours=3))
+BULK_UNASSIGNED_FRAGMENT_SOURCE = "bulk_unassigned_fragment"
 AUDIT_SERVICE = AuditService(lambda: now_iso())
 
 app = FastAPI(title="NetAtlas IPAM API", version="1.0.0")
@@ -897,6 +898,7 @@ class CstPendingPushResult(BaseModel):
     hourly_request_limit: int = 0
     rate_delay_seconds: float = 0
     force_api_override: bool = False
+    resource_scope: str = "all"
     jobs: list[CstSyncJob] = Field(default_factory=list)
 
 
@@ -907,7 +909,91 @@ class CstManualMigrationRequest(BaseModel):
     force_api_override: bool = False
     include_existing_transactions: bool = False
     only_cst_ready: bool = True
+    resource_scope: str = "all"
 
+
+class CstMigrationReviewRequest(BaseModel):
+    page: int = 1
+    page_size: int = 25
+    search: str = ""
+    assignment_status: str = "all"
+    transaction_type: str = "all"
+    validation_status: str = "all"
+    created_from: str = ""
+    created_to: str = ""
+    resource_scope: str = "assigned"
+    include_existing_transactions: bool = False
+
+
+class CstMigrationReviewItem(BaseModel):
+    review_id: str
+    resource_uuid: str
+    operation: str
+    cidr: str
+    start_ip: str = ""
+    end_ip: str = ""
+    customer_name: str = ""
+    customer_id: str = ""
+    service_id: str = ""
+    transaction_id: str = ""
+    assignment_status_id: int = 1
+    assignment_status: str = "Unassigned"
+    validation_status: str = "VALID"
+    validation_errors: list[str] = Field(default_factory=list)
+    cst_sync_status: str = ""
+    source_entity_type: str = ""
+    created_at: str = ""
+    eligible: bool = True
+    reason: str = ""
+
+
+class CstMigrationReviewCounts(BaseModel):
+    total_matching: int = 0
+    included_default: int = 0
+    excluded: int = 0
+    selected: int = 0
+    valid: int = 0
+    invalid: int = 0
+
+
+class CstMigrationReviewResponse(BaseModel):
+    page: int = 1
+    page_size: int = 25
+    total: int = 0
+    resource_scope: str = "assigned"
+    generated_at: str = ""
+    items: list[CstMigrationReviewItem] = Field(default_factory=list)
+    all_matching_review_ids: list[str] = Field(default_factory=list)
+    counts: CstMigrationReviewCounts = Field(default_factory=CstMigrationReviewCounts)
+
+
+class CstMigrationReviewCreateRequest(BaseModel):
+    included_review_ids: list[str] = Field(default_factory=list)
+    excluded_review_ids: list[str] = Field(default_factory=list)
+    resource_scope: str = "assigned"
+    final_confirmed: bool = False
+    created_by: str = "admin"
+
+
+class CstMigrationReviewRejectedItem(BaseModel):
+    review_id: str
+    resource_uuid: str = ""
+    cidr: str = ""
+    operation: str = ""
+    reason: str
+
+
+class CstMigrationReviewCreateResult(BaseModel):
+    batch_id: str = ""
+    created_jobs: int = 0
+    included_transactions: int = 0
+    rejected_count: int = 0
+    skipped_count: int = 0
+    created_at: str = ""
+    created_by: str = "admin"
+    message: str = ""
+    rejected: list[CstMigrationReviewRejectedItem] = Field(default_factory=list)
+    jobs: list[CstSyncJob] = Field(default_factory=list)
 
 class CstMigrationJobStats(BaseModel):
     batch_id: str
@@ -2087,6 +2173,55 @@ def resource_requires_cst(resource: ResourceRecord) -> bool:
     return resource.ip_type == "PUBLIC" and resource.status != "RETIRED"
 
 
+def cst_integrity_conflict_blocks_push(status: object) -> bool:
+    normalized = str(status or "").strip().upper()
+    return bool(normalized and normalized != "ACCEPTED")
+
+
+def cst_resource_integrity_issues(connection: sqlite3.Connection, resource: ResourceRecord | None) -> list[str]:
+    if resource is None or resource.source_entity_type != "assignment" or not resource.source_entity_id:
+        return []
+    row = connection.execute(
+        "SELECT migration_conflict_status, migration_conflict_reason FROM assignments WHERE id = ?",
+        (resource.source_entity_id,),
+    ).fetchone()
+    if row is not None:
+        conflict_status = row["migration_conflict_status"]
+        conflict_reason = str(row["migration_conflict_reason"] or "").strip()
+    else:
+        conflict_status = resource.migration_conflict_status
+        conflict_reason = str(resource.migration_conflict_reason or "").strip()
+    if not cst_integrity_conflict_blocks_push(conflict_status):
+        return []
+    reason = conflict_reason or "Resolve the subnet in Integrity & Conflicts before CST sync"
+    return [f"Integrity conflict is pending resolution for {resource.cidr}: {reason}"]
+
+
+def normalize_cst_resource_scope(value: str) -> str:
+    scope = str(value or "all").strip().lower().replace("-", "_")
+    aliases = {
+        "all": "all",
+        "assigned": "assigned",
+        "assignment": "assigned",
+        "assignments": "assigned",
+        "unassigned": "unassigned",
+        "un_assigned": "unassigned",
+        "free": "unassigned",
+    }
+    normalized = aliases.get(scope)
+    if normalized is None:
+        raise HTTPException(status_code=400, detail="resource_scope must be all, assigned, or unassigned")
+    return normalized
+
+
+def cst_resource_matches_scope(resource: ResourceRecord, resource_scope: str) -> bool:
+    scope = normalize_cst_resource_scope(resource_scope)
+    if scope == "all":
+        return True
+    status_id = cst_int_value(resource.assignment_status_id, 1)
+    if scope == "unassigned":
+        return status_id == 1
+    return status_id in {2, 3, 4}
 def cst_operation_enabled(config: CstConfig, operation: str) -> bool:
     return {
         "SEND": config.send_enabled,
@@ -2588,12 +2723,24 @@ def cst_resource_from_ledger(row: sqlite3.Row) -> ResourceRecord:
 
 
 def remaining_networks_after_subtract(container: IPv4Network, allocated: IPv4Network) -> list[IPv4Network]:
+    if not container.overlaps(allocated):
+        return [container]
     remaining: list[IPv4Network] = []
-    if int(container.network_address) < int(allocated.network_address):
-        remaining.extend(summarize_address_range(container.network_address, IPv4Address(int(allocated.network_address) - 1)))
-    if int(allocated.broadcast_address) < int(container.broadcast_address):
-        remaining.extend(summarize_address_range(IPv4Address(int(allocated.broadcast_address) + 1), container.broadcast_address))
-    return remaining
+    overlap_start = max(int(container.network_address), int(allocated.network_address))
+    overlap_end = min(int(container.broadcast_address), int(allocated.broadcast_address))
+    if int(container.network_address) < overlap_start:
+        remaining.extend(summarize_address_range(container.network_address, IPv4Address(overlap_start - 1)))
+    if overlap_end < int(container.broadcast_address):
+        remaining.extend(summarize_address_range(IPv4Address(overlap_end + 1), container.broadcast_address))
+    return sorted(remaining, key=lambda item: (int(item.network_address), item.prefixlen))
+
+
+def normalize_network_list(networks: list[IPv4Network]) -> list[IPv4Network]:
+    return sorted(collapse_addresses(networks), key=lambda item: (int(item.network_address), item.prefixlen))
+
+
+def network_difference(container: IPv4Network, removed: IPv4Network) -> list[IPv4Network]:
+    return normalize_network_list(remaining_networks_after_subtract(container, removed))
 
 
 def active_cst_containers_for_network(connection: sqlite3.Connection, network: IPv4Network) -> list[sqlite3.Row]:
@@ -2617,6 +2764,133 @@ def active_cst_containers_for_network(connection: sqlite3.Connection, network: I
     containers.sort(key=lambda item: item[0], reverse=True)
     return [row for _prefix, row in containers[:1]]
 
+
+def subtract_allocated_networks(container: IPv4Network, allocated_networks: list[IPv4Network]) -> list[IPv4Network]:
+    free_blocks = [container]
+    ordered = sorted(allocated_networks, key=lambda item: (int(item.network_address), item.prefixlen))
+    for allocated in ordered:
+        next_blocks: list[IPv4Network] = []
+        for block in free_blocks:
+            if not block.overlaps(allocated):
+                next_blocks.append(block)
+                continue
+            overlap_start = max(int(block.network_address), int(allocated.network_address))
+            overlap_end = min(int(block.broadcast_address), int(allocated.broadcast_address))
+            if int(block.network_address) < overlap_start:
+                next_blocks.extend(summarize_address_range(block.network_address, IPv4Address(overlap_start - 1)))
+            if overlap_end < int(block.broadcast_address):
+                next_blocks.extend(summarize_address_range(IPv4Address(overlap_end + 1), block.broadcast_address))
+        free_blocks = next_blocks
+    return sorted(free_blocks, key=lambda item: (int(item.network_address), item.prefixlen))
+
+
+def top_level_public_pool_resources(connection: sqlite3.Connection) -> list[ResourceRecord]:
+    rows = connection.execute(
+        """
+        SELECT * FROM ip_resources
+        WHERE source_entity_type = 'pool'
+          AND ip_type = 'PUBLIC'
+          AND status != 'RETIRED'
+        ORDER BY prefix ASC, start_ip ASC
+        """
+    ).fetchall()
+    roots: list[ResourceRecord] = []
+    root_networks: list[IPv4Network] = []
+    for row in rows:
+        resource = resource_from_row(row)
+        network = normalize_network(resource.cidr)
+        if any(network.subnet_of(root_network) for root_network in root_networks):
+            continue
+        roots.append(resource)
+        root_networks.append(network)
+    return roots
+
+
+def active_public_assignment_networks(connection: sqlite3.Connection, root_network: IPv4Network) -> list[IPv4Network]:
+    rows = connection.execute(
+        """
+        SELECT a.*
+        FROM assignments a
+        INNER JOIN ip_resources r ON r.source_entity_type = 'assignment' AND r.source_entity_id = a.id
+        WHERE r.ip_type = 'PUBLIC'
+          AND r.status != 'RETIRED'
+        """
+    ).fetchall()
+    networks: list[IPv4Network] = []
+    for row in rows:
+        assignment = assignment_from_row(row)
+        if not assignment_active_for_conflict(assignment):
+            continue
+        network = network_of(assignment)
+        if network.subnet_of(root_network):
+            networks.append(network)
+    return networks
+
+
+def materialize_bulk_unassigned_fragments(connection: sqlite3.Connection) -> tuple[int, int]:
+    roots = top_level_public_pool_resources(connection)
+    desired: dict[str, ResourceRecord] = {}
+    for root in roots:
+        root_network = normalize_network(root.cidr)
+        assigned_networks = active_public_assignment_networks(connection, root_network)
+        if not assigned_networks:
+            continue
+        for fragment in subtract_allocated_networks(root_network, assigned_networks):
+            if fragment == root_network:
+                continue
+            resource_uuid = stable_uuid(BULK_UNASSIGNED_FRAGMENT_SOURCE, root.resource_uuid, str(fragment))
+            existing = find_resource_by_cidr(connection, str(fragment))
+            if existing and existing.source_entity_type != BULK_UNASSIGNED_FRAGMENT_SOURCE:
+                continue
+            fragment_resource = cst_resource_from_network(
+                fragment,
+                resource_uuid,
+                BULK_UNASSIGNED_FRAGMENT_SOURCE,
+                f"{root.resource_uuid}:{fragment}",
+                f"Bulk migration remaining unassigned fragment from {root.cidr}",
+            ).model_copy(update={
+                "parent_resource_uuid": root.resource_uuid,
+                "parent_version_uuid": root.version_uuid,
+                "service_provider_id": root.service_provider_id or DEFAULT_SERVICE_PROVIDER_ID,
+                "service_provider_name": root.service_provider_name or DEFAULT_SERVICE_PROVIDER_NAME,
+                "asn": root.asn or DEFAULT_ASN,
+                "ip_type": root.ip_type,
+                "root_pool_uuid": root.resource_uuid,
+                "region": root.region,
+                "city": root.city,
+                "cst_sync_ready": True,
+                "cst_validation_status": "READY",
+            })
+            desired[resource_uuid] = fragment_resource
+
+    stale_rows = connection.execute(
+        "SELECT * FROM ip_resources WHERE source_entity_type = ?",
+        (BULK_UNASSIGNED_FRAGMENT_SOURCE,),
+    ).fetchall()
+    deleted = 0
+    for row in stale_rows:
+        status = str(row["cst_sync_status"] or "").upper()
+        if str(row["resource_uuid"]) in desired or status in {"SUCCESS", "SYNCHRONIZED"}:
+            continue
+        connection.execute("DELETE FROM assignment_details WHERE resource_uuid = ?", (row["resource_uuid"],))
+        connection.execute("DELETE FROM ip_resources WHERE resource_uuid = ?", (row["resource_uuid"],))
+        deleted += 1
+
+    materialized = 0
+    for resource in desired.values():
+        upsert_resource_record(connection, resource)
+        materialized += 1
+
+    if materialized or deleted:
+        record_audit(
+            connection,
+            "Bulk Unassigned Fragment Materialized",
+            "bulk_migration_inventory",
+            "bulk-unassigned-fragments",
+            "",
+            json.dumps({"materialized": materialized, "deletedStale": deleted}),
+        )
+    return materialized, deleted
 
 def parse_iso_datetime(value: str) -> datetime | None:
     if not value:
@@ -2825,6 +3099,28 @@ def create_cst_assignment_create_jobs(
             )
     operations.append((assignment_resource, "SEND"))
     return create_cst_sync_jobs(connection, operations, workflow_type)
+
+def cst_waiting_for_prior_delete_message() -> str:
+    return "Waiting for earlier CST DeleteLIRData job in this batch to succeed before sending split child records"
+
+
+def cst_job_waiting_for_prior_delete(connection: sqlite3.Connection, job: CstSyncJob) -> bool:
+    if job.operation == "DELETE":
+        return False
+    row = connection.execute(
+        """
+        SELECT 1
+        FROM cst_sync_jobs
+        WHERE batch_id = ?
+          AND sequence_no < ?
+          AND operation = 'DELETE'
+          AND status != 'SUCCESS'
+        LIMIT 1
+        """,
+        (job.batch_id, job.sequence_no),
+    ).fetchone()
+    return row is not None
+
 def create_cst_sync_jobs(
     connection: sqlite3.Connection,
     resource_operations: list[tuple[ResourceRecord, str]],
@@ -2850,12 +3146,17 @@ def create_cst_sync_jobs(
     )
 
     jobs: list[CstSyncJob] = []
+    prior_delete_unresolved = False
     for sequence_no, (resource, operation) in enumerate(eligible, start=1):
         transaction_id = cst_transaction_id_for_resource(connection, resource, operation, batch_id, correlation_id)
         payload = cst_payload_for_resource(resource, operation, transaction_id, correlation_id)
         validation_payload = payload if operation in {"SEND", "UPDATE"} else cst_payload_for_resource(resource, "SEND", transaction_id, correlation_id)
-        quality_issues = cst_data_quality_issues(resource, operation, validation_payload)
-        if not config.enabled:
+        quality_issues = [*cst_resource_integrity_issues(connection, resource), *cst_data_quality_issues(resource, operation, validation_payload)]
+        if prior_delete_unresolved and operation != "DELETE":
+            status = "PENDING"
+            last_error = cst_waiting_for_prior_delete_message()
+            response = {"temporaryStorage": True, "externalApiCalled": False, "accepted": False, "message": last_error}
+        elif not config.enabled:
             status = "PENDING"
             last_error = "CST integration is disabled in Administration"
             response = {"temporaryStorage": True, "externalApiCalled": False, "accepted": False, "message": last_error}
@@ -2934,8 +3235,11 @@ def create_cst_sync_jobs(
                 "UPDATE assignments SET cst_sync_status = ?, action_flag = ? WHERE id = ?",
                 (status, action_flag, resource.source_entity_id),
             )
+        if operation == "DELETE" and status != "SUCCESS":
+            prior_delete_unresolved = True
         jobs.append(job)
 
+    reconcile_cst_success_resource_statuses(connection)
     completed_jobs = sum(1 for job in jobs if job.status in {"SUCCESS", "NOT_REQUIRED"})
     failed_jobs = sum(1 for job in jobs if job.status == "FAILED")
     blocked_jobs = 0
@@ -2965,9 +3269,13 @@ def retry_cst_jobs(connection: sqlite3.Connection, job_rows: list[sqlite3.Row], 
         updated_at = now_iso()
         payload = cst_payload_for_resource(resource, job.operation, job.transaction_id, job.batch_id) if resource else stored_payload
         validation_payload = cst_payload_for_resource(resource, "SEND", job.transaction_id, job.batch_id) if resource and job.operation not in {"SEND", "UPDATE", "GET"} else payload
-        quality_issues = cst_data_quality_issues(resource, job.operation, validation_payload) if resource else []
+        quality_issues = [*cst_resource_integrity_issues(connection, resource), *(cst_data_quality_issues(resource, job.operation, validation_payload) if resource else [])]
         retry_without_resource = resource is None and job.operation in {"DELETE", "UPDATE", "SEND"} and bool(payload)
-        if quality_issues:
+        if cst_job_waiting_for_prior_delete(connection, job):
+            status = "PENDING"
+            last_error = cst_waiting_for_prior_delete_message()
+            response = {"temporaryStorage": True, "externalApiCalled": False, "accepted": False, "message": last_error}
+        elif quality_issues:
             status = "PENDING"
             last_error = cst_quality_message(quality_issues)
             response = {"temporaryStorage": True, "externalApiCalled": False, "accepted": False, "dataQualityStatus": "INVALID_FOR_CST", "issues": quality_issues, "message": last_error}
@@ -3051,8 +3359,14 @@ def retry_cst_jobs(connection: sqlite3.Connection, job_rows: list[sqlite3.Row], 
             "UPDATE ip_resources SET cst_sync_status = ?, transaction_id = ?, action_flag = ?, updated_at = ? WHERE resource_uuid = ?",
             (status, job.transaction_id, action_flag, updated_at, job.resource_uuid),
         )
+        if resource and resource.source_entity_type == "assignment":
+            connection.execute(
+                "UPDATE assignments SET cst_sync_status = ?, action_flag = ? WHERE id = ?",
+                (status, action_flag, resource.source_entity_id),
+            )
         updated = connection.execute("SELECT * FROM cst_sync_jobs WHERE id = ?", (job.id,)).fetchone()
         updated_jobs.append(cst_job_from_row(updated))
+    reconcile_cst_success_resource_statuses(connection)
     for batch_id in {job.batch_id for job in updated_jobs}:
         rows = connection.execute("SELECT status FROM cst_sync_jobs WHERE batch_id = ?", (batch_id,)).fetchall()
         total = len(rows)
@@ -3065,6 +3379,38 @@ def retry_cst_jobs(connection: sqlite3.Connection, job_rows: list[sqlite3.Row], 
             (status, completed, failed, blocked, now_iso() if status in {"SUCCESS", "NOT_REQUIRED"} else "", batch_id),
         )
     return updated_jobs
+
+
+def reconcile_cst_success_resource_statuses(connection: sqlite3.Connection) -> int:
+    rows = connection.execute(
+        """
+        SELECT j.resource_uuid, j.transaction_id, r.source_entity_type, r.source_entity_id
+        FROM cst_sync_jobs j
+        INNER JOIN ip_resources r ON r.resource_uuid = j.resource_uuid
+        WHERE j.status = 'SUCCESS'
+          AND r.cst_sync_status != 'SUCCESS'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM cst_sync_jobs newer
+            WHERE newer.resource_uuid = j.resource_uuid
+              AND newer.updated_at > j.updated_at
+          )
+        """
+    ).fetchall()
+    updated = 0
+    timestamp = now_iso()
+    for row in rows:
+        connection.execute(
+            "UPDATE ip_resources SET cst_sync_status = 'SUCCESS', transaction_id = ?, action_flag = 'S', updated_at = ? WHERE resource_uuid = ?",
+            (row["transaction_id"], timestamp, row["resource_uuid"]),
+        )
+        if row["source_entity_type"] == "assignment":
+            connection.execute(
+                "UPDATE assignments SET cst_sync_status = 'SUCCESS', action_flag = 'S' WHERE id = ?",
+                (row["source_entity_id"],),
+            )
+        updated += 1
+    return updated
 
 
 def cst_effective_pending_push_limit(config: CstConfig, requested_limit: int) -> int:
@@ -3309,6 +3655,25 @@ def insert_pool(connection: sqlite3.Connection, pool: Pool) -> None:
     )
 
 
+def ensure_assignment_cidr_conflicts_allowed(connection: sqlite3.Connection) -> None:
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'assignments'"
+    ).fetchone()
+    create_sql = str(row["sql"] if row else "")
+    if "cidr TEXT NOT NULL UNIQUE" not in create_sql:
+        return
+    temp_table = "assignments_allow_conflicts"
+    connection.execute(f"DROP TABLE IF EXISTS {temp_table}")
+    connection.execute(f"ALTER TABLE assignments RENAME TO {temp_table}")
+    replacement_sql = create_sql.replace("CREATE TABLE assignments", "CREATE TABLE assignments", 1).replace("cidr TEXT NOT NULL UNIQUE", "cidr TEXT NOT NULL", 1)
+    connection.execute(replacement_sql)
+    columns = [str(info[1]) for info in connection.execute(f"PRAGMA table_info({temp_table})").fetchall()]
+    column_sql = ", ".join(columns)
+    connection.execute(f"INSERT INTO assignments ({column_sql}) SELECT {column_sql} FROM {temp_table}")
+    connection.execute(f"DROP TABLE {temp_table}")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_assignments_cidr ON assignments (cidr)")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_assignments_customer ON assignments (customer_name)")
+
 def insert_assignment(connection: sqlite3.Connection, assignment: Assignment) -> None:
     data = assignment.model_dump()
     columns = list(data.keys())
@@ -3340,7 +3705,7 @@ def init_db() -> None:
 
             CREATE TABLE IF NOT EXISTS assignments (
               id TEXT PRIMARY KEY,
-              cidr TEXT NOT NULL UNIQUE,
+              cidr TEXT NOT NULL,
               prefix INTEGER NOT NULL,
               size INTEGER NOT NULL,
               start TEXT NOT NULL,
@@ -3671,6 +4036,8 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_partial_reassignment_fragments_status ON partial_reassignment_fragments (status);
                     """
                 )
+        ensure_assignment_cidr_conflicts_allowed(connection)
+        add_missing_columns(connection, "pools", Pool)
         add_missing_columns(connection, "assignments", Assignment)
         add_missing_columns(connection, "ip_resources", ResourceRecord)
         add_missing_columns(connection, "assignment_details", AssignmentDetailRecord)
@@ -3702,7 +4069,7 @@ def init_db() -> None:
                 INSERT INTO siebel_config (id, username, encrypted_password, dsn, connection_timeout, query_sql, updated_at)
                 VALUES ('default', 'LIR_USER', '', '172.31.23.101:1525/SIDB', 10, ?, ?)
                 """,
-                (now_iso(),),
+                ("", now_iso()),
             )
 
         cst_config_count = connection.execute("SELECT COUNT(*) FROM cst_config").fetchone()[0]
@@ -3904,24 +4271,47 @@ def list_users_from_db() -> list[UserOut]:
     return [user_from_row(row) for row in rows]
 
 
-def csv_rows(csv_text: str) -> list[dict[str, str]]:
-    reader = csv.DictReader(StringIO(csv_text.strip()))
+def csv_cell_text(value: object) -> str:
+    if isinstance(value, list):
+        return ",".join(str(item or "").strip() for item in value if str(item or "").strip())
+    return str(value or "").strip()
+
+
+def csv_text_value(csv_text: object) -> str:
+    if isinstance(csv_text, list):
+        return "\n".join(csv_cell_text(item) for item in csv_text)
+    return str(csv_text or "")
+
+
+def csv_rows(csv_text: object) -> list[dict[str, str]]:
+    reader = csv.DictReader(StringIO(csv_text_value(csv_text).strip()))
     if not reader.fieldnames:
         return []
-    return [{key: (value or "").strip() for key, value in row.items()} for row in reader]
+    rows: list[dict[str, str]] = []
+    for row in reader:
+        normalized: dict[str, str] = {}
+        for key, value in row.items():
+            if key is None:
+                extra_columns = csv_cell_text(value)
+                if extra_columns:
+                    normalized["_extra_columns"] = extra_columns
+                continue
+            normalized[str(key).strip()] = csv_cell_text(value)
+        rows.append(normalized)
+    return rows
 
 
-def csv_data_row_count(csv_text: str) -> int:
-    lines = [line for line in csv_text.splitlines() if line.strip()]
+def csv_data_row_count(csv_text: object) -> int:
+    lines = [line for line in csv_text_value(csv_text).splitlines() if line.strip()]
     return max(0, len(lines) - 1)
 
 
 def csv_value(row: dict[str, str], *keys: str) -> str:
-    normalized = {key.lower(): value for key, value in row.items()}
+    normalized = {str(key).lower(): value for key, value in row.items()}
     for key in keys:
         value = normalized.get(key.lower())
         if value is not None:
-            return value.strip()
+            return csv_cell_text(value)
     return ""
 
 
@@ -4279,8 +4669,14 @@ def cst_bulk_readiness_for_assignment(connection: sqlite3.Connection, assignment
     assignment_type = (assignment.assignment_target_type or "").lower()
     if assignment_type == "business_customer" or assignment.assignment_status_id == 3:
         organization_identifier = assignment.organization_id or assignment.commercial_reg_id or assignment.unified_number
-        if not valid_organization_identifier(organization_identifier):
+        if organization_identifier and not valid_organization_identifier(organization_identifier):
             errors.append("organizationId/commercialRegId/unifiedNumber must contain a valid 10-digit customer organization identifier for Business assignment")
+        elif not organization_identifier:
+            fallback_customer_id = str(assignment.customer_id or assignment.bss_customer_id or "").strip()
+            if fallback_customer_id:
+                warnings.append("organizationId/commercialRegId/unifiedNumber missing; customerId was used as organizationId for CST upload")
+            else:
+                errors.append("organizationId/commercialRegId/unifiedNumber/customerId is required for Business assignment")
         if assignment.commercial_reg_id and assignment.commercial_reg_id != "N/A" and not valid_organization_identifier(assignment.commercial_reg_id):
             errors.append("commercialRegId must be 10 digits when supplied")
         if assignment.unified_number and assignment.unified_number != "N/A" and not valid_organization_identifier(assignment.unified_number):
@@ -4332,8 +4728,11 @@ def assignment_payload_from_bulk_row(row: dict[str, str], network: IPv4Network, 
     organization_id = csv_value(row, "organizationId", "organization_id")
     commercial_reg_id = csv_value(row, "commercial_reg_id", "commercialRegId", "crNumber", "cr_number")
     unified_number = csv_value(row, "unified_number", "unifiedNumber", "unifiedFacilityNumber", "unified_facility_number")
+    customer_id = csv_value(row, "customerId", "customer_id")
     if not organization_id:
-        organization_id = commercial_reg_id or unified_number
+        organization_id = commercial_reg_id or unified_number or customer_id
+        if organization_id == customer_id and assignment_type == "BUSINESS":
+            warnings.append("organizationId/commercialRegId/unifiedNumber missing; customerId was used as organizationId for CST upload")
     mobile_number = normalize_bulk_cst_phone(csv_value(row, "mobileNumber", "mobile_number"), row_number, "mobileNumber", warnings)
     contact_number = normalize_bulk_cst_phone(csv_value(row, "contact_number", "contactNumber"), row_number, "contactNumber", warnings)
     if not mobile_number and contact_number:
@@ -4343,6 +4742,18 @@ def assignment_payload_from_bulk_row(row: dict[str, str], network: IPv4Network, 
     contact_email = normalize_cst_email(csv_value(row, "contact_email", "contactEmail")) or csv_value(row, "contact_email", "contactEmail")
     if not email and contact_email:
         email = contact_email
+    region_text = csv_value(row, "region")
+    city_text = csv_value(row, "city")
+    customer_type_value = csv_value(row, "customerTypeId", "customer_type_id", "customerType", "customer_type")
+    region_id_value = csv_value(row, "regionId", "region_id")
+    city_id_value = csv_value(row, "cityId", "city_id")
+    access_technology_value = csv_value(row, "accessTechnologyId", "access_technology_id", "accessTechnology", "access_technology")
+    customer_type_id = str(cst_customer_type_id(customer_type_value) or customer_type_value or "")
+    city_id = str(cst_city_id(city_id_value or city_text) or city_id_value or "1")
+    region_id = str(cst_region_id(region_id_value or region_text) or region_id_value or "")
+    if not region_id and city_id.isdigit():
+        region_id = str(CST_CITY_REGION_BY_ID.get(int(city_id), ""))
+    access_technology_id = str(cst_access_technology_id(access_technology_value) or access_technology_value or "")
     if not assignment_date:
         raise HTTPException(status_code=400, detail="assignmentDate is mandatory")
     if assignment_type == "BUSINESS" and not service_id:
@@ -4360,13 +4771,13 @@ def assignment_payload_from_bulk_row(row: dict[str, str], network: IPv4Network, 
         service_order_id=csv_value(row, "serviceOrderId", "service_order_id"),
         siebel_order_number=csv_value(row, "siebelOrderNumber", "siebel_order_number"),
         bss_customer_id=csv_value(row, "bssCustomerId", "bss_customer_id", "customerId", "customer_id"),
-        customer_id=csv_value(row, "customerId", "customer_id"),
+        customer_id=customer_id,
         customer_name=customer_name,
         organization_name=csv_value(row, "organizationName", "organization_name") or customer_name,
         organization_id=organization_id,
-        customer_type_id=csv_value(row, "customerTypeId", "customer_type_id"),
-        region_id=csv_value(row, "regionId", "region_id"),
-        city_id=csv_value(row, "cityId", "city_id"),
+        customer_type_id=customer_type_id,
+        region_id=region_id,
+        city_id=city_id,
         full_name=full_name,
         mobile_number=mobile_number,
         id_number=normalize_cst_id_number(csv_value(row, "idNumber", "id_number", "customerIdentity", "customer_identity")) or csv_value(row, "idNumber", "id_number", "customerIdentity", "customer_identity"),
@@ -4375,8 +4786,8 @@ def assignment_payload_from_bulk_row(row: dict[str, str], network: IPv4Network, 
         unified_number=unified_number,
         contact_number=contact_number or mobile_number,
         contact_email=contact_email or email,
-        city=csv_value(row, "city"),
-        region=csv_value(row, "region"),
+        city=city_text,
+        region=region_text,
         contact_name=csv_value(row, "contact_name", "contactName") or full_name,
         internal_consumer_type=csv_value(row, "internalConsumerType", "internal_consumer_type"),
         internal_business_unit=csv_value(row, "internalBusinessUnit", "internal_business_unit"),
@@ -4391,7 +4802,7 @@ def assignment_payload_from_bulk_row(row: dict[str, str], network: IPv4Network, 
         l3_service=csv_value(row, "l3_service", "l3Service") or ("MPLS L3VPN" if assignment_type == "BUSINESS" else "Internal L3 Service"),
         service=service_description or csv_value(row, "service") or "L3 service allocation",
         service_description=service_description,
-        access_technology_id=csv_value(row, "accessTechnologyId", "access_technology_id"),
+        access_technology_id=access_technology_id,
         access_technology=csv_value(row, "accessTechnology", "access_technology"),
         owner=csv_value(row, "owner") or ("Business Customer" if assignment_type == "BUSINESS" else ""),
         site=csv_value(row, "site"),
@@ -5311,11 +5722,164 @@ def list_cst_transactions() -> list[CstTransactionLedger]:
     return [cst_ledger_from_row(row) for row in rows]
 
 
+def cst_review_id(operation: str, resource_uuid: str) -> str:
+    return f"{operation.upper()}:{resource_uuid}"
+
+
+def parse_cst_review_id(review_id: str) -> tuple[str, str]:
+    operation, _, resource_uuid = str(review_id or "").partition(":")
+    return operation.upper(), resource_uuid
+
+
+def cst_resource_existing_transaction_id(connection: sqlite3.Connection, resource: ResourceRecord) -> str:
+    row = connection.execute(
+        """
+        SELECT transaction_id
+        FROM cst_transaction_ledger
+        WHERE resource_uuid = ? OR cidr = ?
+        ORDER BY CASE WHEN resource_uuid = ? THEN 0 ELSE 1 END, first_used_at DESC
+        LIMIT 1
+        """,
+        (resource.resource_uuid, resource.cidr, resource.resource_uuid),
+    ).fetchone()
+    if row:
+        return str(row["transaction_id"] or "")
+    return str(resource.transaction_id or "")
+
+
+def cst_resource_has_existing_job(connection: sqlite3.Connection, resource_uuid: str) -> bool:
+    row = connection.execute(
+        """
+        SELECT 1
+        FROM cst_sync_jobs j
+        INNER JOIN cst_sync_batches b ON b.id = j.batch_id
+        WHERE j.resource_uuid = ?
+          AND b.workflow_type IN ('MANUAL_LIR_MIGRATION', 'INITIAL_MIGRATION')
+          AND j.status IN ('PENDING', 'RUNNING', 'SUCCESS', 'FAILED', 'NOT_REQUIRED')
+        LIMIT 1
+        """,
+        (resource_uuid,),
+    ).fetchone()
+    return row is not None
+
+
+def cst_review_operation_item(connection: sqlite3.Connection, resource: ResourceRecord, operation: str) -> CstMigrationReviewItem:
+    operation = operation.upper()
+    transaction_id = cst_resource_existing_transaction_id(connection, resource)
+    proposed_transaction_id = transaction_id or "Generated on job creation"
+    validation_payload = cst_payload_for_resource(resource, "SEND" if operation not in {"SEND", "UPDATE"} else operation, transaction_id or resource.resource_uuid, "migration-review")
+    issues = [*cst_resource_integrity_issues(connection, resource), *cst_data_quality_issues(resource, operation, validation_payload)]
+    return CstMigrationReviewItem(
+        review_id=cst_review_id(operation, resource.resource_uuid),
+        resource_uuid=resource.resource_uuid,
+        operation=operation,
+        cidr=resource.cidr,
+        start_ip=resource.start_ip,
+        end_ip=resource.end_ip,
+        customer_name=resource.organization_name or resource.customer_name,
+        customer_id=resource.organization_id,
+        service_id=resource.service_id,
+        transaction_id=proposed_transaction_id,
+        assignment_status_id=int(resource.assignment_status_id or 1),
+        assignment_status=assignment_status_id_name(int(resource.assignment_status_id or 1)),
+        validation_status="INVALID" if issues else "VALID",
+        validation_errors=issues,
+        cst_sync_status=resource.cst_sync_status,
+        source_entity_type=resource.source_entity_type,
+        created_at=resource.created_at,
+        eligible=not issues,
+        reason="; ".join(issues),
+    )
+
+
+def cst_review_matches_filter(item: CstMigrationReviewItem, request: CstMigrationReviewRequest) -> bool:
+    search = str(request.search or "").strip().lower()
+    if search:
+        haystack = " ".join([
+            item.cidr,
+            item.start_ip,
+            item.end_ip,
+            item.customer_name,
+            item.customer_id,
+            item.service_id,
+            item.transaction_id,
+            item.resource_uuid,
+        ]).lower()
+        if search not in haystack:
+            return False
+    assignment_status = str(request.assignment_status or "all").strip().lower()
+    if assignment_status not in {"", "all"}:
+        status_name = item.assignment_status.lower()
+        if assignment_status.isdigit():
+            if str(item.assignment_status_id) != assignment_status:
+                return False
+        elif assignment_status not in status_name:
+            return False
+    transaction_type = str(request.transaction_type or "all").strip().upper()
+    if transaction_type not in {"", "ALL"} and item.operation != transaction_type:
+        return False
+    validation_status = str(request.validation_status or "all").strip().upper()
+    if validation_status not in {"", "ALL"} and item.validation_status != validation_status:
+        return False
+    created_at = item.created_at[:10]
+    if request.created_from and created_at < request.created_from:
+        return False
+    if request.created_to and created_at > request.created_to:
+        return False
+    return True
+
+
+def cst_migration_review_items(connection: sqlite3.Connection, request: CstMigrationReviewRequest) -> list[CstMigrationReviewItem]:
+    scope = normalize_cst_resource_scope(request.resource_scope)
+    payload = CstManualMigrationRequest(
+        limit=0,
+        execute_immediately=False,
+        include_existing_transactions=request.include_existing_transactions,
+        only_cst_ready=False,
+        resource_scope=scope,
+    )
+    operations, _eligible_count, _parent_delete_count = cst_migration_resource_operations(connection, payload)
+    items: list[CstMigrationReviewItem] = []
+    seen: set[str] = set()
+    for resource, operation in operations:
+        review_id = cst_review_id(operation, resource.resource_uuid)
+        if review_id in seen:
+            continue
+        seen.add(review_id)
+        if cst_resource_has_existing_job(connection, resource.resource_uuid):
+            continue
+        item = cst_review_operation_item(connection, resource, operation)
+        if cst_review_matches_filter(item, request):
+            items.append(item)
+    return items
+
 def cst_migration_resource_rows(connection: sqlite3.Connection, payload: CstManualMigrationRequest) -> tuple[list[ResourceRecord], int]:
-    filters = ["r.ip_type = 'PUBLIC'", "r.status != 'RETIRED'"]
+    resource_scope = normalize_cst_resource_scope(payload.resource_scope)
+    filters = [
+        "r.ip_type = 'PUBLIC'",
+        "r.status != 'RETIRED'",
+        """
+        (
+          r.source_entity_type != 'pool'
+          OR NOT EXISTS (
+            SELECT 1
+            FROM ip_resources child
+            WHERE child.root_pool_uuid = r.resource_uuid
+              AND child.resource_uuid != r.resource_uuid
+              AND child.status != 'RETIRED'
+              AND child.source_entity_type IN ('assignment', 'bulk_unassigned_fragment')
+          )
+        )
+        """,
+    ]
     params: list[object] = []
+    if resource_scope == "assigned":
+        filters.append("r.assignment_status_id IN (2, 3, 4)")
+    elif resource_scope == "unassigned":
+        filters.append("r.assignment_status_id = 1")
     if not payload.include_existing_transactions:
         filters.append("r.resource_uuid NOT IN (SELECT resource_uuid FROM cst_transaction_ledger)")
+    filters.append("(r.source_entity_type != 'assignment' OR COALESCE(a.migration_conflict_status, '') IN ('', 'ACCEPTED'))")
     if payload.only_cst_ready:
         filters.append("(r.source_entity_type != 'assignment' OR COALESCE(a.cst_sync_ready, 0) = 1)")
     where_sql = " AND ".join(filters)
@@ -5343,6 +5907,51 @@ def cst_migration_resource_rows(connection: sqlite3.Connection, payload: CstManu
     ).fetchall()
     return [resource_from_row(row) for row in rows], int(total or 0)
 
+
+def cst_migration_parent_delete_operations(connection: sqlite3.Connection, resource_scope: str = "all") -> list[tuple[ResourceRecord, str]]:
+    scope = normalize_cst_resource_scope(resource_scope)
+    scope_filter = ""
+    if scope == "assigned":
+        scope_filter = "AND child.assignment_status_id IN (2, 3, 4)"
+    elif scope == "unassigned":
+        scope_filter = "AND child.assignment_status_id = 1"
+    rows = connection.execute(
+        f"""
+        SELECT parent.*
+        FROM ip_resources parent
+        WHERE parent.source_entity_type = 'pool'
+          AND parent.ip_type = 'PUBLIC'
+          AND parent.status != 'RETIRED'
+          AND EXISTS (
+            SELECT 1
+            FROM ip_resources child
+            LEFT JOIN assignments child_assignment ON child.source_entity_type = 'assignment' AND child.source_entity_id = child_assignment.id
+            WHERE child.root_pool_uuid = parent.resource_uuid
+              AND child.resource_uuid != parent.resource_uuid
+              AND child.status != 'RETIRED'
+              AND child.source_entity_type IN ('assignment', 'bulk_unassigned_fragment')
+              AND (child.source_entity_type != 'assignment' OR COALESCE(child_assignment.migration_conflict_status, '') IN ('', 'ACCEPTED'))
+              {scope_filter}
+          )
+        ORDER BY parent.prefix ASC, parent.cidr ASC
+        """
+    ).fetchall()
+    operations: list[tuple[ResourceRecord, str]] = []
+    for row in rows:
+        resource = resource_from_row(row)
+        if cst_resource_reported_to_cst(connection, resource) and not cst_resource_deleted_from_cst(connection, resource):
+            operations.append((resource, "DELETE"))
+    return operations
+
+
+def cst_migration_resource_operations(
+    connection: sqlite3.Connection,
+    payload: CstManualMigrationRequest,
+) -> tuple[list[tuple[ResourceRecord, str]], int, int]:
+    resources, eligible_count = cst_migration_resource_rows(connection, payload)
+    delete_operations = cst_migration_parent_delete_operations(connection, payload.resource_scope)
+    operations = [*delete_operations, *[(resource, "SEND") for resource in resources]]
+    return operations, eligible_count, len(delete_operations)
 
 def cst_batch_job_stats(connection: sqlite3.Connection, batch_id: str) -> CstMigrationJobStats:
     batch = connection.execute("SELECT * FROM cst_sync_batches WHERE id = ?", (batch_id,)).fetchone()
@@ -5404,9 +6013,121 @@ def process_cst_batch_pending_jobs(connection: sqlite3.Connection, batch_id: str
     return processed
 
 
+@app.post("/cst/migration-jobs/review", response_model=CstMigrationReviewResponse)
+def review_cst_migration_jobs(request: CstMigrationReviewRequest | None = None) -> CstMigrationReviewResponse:
+    request = request or CstMigrationReviewRequest()
+    request.resource_scope = normalize_cst_resource_scope(request.resource_scope)
+    request.page = max(int(request.page or 1), 1)
+    request.page_size = min(max(int(request.page_size or 25), 1), 500)
+    with connect() as connection:
+        items = cst_migration_review_items(connection, request)
+    total = len(items)
+    valid_count = sum(1 for item in items if item.validation_status == "VALID")
+    invalid_count = total - valid_count
+    start = (request.page - 1) * request.page_size
+    page_items = items[start:start + request.page_size]
+    return CstMigrationReviewResponse(
+        page=request.page,
+        page_size=request.page_size,
+        total=total,
+        resource_scope=request.resource_scope,
+        generated_at=now_iso(),
+        items=page_items,
+        all_matching_review_ids=[item.review_id for item in items],
+        counts=CstMigrationReviewCounts(
+            total_matching=total,
+            included_default=total,
+            excluded=0,
+            selected=0,
+            valid=valid_count,
+            invalid=invalid_count,
+        ),
+    )
+
+
+@app.post("/cst/migration-jobs/review/create", response_model=CstMigrationReviewCreateResult)
+def create_cst_migration_job_from_review(request: CstMigrationReviewCreateRequest) -> CstMigrationReviewCreateResult:
+    if not request.final_confirmed:
+        raise HTTPException(status_code=400, detail="Final confirmation is required before creating the CST migration job")
+    request.resource_scope = normalize_cst_resource_scope(request.resource_scope)
+    included_ids = list(dict.fromkeys([item for item in request.included_review_ids if str(item or "").strip()]))
+    excluded_ids = list(dict.fromkeys([item for item in request.excluded_review_ids if str(item or "").strip()]))
+    if not included_ids:
+        raise HTTPException(status_code=400, detail="At least one CST transaction must be included")
+
+    created_at = now_iso()
+    rejected: list[CstMigrationReviewRejectedItem] = []
+    jobs: list[CstSyncJob] = []
+    batch_id = ""
+    with connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        review_request = CstMigrationReviewRequest(
+            page=1,
+            page_size=500,
+            resource_scope=request.resource_scope,
+            include_existing_transactions=False,
+            validation_status="all",
+        )
+        current_items = {item.review_id: item for item in cst_migration_review_items(connection, review_request)}
+        operations: list[tuple[ResourceRecord, str]] = []
+        for review_id in included_ids:
+            operation, resource_uuid = parse_cst_review_id(review_id)
+            item = current_items.get(review_id)
+            if item is None:
+                rejected.append(CstMigrationReviewRejectedItem(review_id=review_id, resource_uuid=resource_uuid, operation=operation, reason="No longer eligible or already assigned to another migration job"))
+                continue
+            resource_row = connection.execute("SELECT * FROM ip_resources WHERE resource_uuid = ?", (resource_uuid,)).fetchone()
+            if resource_row is None:
+                rejected.append(CstMigrationReviewRejectedItem(review_id=review_id, resource_uuid=resource_uuid, cidr=item.cidr, operation=operation, reason="Resource no longer exists"))
+                continue
+            resource = resource_from_row(resource_row)
+            if cst_resource_has_existing_job(connection, resource_uuid):
+                rejected.append(CstMigrationReviewRejectedItem(review_id=review_id, resource_uuid=resource_uuid, cidr=resource.cidr, operation=operation, reason="Already assigned to an active or completed CST migration job"))
+                continue
+            validation_payload = cst_payload_for_resource(resource, "SEND" if operation not in {"SEND", "UPDATE"} else operation, resource.transaction_id or resource_uuid, "migration-review-create")
+            issues = [*cst_resource_integrity_issues(connection, resource), *cst_data_quality_issues(resource, operation, validation_payload)]
+            if issues:
+                rejected.append(CstMigrationReviewRejectedItem(review_id=review_id, resource_uuid=resource_uuid, cidr=resource.cidr, operation=operation, reason="; ".join(issues)))
+                continue
+            operations.append((resource, operation))
+        if operations:
+            jobs = create_cst_sync_jobs(connection, operations, "MANUAL_LIR_MIGRATION")
+            batch_id = jobs[0].batch_id if jobs else ""
+        stats = cst_batch_job_stats(connection, batch_id) if batch_id else None
+        record_audit(
+            connection,
+            "Manual CST Migration Job Created From Review",
+            "cst_batch",
+            batch_id,
+            "",
+            json.dumps({
+                "createdBy": request.created_by,
+                "includedReviewIds": included_ids,
+                "excludedReviewIds": excluded_ids,
+                "createdJobs": len(jobs),
+                "rejected": [item.model_dump() for item in rejected],
+                "resourceScope": request.resource_scope,
+                "createdAt": created_at,
+            }),
+        )
+        message = f"Migration job {batch_id} created with {len(jobs)} transaction(s)." if batch_id else "No CST migration job was created because all selected transactions were rejected."
+        return CstMigrationReviewCreateResult(
+            batch_id=batch_id,
+            created_jobs=len(jobs),
+            included_transactions=len(jobs),
+            rejected_count=len(rejected),
+            skipped_count=max(len(included_ids) - len(jobs) - len(rejected), 0),
+            created_at=created_at,
+            created_by=request.created_by or "admin",
+            message=message,
+            rejected=rejected,
+            jobs=jobs,
+        )
+
 @app.post("/cst/migration-jobs/manual", response_model=CstManualMigrationResult)
 def create_manual_cst_migration_job(payload: CstManualMigrationRequest | None = None) -> CstManualMigrationResult:
     payload = payload or CstManualMigrationRequest()
+    payload.resource_scope = normalize_cst_resource_scope(payload.resource_scope)
     if payload.limit < 0:
         raise HTTPException(status_code=400, detail="limit must be zero or greater")
     if payload.execute_immediately and not CST_PENDING_PUSH_LOCK.acquire(blocking=False):
@@ -5414,8 +6135,9 @@ def create_manual_cst_migration_job(payload: CstManualMigrationRequest | None = 
     lock_acquired = payload.execute_immediately
     try:
         with connect() as connection:
-            resources, eligible_count = cst_migration_resource_rows(connection, payload)
-            jobs = create_cst_sync_jobs(connection, [(resource, "SEND") for resource in resources], "MANUAL_LIR_MIGRATION")
+            operations, eligible_count, parent_delete_count = cst_migration_resource_operations(connection, payload)
+            send_count = sum(1 for _resource, operation in operations if operation == "SEND")
+            jobs = create_cst_sync_jobs(connection, operations, "MANUAL_LIR_MIGRATION")
             batch_id = jobs[0].batch_id if jobs else ""
             processed_jobs: list[CstSyncJob] = []
             if payload.execute_immediately and batch_id:
@@ -5426,7 +6148,7 @@ def create_manual_cst_migration_job(payload: CstManualMigrationRequest | None = 
                 ).fetchall()]
             stats = cst_batch_job_stats(connection, batch_id) if batch_id else None
             message = (
-                f"Manual CST migration job {batch_id} created with {len(jobs)} transaction job(s)."
+                f"Manual CST migration job {batch_id} created with {len(jobs)} transaction job(s) for scope {payload.resource_scope}, including {parent_delete_count} parent delete job(s)."
                 if batch_id else
                 "No eligible CST resources found. Load public pools/assignments first, or check CST readiness and existing transaction filters."
             )
@@ -5440,6 +6162,8 @@ def create_manual_cst_migration_job(payload: CstManualMigrationRequest | None = 
                     "createdJobs": len(jobs),
                     "processedJobs": len(processed_jobs),
                     "eligibleResources": eligible_count,
+                    "parentDeleteJobs": parent_delete_count,
+                    "resourceScope": payload.resource_scope,
                     "includeExistingTransactions": payload.include_existing_transactions,
                     "onlyCstReady": payload.only_cst_ready,
                     "executeImmediately": payload.execute_immediately,
@@ -5451,7 +6175,7 @@ def create_manual_cst_migration_job(payload: CstManualMigrationRequest | None = 
                 created_jobs=len(jobs),
                 processed_jobs=len(processed_jobs),
                 eligible_resources=eligible_count,
-                skipped_resources=max(eligible_count - len(resources), 0),
+                skipped_resources=max(eligible_count - send_count, 0),
                 message=message,
                 stats=stats,
                 jobs=jobs,
@@ -5509,7 +6233,8 @@ def reconcile_cst_resources() -> list[CstSyncJob]:
 
 
 
-def push_pending_cst_jobs_with_options(limit: int = 0, force_api_override: bool = False) -> CstPendingPushResult:
+def push_pending_cst_jobs_with_options(limit: int = 0, force_api_override: bool = False, resource_scope: str = "all") -> CstPendingPushResult:
+    resource_scope = normalize_cst_resource_scope(resource_scope)
     if limit < 0:
         raise HTTPException(status_code=400, detail="limit must be zero or greater")
     if not CST_PENDING_PUSH_LOCK.acquire(blocking=False):
@@ -5528,8 +6253,21 @@ def push_pending_cst_jobs_with_options(limit: int = 0, force_api_override: bool 
             hourly_request_limit = max(int(config.hourly_request_limit or 1000), 1)
             effective_limit = cst_effective_pending_push_limit(config, limit)
             rate_delay_seconds = cst_rate_limit_delay_seconds(config)
+            scope_filter = ""
+            if resource_scope == "assigned":
+                scope_filter = "AND (j.operation = 'DELETE' OR r.assignment_status_id IN (2, 3, 4))"
+            elif resource_scope == "unassigned":
+                scope_filter = "AND (j.operation = 'DELETE' OR r.assignment_status_id = 1)"
             rows = connection.execute(
-                "SELECT * FROM cst_sync_jobs WHERE status = 'PENDING' ORDER BY created_at, sequence_no, id LIMIT ?",
+                f"""
+                SELECT j.*
+                FROM cst_sync_jobs j
+                LEFT JOIN ip_resources r ON r.resource_uuid = j.resource_uuid
+                WHERE j.status = 'PENDING'
+                  {scope_filter}
+                ORDER BY j.created_at, j.sequence_no, j.id
+                LIMIT ?
+                """,
                 (effective_limit,),
             ).fetchall()
             requested_jobs = len(rows)
@@ -5556,24 +6294,25 @@ def push_pending_cst_jobs_with_options(limit: int = 0, force_api_override: bool 
         failed_jobs=failed_jobs,
         pending_jobs=pending_jobs,
         not_required_jobs=not_required_jobs,
-        message=f"{mode} {len(processed_jobs)} pending CST job(s) sequentially. Batch limit: {batch_size_limit}. Hourly limit: {hourly_request_limit}.",
+        message=f"{mode} {len(processed_jobs)} pending CST job(s) sequentially for scope {resource_scope}. Batch limit: {batch_size_limit}. Hourly limit: {hourly_request_limit}.",
         effective_limit=effective_limit,
         batch_size_limit=batch_size_limit,
         hourly_request_limit=hourly_request_limit,
         rate_delay_seconds=rate_delay_seconds,
         force_api_override=force_api_override,
+        resource_scope=resource_scope,
         jobs=processed_jobs,
     )
 
 
 @app.post("/cst/jobs/push-pending", response_model=CstPendingPushResult)
-def push_pending_cst_jobs(limit: int = 0) -> CstPendingPushResult:
-    return push_pending_cst_jobs_with_options(limit=limit, force_api_override=False)
+def push_pending_cst_jobs(limit: int = 0, resource_scope: str = "all") -> CstPendingPushResult:
+    return push_pending_cst_jobs_with_options(limit=limit, force_api_override=False, resource_scope=resource_scope)
 
 
 @app.post("/cst/jobs/push-pending/force", response_model=CstPendingPushResult)
-def force_push_pending_cst_jobs(limit: int = 0) -> CstPendingPushResult:
-    return push_pending_cst_jobs_with_options(limit=limit, force_api_override=True)
+def force_push_pending_cst_jobs(limit: int = 0, resource_scope: str = "all") -> CstPendingPushResult:
+    return push_pending_cst_jobs_with_options(limit=limit, force_api_override=True, resource_scope=resource_scope)
 
 
 @app.post("/cst/jobs/{job_id}/retry", response_model=CstSyncJob)
@@ -5775,7 +6514,7 @@ def run_bulk_batch(batch_id: str, operation_type: str, csv_text: str) -> None:
         fail_bulk_batch(batch_id, exc, started)
 
 
-def process_pool_bulk(csv_text: str) -> BulkImportResult:
+def process_pool_bulk(csv_text: object) -> BulkImportResult:
     imported = 0
     errors: list[str] = []
     output_rows: list[BulkOutputRow] = []
@@ -6143,6 +6882,148 @@ def partial_resource_from_network(original_resource: ResourceRecord, network: IP
     })
 
 
+def partial_fragment_success_for_resource(connection: sqlite3.Connection, operation_id: str, kind: str, resource_uuid: str) -> bool:
+    row = connection.execute(
+        """
+        SELECT 1
+        FROM partial_reassignment_fragments
+        WHERE operation_id = ?
+          AND kind = ?
+          AND resource_uuid = ?
+          AND status = 'SUCCESS'
+        LIMIT 1
+        """,
+        (operation_id, kind, resource_uuid),
+    ).fetchone()
+    return row is not None
+
+
+def partial_non_success_fragments_for_resource(connection: sqlite3.Connection, operation_id: str, kind: str, resource_uuid: str) -> list[sqlite3.Row]:
+    return connection.execute(
+        """
+        SELECT *
+        FROM partial_reassignment_fragments
+        WHERE operation_id = ?
+          AND kind = ?
+          AND resource_uuid = ?
+          AND status != 'SUCCESS'
+        ORDER BY created_at, id
+        """,
+        (operation_id, kind, resource_uuid),
+    ).fetchall()
+
+
+def partial_cst_unassigned_delete_resources(
+    connection: sqlite3.Connection,
+    original_resource: ResourceRecord,
+    original_network: IPv4Network,
+    requested_network: IPv4Network,
+) -> list[ResourceRecord]:
+    expansion_networks = network_difference(requested_network, original_network)
+    if not expansion_networks:
+        return []
+    rows = connection.execute(
+        """
+        SELECT *
+        FROM ip_resources
+        WHERE ip_type = 'PUBLIC'
+          AND status != 'RETIRED'
+          AND resource_uuid != ?
+          AND source_entity_type != 'assignment'
+        ORDER BY prefix ASC, start_ip ASC
+        """,
+        (original_resource.resource_uuid,),
+    ).fetchall()
+    resources: list[ResourceRecord] = []
+    seen: set[str] = set()
+    for row in rows:
+        resource = resource_from_row(row)
+        if resource.resource_uuid in seen:
+            continue
+        if normalize_assignment_status_id(resource.assignment_status_id, None) != 1:
+            continue
+        if not cst_resource_reported_to_cst(connection, resource):
+            continue
+        resource_network = normalize_network(resource.cidr)
+        if any(resource_network.overlaps(fragment) for fragment in expansion_networks):
+            resources.append(resource)
+            seen.add(resource.resource_uuid)
+    return resources
+
+
+def partial_unassigned_networks_after_reassignment(
+    original_network: IPv4Network,
+    requested_network: IPv4Network,
+    deleted_unassigned_resources: list[ResourceRecord],
+) -> list[IPv4Network]:
+    fragments = network_difference(original_network, requested_network)
+    for resource in deleted_unassigned_resources:
+        fragments.extend(network_difference(normalize_network(resource.cidr), requested_network))
+    return normalize_network_list(fragments)
+
+
+def validate_partial_reassignment_scope(
+    connection: sqlite3.Connection,
+    original_assignment: Assignment,
+    original_network: IPv4Network,
+    requested_network: IPv4Network,
+) -> None:
+    if requested_network == original_network:
+        raise HTTPException(status_code=400, detail="Partial reassignment requires a different CIDR than the current assignment")
+    if not (requested_network.subnet_of(original_network) or original_network.subnet_of(requested_network)):
+        raise HTTPException(
+            status_code=409,
+            detail=f"{requested_network} must either shrink within or expand around original assignment {original_assignment.cidr}",
+        )
+    parent = root_pool_for_network(original_network, connection)
+    if parent is None:
+        raise HTTPException(status_code=409, detail=f"Original assignment {original_assignment.cidr} is outside managed parent pools")
+    parent_network = network_of(parent)
+    if not requested_network.subnet_of(parent_network):
+        raise HTTPException(status_code=409, detail=f"{requested_network} is outside managed parent pool {parent.cidr}")
+    overlaps = assignment_overlap_candidates(requested_network, {original_assignment.id})
+    if overlaps:
+        raise HTTPException(status_code=409, detail=assignment_conflict_message(requested_network, overlaps))
+
+
+def upsert_successful_partial_unassigned_fragments(
+    connection: sqlite3.Connection,
+    operation_id: str,
+    original_resource: ResourceRecord,
+) -> list[ResourceRecord]:
+    rows = connection.execute(
+        """
+        SELECT *
+        FROM partial_reassignment_fragments
+        WHERE operation_id = ?
+          AND kind = 'UNASSIGNED'
+          AND status = 'SUCCESS'
+        ORDER BY cidr
+        """,
+        (operation_id,),
+    ).fetchall()
+    resources: list[ResourceRecord] = []
+    for row in rows:
+        fragment_network = normalize_network(str(row["cidr"]))
+        resource = partial_resource_from_network(original_resource, fragment_network, operation_id, "UNASSIGNED").model_copy(update={
+            "resource_uuid": str(row["resource_uuid"]),
+            "transaction_id": str(row["transaction_id"]),
+            "cst_sync_status": "SUCCESS",
+            "action_flag": "S",
+            "cst_sync_ready": True,
+            "cst_validation_status": "READY",
+        })
+        upsert_resource_record(connection, resource)
+        resources.append(resource)
+    return resources
+
+
+def delete_replaced_partial_unassigned_resources(connection: sqlite3.Connection, resources: list[ResourceRecord]) -> None:
+    for resource in resources:
+        connection.execute("DELETE FROM assignment_details WHERE resource_uuid = ?", (resource.resource_uuid,))
+        connection.execute("DELETE FROM ip_resources WHERE resource_uuid = ?", (resource.resource_uuid,))
+
+
 def record_partial_fragment_job(connection: sqlite3.Connection, operation_id: str, kind: str, resource: ResourceRecord, cst_operation: str, job: CstSyncJob) -> None:
     timestamp = now_iso()
     connection.execute(
@@ -6238,9 +7119,11 @@ def finalize_partial_reassignment(connection: sqlite3.Connection, operation_id: 
         return
     original_assignment = assignment_from_row(original)
     requested_network = normalize_network(str(op["requested_cidr"]))
-    overlaps = assignment_overlap_candidates(requested_network, {original_assignment.id})
-    if overlaps:
-        set_partial_operation_status(connection, operation_id, "LOCAL_CONFLICT", assignment_conflict_message(requested_network, overlaps))
+    original_network = normalize_network(str(op["original_cidr"]))
+    try:
+        validate_partial_reassignment_scope(connection, original_assignment, original_network, requested_network)
+    except HTTPException as exc:
+        set_partial_operation_status(connection, operation_id, "LOCAL_CONFLICT", str(exc.detail))
         return
     assigned_fragment = connection.execute(
         "SELECT transaction_id FROM partial_reassignment_fragments WHERE operation_id = ? AND kind = 'ASSIGNED' AND status = 'SUCCESS' LIMIT 1",
@@ -6281,10 +7164,17 @@ def finalize_partial_reassignment(connection: sqlite3.Connection, operation_id: 
         (resource.resource_uuid, now_iso(), operation_id),
     )
     original_resource = find_resource_by_source(connection, "assignment", original_assignment.id)
+    unassigned_resources: list[ResourceRecord] = []
+    replaced_unassigned_resources: list[ResourceRecord] = []
+    if original_resource:
+        replaced_unassigned_resources = partial_cst_unassigned_delete_resources(connection, original_resource, original_network, requested_network)
+        unassigned_resources = upsert_successful_partial_unassigned_fragments(connection, operation_id, original_resource)
     connection.execute("DELETE FROM assignments WHERE id = ?", (original_assignment.id,))
     if original_resource:
         connection.execute("DELETE FROM assignment_details WHERE resource_uuid = ?", (original_resource.resource_uuid,))
         connection.execute("DELETE FROM ip_resources WHERE resource_uuid = ?", (original_resource.resource_uuid,))
+    delete_replaced_partial_unassigned_resources(connection, replaced_unassigned_resources)
+    materialize_bulk_unassigned_fragments(connection)
     set_partial_operation_status(connection, operation_id, "COMPLETED", "Partial reassignment completed and local records updated", completed=True)
     record_audit(
         connection,
@@ -6292,7 +7182,13 @@ def finalize_partial_reassignment(connection: sqlite3.Connection, operation_id: 
         "partial_reassignment",
         operation_id,
         original_assignment.model_dump_json(),
-        json.dumps({"newAssignmentId": assignment.id, "resourceUuid": resource.resource_uuid, "requestedCidr": assignment.cidr}),
+        json.dumps({
+            "newAssignmentId": assignment.id,
+            "resourceUuid": resource.resource_uuid,
+            "requestedCidr": assignment.cidr,
+            "unassignedFragments": [item.cidr for item in unassigned_resources],
+            "deletedExpansionResources": [item.cidr for item in replaced_unassigned_resources],
+        }),
     )
 
 
@@ -6313,6 +7209,15 @@ def continue_partial_reassignment(connection: sqlite3.Connection, operation_id: 
     if original_resource is None:
         set_partial_operation_status(connection, operation_id, "LOCAL_CONFLICT", "Original assignment resource is missing; manual reconciliation is required")
         return partial_result_from_db(connection, operation_id, jobs)
+
+    original_network = normalize_network(str(op["original_cidr"]))
+    requested_network = normalize_network(str(op["requested_cidr"]))
+    try:
+        validate_partial_reassignment_scope(connection, original_assignment, original_network, requested_network)
+    except HTTPException as exc:
+        set_partial_operation_status(connection, operation_id, "LOCAL_CONFLICT", str(exc.detail))
+        return partial_result_from_db(connection, operation_id, jobs)
+    expansion_delete_resources = partial_cst_unassigned_delete_resources(connection, original_resource, original_network, requested_network)
 
     original_status_id = normalize_assignment_status_id(original_assignment.assignment_status_id, original_assignment)
     if original_status_id != 1 and not partial_fragment_success(connection, operation_id, "ORIGINAL_UPDATE_UNASSIGNED"):
@@ -6337,7 +7242,29 @@ def continue_partial_reassignment(connection: sqlite3.Connection, operation_id: 
             set_partial_operation_status(connection, operation_id, status, "Original CST record has not yet been deleted")
             return partial_result_from_db(connection, operation_id, jobs)
 
-    requested_network = normalize_network(str(op["requested_cidr"]))
+    for delete_resource in expansion_delete_resources:
+        if partial_fragment_success_for_resource(connection, operation_id, "EXPANSION_DELETE", delete_resource.resource_uuid):
+            continue
+        pending = partial_non_success_fragments_for_resource(connection, operation_id, "EXPANSION_DELETE", delete_resource.resource_uuid)
+        if pending:
+            jobs.extend(retry_partial_fragment_job(connection, row) for row in pending)
+        else:
+            jobs.append(create_partial_cst_job(connection, operation_id, "EXPANSION_DELETE", delete_resource, "DELETE"))
+
+    unresolved_expansion_deletes = [
+        resource for resource in expansion_delete_resources
+        if not partial_fragment_success_for_resource(connection, operation_id, "EXPANSION_DELETE", resource.resource_uuid)
+    ]
+    if unresolved_expansion_deletes:
+        status = "PENDING" if any(job.status == "PENDING" for job in jobs) else "FAILED"
+        set_partial_operation_status(
+            connection,
+            operation_id,
+            status,
+            f"{len(unresolved_expansion_deletes)} CST unassigned expansion record(s) must be deleted before sending revised fragments",
+        )
+        return partial_result_from_db(connection, operation_id, jobs)
+
     payload = partial_assignment_payload(op)
     assigned_assignment = assignment_from_network(requested_network, payload)
     assigned_resource = resource_record_for_assignment(assigned_assignment, connection=connection).model_copy(update={
@@ -6351,8 +7278,7 @@ def continue_partial_reassignment(connection: sqlite3.Connection, operation_id: 
         jobs.append(create_partial_cst_job(connection, operation_id, "ASSIGNED", assigned_resource, "SEND"))
         connection.execute("UPDATE partial_reassignment_operations SET assigned_transaction_id = ? WHERE id = ?", (jobs[-1].transaction_id, operation_id))
 
-    original_network = normalize_network(str(op["original_cidr"]))
-    for fragment_network in remaining_networks_after_subtract(original_network, requested_network):
+    for fragment_network in partial_unassigned_networks_after_reassignment(original_network, requested_network, expansion_delete_resources):
         cidr = str(fragment_network)
         exists = connection.execute(
             "SELECT 1 FROM partial_reassignment_fragments WHERE operation_id = ? AND kind = 'UNASSIGNED' AND cidr = ? LIMIT 1",
@@ -6381,18 +7307,12 @@ def partial_reassign_assignment(assignment_id: str, payload: PartialReassignment
     original = find_assignment(assignment_id)
     original_network = network_of(original)
     requested_network = normalize_network(payload.cidr)
-    if requested_network == original_network:
-        raise HTTPException(status_code=400, detail="Partial reassignment requires a smaller subnet than the original assignment")
-    if not requested_network.subnet_of(original_network):
-        raise HTTPException(status_code=409, detail=f"{requested_network} is not fully contained within original assignment {original.cidr}")
-    overlaps = assignment_overlap_candidates(requested_network, {assignment_id})
-    if overlaps:
-        raise HTTPException(status_code=409, detail=assignment_conflict_message(requested_network, overlaps))
 
     payload.assignment_status_id = normalize_assignment_status_id(payload.assignment_status_id, payload)
     validate_cst_lir_assignment(payload)
     operation_id = f"partial-reassign-{uuid4().hex[:12]}"
     with connect() as connection:
+        validate_partial_reassignment_scope(connection, original, original_network, requested_network)
         original_resource = find_resource_by_source(connection, "assignment", assignment_id)
         if original_resource is None:
             raise HTTPException(status_code=404, detail="Original assignment resource not found")
@@ -6463,12 +7383,27 @@ def add_assignment(payload: AssignmentCreate) -> Assignment:
 
 
 
-def process_assignment_bulk(csv_text: str) -> BulkImportResult:
+def process_assignment_bulk(csv_text: object) -> BulkImportResult:
     imported = 0
     errors: list[str] = []
     output_rows: list[BulkOutputRow] = []
     for index, row in enumerate(csv_rows(csv_text), start=2):
         row_output_start = len(output_rows)
+        extra_columns = csv_value(row, "_extra_columns")
+        if extra_columns:
+            message = "Row has more values than the CSV header. Quote any field that contains commas, especially site/address/notes fields."
+            errors.append(f"row {index}: {message} Extra values: {extra_columns}")
+            output_rows.append(
+                BulkOutputRow(
+                    inputRowNumber=index,
+                    processingStatus="FAILED",
+                    processingMessage=message,
+                    cstSyncReady=False,
+                    cstValidationStatus="REJECTED",
+                    cstValidationErrors=message,
+                )
+            )
+            continue
         try:
             networks, is_pr_format = bulk_assignment_networks_from_row(row)
             assignment_status_id, assignment_status = bulk_assignment_status(row, is_pr_format)
@@ -6479,8 +7414,14 @@ def process_assignment_bulk(csv_text: str) -> BulkImportResult:
                     overlap_assignments = validate_assignment(network, allow_overlap=True)
                     assignment = assignment_from_network(network, assignment_payload)
                     conflict_errors: list[str] = []
+                    exact_overlap_conflict = False
                     if overlap_assignments:
+                        exact_overlaps = [item for item in overlap_assignments if network_of(item) == network]
+                        exact_overlap_conflict = bool(exact_overlaps)
                         conflict_errors = [assignment_conflict_message(network, overlap_assignments)]
+                        if exact_overlaps:
+                            exact_names = "; ".join(f"{item.customer_name or item.id} allocation {item.cidr}" for item in exact_overlaps[:8])
+                            conflict_errors = [f"{network} exactly duplicates existing assignment(s): {exact_names}"]
                         assignment.migration_conflict_status = "CONFLICT"
                         assignment.migration_conflict_reason = conflict_errors[0]
                         assignment.migration_conflict_group = conflict_group_for_assignments(network, overlap_assignments)
@@ -6495,10 +7436,10 @@ def process_assignment_bulk(csv_text: str) -> BulkImportResult:
                         assignment.cst_validation_errors = "; ".join(validation_errors)
                         assignment.cst_validation_warnings = "; ".join(validation_warnings)
                         insert_assignment(connection, assignment)
-                        resource = sync_assignment_resource(connection, assignment)
+                        resource = resource_record_for_assignment(assignment, connection=connection) if exact_overlap_conflict else sync_assignment_resource(connection, assignment)
                         record_audit(connection, "Subnet Allocation", "assignment", assignment.id, "", assignment.model_dump_json())
                         if conflict_errors:
-                            record_audit(connection, "Bulk Assignment Conflict", "assignment", assignment.id, "", json.dumps({"row": index, "conflicts": conflict_errors, "group": assignment.migration_conflict_group}))
+                            record_audit(connection, "Bulk Assignment Conflict", "assignment", assignment.id, "", json.dumps({"row": index, "conflicts": conflict_errors, "group": assignment.migration_conflict_group, "exactOverlap": exact_overlap_conflict}))
                         if validation_warnings:
                             record_audit(connection, "CST Bulk Import Normalization", "assignment", assignment.id, "", json.dumps({"row": index, "warnings": validation_warnings}))
                     imported += 1
@@ -6591,6 +7532,20 @@ def process_assignment_bulk(csv_text: str) -> BulkImportResult:
                             customerName=csv_value(row, "customerName", "customer_name"),
                         )
                     )
+    if imported:
+        with connect() as connection:
+            materialized, deleted_stale = materialize_bulk_unassigned_fragments(connection)
+            if materialized or deleted_stale:
+                output_rows.append(
+                    BulkOutputRow(
+                        inputRowNumber=0,
+                        processingStatus="MATERIALIZED_UNASSIGNED",
+                        processingMessage=f"Materialized {materialized} remaining unassigned CIDR fragment(s); removed {deleted_stale} stale generated fragment(s).",
+                        assignmentType="UNASSIGNED",
+                        cstSyncReady=True,
+                        cstValidationStatus="READY",
+                    )
+                )
     return BulkImportResult(imported=imported, blocked=len(errors), errors=errors, output_rows=output_rows)
 
 
@@ -6829,7 +7784,9 @@ def update_assignment_conflict_state(
         ),
     )
     updated = assignment_from_row(connection.execute("SELECT * FROM assignments WHERE id = ?", (assignment.id,)).fetchone())
-    sync_assignment_resource(connection, updated)
+    existing_resource = find_resource_by_source(connection, "assignment", updated.id)
+    if existing_resource or conflict_status == "ACCEPTED":
+        sync_assignment_resource(connection, updated)
     return updated
 
 
@@ -6852,6 +7809,7 @@ def reject_conflicting_assignment(assignment_id: str) -> Assignment:
             cst_sync_status="NOT_REQUIRED",
             action_flag="D",
         )
+        materialize_bulk_unassigned_fragments(connection)
         record_audit(connection, "Bulk Assignment Conflict Rejected", "assignment", assignment_id, before.model_dump_json(), after.model_dump_json())
     return after
 
@@ -6905,6 +7863,7 @@ def accept_conflicting_assignment(assignment_id: str) -> Assignment:
         connection.execute("UPDATE assignments SET migration_conflict_group = '' WHERE id = ?", (assignment_id,))
         after = assignment_from_row(connection.execute("SELECT * FROM assignments WHERE id = ?", (assignment_id,)).fetchone())
         sync_assignment_resource(connection, after)
+        materialize_bulk_unassigned_fragments(connection)
         record_audit(connection, "Bulk Assignment Conflict Accepted", "assignment", assignment_id, before.model_dump_json(), after.model_dump_json())
     return after
 

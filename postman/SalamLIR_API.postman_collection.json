@@ -542,6 +542,12 @@
                   "value": "0",
                   "description": "",
                   "disabled": true
+                },
+                {
+                  "key": "resource_scope",
+                  "value": "all",
+                  "description": "all, assigned, or unassigned",
+                  "disabled": true
                 }
               ]
             },
@@ -570,6 +576,12 @@
                   "key": "limit",
                   "value": "0",
                   "description": "",
+                  "disabled": true
+                },
+                {
+                  "key": "resource_scope",
+                  "value": "all",
+                  "description": "all, assigned, or unassigned",
                   "disabled": true
                 }
               ]
@@ -629,7 +641,7 @@
             "description": "",
             "body": {
               "mode": "raw",
-              "raw": "{\n  \"limit\": 0,\n  \"execute_immediately\": false,\n  \"force_api_override\": false,\n  \"include_existing_transactions\": false,\n  \"only_cst_ready\": true\n}",
+              "raw": "{\n  \"limit\": 0,\n  \"execute_immediately\": false,\n  \"force_api_override\": false,\n  \"include_existing_transactions\": false,\n  \"only_cst_ready\": true,\n  \"resource_scope\": \"all\"\n}",
               "options": {
                 "raw": {
                   "language": "json"
