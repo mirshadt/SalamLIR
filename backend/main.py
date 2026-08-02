@@ -7616,6 +7616,18 @@ def continue_partial_reassignment(connection: sqlite3.Connection, operation_id: 
         )
         return partial_result_from_db(connection, operation_id, jobs)
 
+    if mode == "SHRINK" and original_reported_to_cst:
+        jobs.extend(partial_ensure_fragment_job(connection, operation_id, "ORIGINAL_UPDATE_UNASSIGNED", cst_unassigned_update_resource(original_resource), "UPDATE"))
+        if not partial_fragment_success(connection, operation_id, "ORIGINAL_UPDATE_UNASSIGNED"):
+            status = "PENDING" if any(job.status == "PENDING" for job in jobs) else "FAILED"
+            set_partial_operation_status(
+                connection,
+                operation_id,
+                status,
+                "CST UpdateLIRData to Unassigned must succeed before DeleteLIRData can be sent",
+            )
+            return partial_result_from_db(connection, operation_id, jobs)
+
     delete_resources: list[tuple[str, ResourceRecord]] = []
     if mode == "SHRINK" and original_reported_to_cst:
         delete_resources.append(("ORIGINAL_DELETE", original_resource))
