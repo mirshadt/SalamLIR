@@ -1515,16 +1515,37 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                   action: () => { void submitAssignment(); }
                 })}
                 onRelease={(assignment) => setConfirm({
-                  title: "Release assignment",
-                  detail: ["SUCCESS", "SYNCHRONIZED", "DECOMMISSION_PENDING"].includes(String(assignment.ripe_sync_status || "").toUpperCase()) ? `Move ${assignment.cidr} to RIPE removal pending? CST UpdateLIRData will set assignmentStatusId to 1 Unassigned if this assignment was reported to CST.` : `Unassign ${assignment.cidr} locally? If it was reported to CST, UpdateLIRData will mark it Unassigned; if never reported, no CST update is required.`,
+                  title: "Confirm Unassign",
+                  detail: ["SUCCESS", "SYNCHRONIZED", "DECOMMISSION_PENDING"].includes(String(assignment.ripe_sync_status || "").toUpperCase())
+                    ? `Are you sure you want to unassign ${assignment.cidr}? This assignment has RIPE history, so it will be moved to removal pending. If it was reported to CST, CST UpdateLIRData will mark it as Unassigned.`
+                    : `Are you sure you want to unassign ${assignment.cidr}? The subnet will be released locally. If it was reported to CST, CST UpdateLIRData will mark it as Unassigned; if never reported, no CST update is required.`,
                   destructive: true,
-                  action: () => run(async () => {
-                    if (["SUCCESS", "SYNCHRONIZED", "DECOMMISSION_PENDING"].includes(String(assignment.ripe_sync_status || "").toUpperCase())) {
-                      await api.patch(`/assignments/${assignment.id}/status`, { status: "Retiring" });
-                    } else {
-                      await api.delete(`/assignments/${assignment.id}`);
-                    }
-                  })
+                  action: () => {
+                    void (async () => {
+                      try {
+                        const ripeSynced = ["SUCCESS", "SYNCHRONIZED", "DECOMMISSION_PENDING"].includes(String(assignment.ripe_sync_status || "").toUpperCase());
+                        if (ripeSynced) {
+                          await api.patch(`/assignments/${assignment.id}/status`, { status: "Retiring" });
+                        } else {
+                          await api.delete(`/assignments/${assignment.id}`);
+                        }
+                        refresh();
+                        setNotice({
+                          title: "Unassign Completed",
+                          detail: ripeSynced
+                            ? `${assignment.cidr} was moved to RIPE removal pending. CST unassigned sync, if required, is tracked separately.`
+                            : `${assignment.cidr} was unassigned successfully. CST unassigned sync, if required, is tracked separately.`
+                        });
+                      } catch (error) {
+                        setNotice({
+                          title: "Unassign Failed",
+                          detail: `${assignment.cidr} could not be unassigned.
+
+${errorMessage(error)}`
+                        });
+                      }
+                    })();
+                  }
                 })}
                 onPartialReassign={(assignment, partialCidr) => setConfirm({
                   title: "Partial LIR reassignment",
@@ -2727,6 +2748,7 @@ function AssignmentManagement(props: {
   const parentPoolMatches = filterResources(available, props.poolDraft.poolSearch);
   const assignmentSummary = assignmentDraftSummary(props.form, props.poolDraft, props.resources);
   const partialAssignment = props.assignments.find((assignment) => assignment.id === partialAssignmentId) ?? null;
+  const partialSummary = partialReassignmentDraftSummary(partialAssignment, partialCidr, props.resources);
   const mergeForm = (patch: Partial<AssignmentPayload>) => props.onForm({ ...props.form, ...patch });
   const update = <Key extends keyof AssignmentPayload>(key: Key, value: AssignmentPayload[Key]) => mergeForm({ [key]: value } as Partial<AssignmentPayload>);
   const updatePoolDraft = (value: Partial<PoolAssignmentDraft>) => props.onPoolDraft({ ...props.poolDraft, ...value });
@@ -2760,18 +2782,20 @@ function AssignmentManagement(props: {
     if (nextWorkflow !== "partial") {
       setPartialAssignmentId("");
       setPartialCidr("");
+    } else if (partialAssignment && !partialCidr.trim()) {
+      setPartialCidr(partialAssignment.cidr);
     }
   };
 
   const selectPartialAssignment = (assignment: Assignment) => {
     setWorkflow("partial");
     setPartialAssignmentId(assignment.id);
-    setPartialCidr("");
+    setPartialCidr(assignment.cidr);
     props.onForm({
       ...props.form,
       ...assignment,
-      cidr: "",
-      assignment_date: props.form.assignment_date || today()
+      cidr: assignment.cidr,
+      assignment_date: props.form.assignment_date || assignment.assignment_date || today()
     });
   };
 
@@ -2931,8 +2955,8 @@ function AssignmentManagement(props: {
                   <p className="mt-1 text-muted-foreground">The requested CIDR can shrink within the original block or expand around it when the added addresses are free in the same managed pool. CST will receive UpdateLIRData, DeleteLIRData, then SendLIRData for each revised block.</p>
                 </div>
                 <label className="grid gap-1">
-                  <span className="text-xs font-medium text-muted-foreground">Requested reassignment CIDR</span>
-                  <Input value={partialCidr} onChange={(event) => setPartialCidr(event.target.value)} placeholder="e.g. 172.20.40.0/24" />
+                  <span className="text-xs font-medium text-muted-foreground">To-be assignment CIDR</span>
+                  <Input value={partialCidr} onChange={(event) => setPartialCidr(event.target.value)} placeholder={partialAssignment?.cidr ?? "e.g. 172.20.40.0/24"} />
                 </label>
               </div>
             )}
@@ -2941,23 +2965,12 @@ function AssignmentManagement(props: {
           {workflow === "assign" ? (
             <AssignmentReviewCard summary={assignmentSummary} form={props.form} onAssign={props.onAssign} />
           ) : (
-            <aside className="grid content-start gap-4 rounded-md border bg-muted/20 p-4">
-              <div>
-                <p className="text-lg font-semibold">Partial Summary</p>
-                <p className="text-sm text-muted-foreground">Review before running the CST split workflow.</p>
-              </div>
-              <DetailRows rows={[
-                ["Original Block", partialAssignment?.cidr ?? "-"],
-                ["Requested Fragment", partialCidr || "-"],
-                ["Assigned To", assignmentTargetLabels[targetType]],
-                ["CST Status", String(assignmentStatusByTarget[targetType])],
-                ["Service", props.form.service_id || props.form.service_description || props.form.internal_application_name || "-"]
-              ]} />
-              <p className="rounded-md border border-amber-500/50 bg-amber-500/10 p-3 text-sm text-amber-100">
-                Local reassignment completes only after all mandatory CST calls succeed. Failed fragments remain retryable under the same operation.
-              </p>
-              <Button type="button" disabled={!partialAssignment || !partialCidr.trim()} onClick={() => partialAssignment && props.onPartialReassign(partialAssignment, partialCidr.trim())}>Run Partial Reassignment</Button>
-            </aside>
+            <PartialReassignmentReviewCard
+              summary={partialSummary}
+              form={props.form}
+              originalAssignment={partialAssignment}
+              onRun={() => partialAssignment && props.onPartialReassign(partialAssignment, partialCidr.trim())}
+            />
           )}
         </div>
       </CardContent>
@@ -3130,6 +3143,19 @@ type AssignmentDraftSummary = {
   error: string;
 };
 
+type PartialReassignmentSummary = {
+  originalCidr: string;
+  requestedCidr: string;
+  originalRange: Range | null;
+  requestedRange: Range | null;
+  sourceSubnet: ManagedResource | null;
+  mode: string;
+  assignedFragments: Range[];
+  unassignedFragments: Range[];
+  additionalAssignedFragments: Range[];
+  error: string;
+};
+
 function AssignmentReviewCard({
   summary,
   form,
@@ -3177,6 +3203,100 @@ function AssignmentReviewCard({
       <Button onClick={onAssign} disabled={!ready}>
         Create Assignment
       </Button>
+    </aside>
+  );
+}
+
+function PartialReassignmentReviewCard({
+  summary,
+  form,
+  originalAssignment,
+  onRun
+}: {
+  summary: PartialReassignmentSummary;
+  form: AssignmentPayload;
+  originalAssignment: Assignment | null;
+  onRun: () => void;
+}) {
+  const owner = assignmentOwnerLabel(form);
+  const service = form.service_id || form.service_description || form.internal_application_name || "-";
+  const usable = summary.requestedRange ? (summary.requestedRange.prefix >= 31 ? summary.requestedRange.size : Math.max(0, summary.requestedRange.size - 2)) : 0;
+  const ready = Boolean(originalAssignment && summary.requestedCidr && !summary.error && summary.requestedCidr !== summary.originalCidr);
+  const resultRows = [
+    ...summary.assignedFragments.map((fragment) => ({ type: "Assigned", fragment })),
+    ...summary.unassignedFragments.map((fragment) => ({ type: "Unassigned", fragment }))
+  ];
+  return (
+    <aside className="grid content-start gap-4 rounded-md border bg-muted/20 p-4">
+      <div>
+        <p className="text-lg font-semibold">Assignment Summary</p>
+        <p className="text-sm text-muted-foreground">Review the partial reassignment before submit.</p>
+      </div>
+      <div className="grid gap-1 border-b pb-4">
+        <span className="text-xs font-medium uppercase text-muted-foreground">To-be Subnet</span>
+        <span className="text-2xl font-semibold">{summary.requestedCidr || "Select original block"}</span>
+        <span className="text-sm text-muted-foreground">{summary.sourceSubnet?.classification ?? "PUBLIC"}</span>
+      </div>
+      <DetailRows rows={[
+        ["Original Block", summary.originalCidr || "-"],
+        ["Operation", summary.mode || "-"],
+        ["Source Subnet", summary.sourceSubnet?.cidr ?? summary.originalCidr ?? "-"],
+        ["Assignment Range", summary.requestedRange ? `${numberToIp(summary.requestedRange.start)} - ${numberToIp(summary.requestedRange.end)}` : "-"],
+        ["Usable Range", summary.requestedRange ? `${summary.requestedRange.firstUsable} - ${summary.requestedRange.lastUsable}` : "-"],
+        ["Usable IPs", summary.requestedRange ? formatHosts(usable) : "-"],
+        ["CIDR Block Size", summary.requestedRange ? formatHosts(summary.requestedRange.size) : "-"],
+        ["Customer", owner || "-"],
+        ["Organization ID", form.organization_id || form.customer_id || "-"],
+        ["Service", service],
+        ["Contact", form.full_name || form.contact_name || "-"],
+        ["Mobile", form.mobile_number || form.contact_number || "-"],
+        ["Email", form.email || form.contact_email || "-"],
+        ["Operational Status", form.status === "Blocked" ? "Blocked" : "Active"],
+        ["Assignment Date", form.assignment_date || "-"]
+      ]} />
+      <div className="grid gap-2 rounded-md border bg-background/40 p-3">
+        <div className="flex items-center justify-between gap-3">
+          <p className="text-sm font-semibold">Resulting CIDRs</p>
+          <Badge variant="muted">{resultRows.length} block{resultRows.length === 1 ? "" : "s"}</Badge>
+        </div>
+        <div className="max-h-[220px] overflow-auto rounded-md border">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Type</TableHead>
+                <TableHead>CIDR</TableHead>
+                <TableHead>Range</TableHead>
+                <TableHead>Size</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {resultRows.length ? resultRows.map(({ type, fragment }) => (
+                <TableRow key={`${type}-${fragment.cidr}`}>
+                  <TableCell><Badge variant={type === "Assigned" ? "success" : "muted"}>{type}</Badge></TableCell>
+                  <TableCell className="font-semibold">{fragment.cidr}</TableCell>
+                  <TableCell>{numberToIp(fragment.start)} - {numberToIp(fragment.end)}</TableCell>
+                  <TableCell>{formatHosts(fragment.size)}</TableCell>
+                </TableRow>
+              )) : (
+                <TableRow>
+                  <TableCell colSpan={4} className="py-5 text-center text-sm text-muted-foreground">Change the to-be CIDR to preview resulting blocks.</TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+          </Table>
+        </div>
+        {summary.additionalAssignedFragments.length ? (
+          <p className="text-xs text-muted-foreground">Additional assigned portion: {summary.additionalAssignedFragments.map((fragment) => fragment.cidr).join(", ")}</p>
+        ) : null}
+      </div>
+      {visibleAssignmentError(summary.error) ? (
+        <p className="rounded-md border border-amber-500/50 bg-amber-500/10 p-3 text-sm text-amber-100">{summary.error}</p>
+      ) : (
+        <p className="rounded-md border border-primary/40 bg-primary/10 p-3 text-sm text-primary">
+          Local reassignment completes only after all mandatory CST calls succeed. Failed fragments remain retryable under the same operation.
+        </p>
+      )}
+      <Button type="button" disabled={!ready} onClick={onRun}>Run Partial Reassignment</Button>
     </aside>
   );
 }
@@ -3897,7 +4017,7 @@ function GlobalSearch({
 
   return (
     <div className="grid gap-5">
-      <PageTitle title="Global Search" description="Search by IP address, CIDR, Resource ID, Transaction ID, owner, status, RIPE/CST sync status, netname, and selected filter criteria." />
+      <PageTitle title="Global Search" description="Search by IP address, CIDR, Resource ID, Transaction ID, customer, service, owner, status, RIPE/CST sync status, netname, and selected filter criteria." />
       <Card>
         <CardContent className="grid gap-3 pt-5">
           <div className="flex flex-col gap-2 md:flex-row">
@@ -3962,18 +4082,34 @@ function GlobalSearch({
         </CardHeader>
         <CardContent>
           <div className="grid max-h-[560px] gap-2 overflow-auto rounded-md border p-2">
-            {results.map((resource, resourceIndex) => (
-              <button key={resourceKey(resource, resourceIndex, "global-search")} className="flex flex-wrap items-center justify-between gap-2 rounded-md border bg-muted/20 p-3 text-left hover:border-primary/70" onClick={() => onOpen(resource)}>
-                <span>
-                  <span className="block font-semibold">{resource.cidr}</span>
-                  <span className="text-sm text-muted-foreground">{resource.uuid} / {resource.transactionId} / {resource.netname}</span>
-                </span>
-                <span className="flex flex-wrap items-center gap-2">
-                  <Badge variant={badgeForResource(resource)}>{resource.status}</Badge>
-                  <Badge variant={resource.cstSyncStatus === "SUCCESS" || resource.cstSyncStatus === "SYNCHRONIZED" ? "success" : resource.cstSyncStatus === "FAILED" ? "danger" : resource.cstSyncStatus === "PENDING" || resource.cstSyncStatus === "RUNNING" ? "warning" : "muted"}>CST {resource.cstSyncStatus || "-"}</Badge>
-                </span>
-              </button>
-            ))}
+            {results.map((resource, resourceIndex) => {
+              const assignedCustomer = assignedResourceCustomerLabel(resource);
+              const assignedService = assignedResourceServiceLabel(resource);
+              return (
+                <button key={resourceKey(resource, resourceIndex, "global-search")} className="flex flex-wrap items-start justify-between gap-3 rounded-md border bg-muted/20 p-3 text-left hover:border-primary/70" onClick={() => onOpen(resource)}>
+                  <span className="min-w-0 flex-1">
+                    <span className="block font-semibold">{resource.cidr}</span>
+                    <span className="text-sm text-muted-foreground">{resource.uuid} / {resource.transactionId} / {resource.netname}</span>
+                    {isAssignedSearchResource(resource) ? (
+                      <span className="mt-2 grid gap-1 text-xs text-muted-foreground sm:grid-cols-2">
+                        <span className="min-w-0">
+                          <span className="font-semibold text-foreground">Customer: </span>
+                          <span className="break-words">{assignedCustomer || "-"}</span>
+                        </span>
+                        <span className="min-w-0">
+                          <span className="font-semibold text-foreground">Service: </span>
+                          <span className="break-words">{assignedService || "-"}</span>
+                        </span>
+                      </span>
+                    ) : null}
+                  </span>
+                  <span className="flex flex-wrap items-center justify-end gap-2">
+                    <Badge variant={badgeForResource(resource)}>{resource.status}</Badge>
+                    <Badge variant={resource.cstSyncStatus === "SUCCESS" || resource.cstSyncStatus === "SYNCHRONIZED" ? "success" : resource.cstSyncStatus === "FAILED" ? "danger" : resource.cstSyncStatus === "PENDING" || resource.cstSyncStatus === "RUNNING" ? "warning" : "muted"}>CST {resource.cstSyncStatus || "-"}</Badge>
+                  </span>
+                </button>
+              );
+            })}
             {!results.length ? <p className="p-3 text-sm text-muted-foreground">No matching resources.</p> : null}
           </div>
         </CardContent>
@@ -5485,6 +5621,24 @@ function resourceTypeLabel(resource: ManagedResource) {
   return isRipeAllocatedPoolResource(resource) ? "Allocated Pool" : resource.type;
 }
 
+function isAssignedSearchResource(resource: ManagedResource) {
+  return resource.administrativeStatus === "ASSIGNED";
+}
+
+function assignedResourceCustomerLabel(resource: ManagedResource) {
+  if (!isAssignedSearchResource(resource)) {
+    return "";
+  }
+  return resource.organizationName || resource.fullName || resource.netname || resource.owner || "";
+}
+
+function assignedResourceServiceLabel(resource: ManagedResource) {
+  if (!isAssignedSearchResource(resource)) {
+    return "";
+  }
+  return resource.serviceId || resource.serviceDescription || resource.description || resource.accessTechnology || "";
+}
+
 function AllocatedPoolBadge() {
   return <span className="inline-flex items-center rounded-md border border-cyan-400/70 bg-cyan-400/15 px-2 py-1 text-xs font-semibold text-cyan-300">Allocated Pool</span>;
 }
@@ -5667,6 +5821,103 @@ function safePoolAssignmentCidr(poolDraft: PoolAssignmentDraft, pool: ManagedRes
     return cidrFromPoolDraft(poolDraft, pool);
   } catch {
     return "";
+  }
+}
+
+function rangesOverlap(left: Range, right: Range) {
+  return left.start <= right.end && right.start <= left.end;
+}
+
+function subtractRange(container: Range, removed: Range): Range[] {
+  if (!rangesOverlap(container, removed)) {
+    return [container];
+  }
+  const fragments: Range[] = [];
+  const overlapStart = Math.max(container.start, removed.start);
+  const overlapEnd = Math.min(container.end, removed.end);
+  if (container.start < overlapStart) {
+    fragments.push(...rangeToCidrs(container.start, overlapStart - 1));
+  }
+  if (overlapEnd < container.end) {
+    fragments.push(...rangeToCidrs(overlapEnd + 1, container.end));
+  }
+  return fragments.sort((left, right) => left.start - right.start || left.prefix - right.prefix);
+}
+
+function subtractRanges(container: Range, removedRanges: Range[]) {
+  return removedRanges.reduce<Range[]>((fragments, removed) => fragments.flatMap((fragment) => subtractRange(fragment, removed)), [container]);
+}
+
+function partialReassignmentDraftSummary(assignment: Assignment | null, requestedCidr: string, resources: ManagedResource[]): PartialReassignmentSummary {
+  const empty: PartialReassignmentSummary = {
+    originalCidr: assignment?.cidr ?? "",
+    requestedCidr: requestedCidr.trim(),
+    originalRange: null,
+    requestedRange: null,
+    sourceSubnet: null,
+    mode: "",
+    assignedFragments: [],
+    unassignedFragments: [],
+    additionalAssignedFragments: [],
+    error: assignment ? "" : "Select an original assignment."
+  };
+  if (!assignment) {
+    return empty;
+  }
+  const requestedText = requestedCidr.trim();
+  if (!requestedText) {
+    return { ...empty, error: "Enter the to-be assignment CIDR." };
+  }
+  try {
+    const originalRange = parseCidr(assignment.cidr);
+    const requestedRange = parseCidr(requestedText);
+    const sourceSubnet = presentationResources(resources)
+      .filter((resource) => resource.type === "Subnet" && contains(toRange(resource.cidr), requestedRange))
+      .sort((left, right) => right.prefix - left.prefix)[0] ?? null;
+    const base = { ...empty, originalRange, requestedRange, requestedCidr: requestedRange.cidr, sourceSubnet };
+    if (requestedText !== requestedRange.cidr) {
+      return { ...base, error: `${requestedText} is not CIDR-aligned. Choose ${requestedRange.cidr} or a valid boundary.` };
+    }
+    if (requestedRange.cidr === originalRange.cidr) {
+      return {
+        ...base,
+        mode: "No change",
+        assignedFragments: [requestedRange],
+        error: "Change the to-be CIDR to shrink or expand the assignment."
+      };
+    }
+    if (contains(originalRange, requestedRange)) {
+      return {
+        ...base,
+        mode: "Shrink",
+        assignedFragments: [requestedRange],
+        unassignedFragments: subtractRange(originalRange, requestedRange)
+      };
+    }
+    if (contains(requestedRange, originalRange)) {
+      const additionalAssignedFragments = subtractRange(requestedRange, originalRange);
+      const adjacent = additionalAssignedFragments.every((fragment) => fragment.end + 1 === originalRange.start || fragment.start === originalRange.end + 1);
+      if (!adjacent) {
+        return { ...base, mode: "Expansion", assignedFragments: [requestedRange], additionalAssignedFragments, error: "Expansion must be adjacent to the existing assignment." };
+      }
+      const availableSources = presentationResources(resources)
+        .filter((resource) => resource.type === "Subnet" && resource.administrativeStatus === "AVAILABLE")
+        .map((resource) => toRange(resource.cidr))
+        .filter((range) => additionalAssignedFragments.some((fragment) => rangesOverlap(range, fragment)));
+      const uncovered = additionalAssignedFragments.filter((fragment) => !availableSources.some((source) => contains(source, fragment)));
+      const unassignedFragments = availableSources.flatMap((source) => subtractRanges(source, additionalAssignedFragments.filter((fragment) => rangesOverlap(source, fragment))));
+      return {
+        ...base,
+        mode: "Expansion",
+        assignedFragments: [requestedRange],
+        additionalAssignedFragments,
+        unassignedFragments,
+        error: uncovered.length ? `Additional range is not fully available: ${uncovered.map((fragment) => fragment.cidr).join(", ")}` : ""
+      };
+    }
+    return { ...base, error: `${requestedRange.cidr} must either shrink within or expand around original assignment ${assignment.cidr}.` };
+  } catch (error) {
+    return { ...empty, error: errorMessage(error) };
   }
 }
 
@@ -6013,7 +6264,29 @@ function buildRegistryStats(resources: ManagedResource[], conflicts: Conflict[])
 function filterResources(resources: ManagedResource[], query: string, filters: SearchFilterCriterion[] = []) {
   const normalized = query.trim().toLowerCase();
   return resources.filter((resource) => {
-    const textMatch = !normalized || [resource.id, resource.uuid, resource.parentId, resource.cidr, resource.startIp, resource.endIp, resource.type, resource.classification, resource.owner, resource.administrativeStatus, resource.ripeSyncStatus, resource.cstSyncStatus, resource.transactionId, resource.netname, resource.description]
+    const textMatch = !normalized || [
+      resource.id,
+      resource.uuid,
+      resource.parentId,
+      resource.cidr,
+      resource.startIp,
+      resource.endIp,
+      resource.type,
+      resource.classification,
+      resource.owner,
+      resource.administrativeStatus,
+      resource.ripeSyncStatus,
+      resource.cstSyncStatus,
+      resource.transactionId,
+      resource.netname,
+      resource.description,
+      resource.organizationName,
+      resource.organizationId,
+      resource.fullName,
+      resource.serviceId,
+      resource.serviceDescription,
+      resource.email
+    ]
       .some((value) => String(value ?? "").toLowerCase().includes(normalized))
     return textMatch && filters.every((filter) => searchCriterionMatches(resource, filter));
   });

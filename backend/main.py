@@ -3103,6 +3103,7 @@ def create_cst_assignment_create_jobs(
     assignment: Assignment,
     assignment_resource: ResourceRecord,
     workflow_type: str,
+    defer_execution: bool = False,
 ) -> list[CstSyncJob]:
     assigned_network = network_of(assignment)
     operations: list[tuple[ResourceRecord, str]] = []
@@ -3111,7 +3112,7 @@ def create_cst_assignment_create_jobs(
         container_network = normalize_network(str(row["cidr"]))
         if container_network == assigned_network:
             operations.append((assignment_resource, "UPDATE"))
-            return create_cst_sync_jobs(connection, operations, workflow_type)
+            return create_cst_sync_jobs(connection, operations, workflow_type, defer_execution=defer_execution)
         operations.append((container_resource, "DELETE"))
         for fragment in remaining_networks_after_subtract(container_network, assigned_network):
             fragment_uuid = stable_uuid("cst-fragment", str(row["transaction_id"]), assignment.id, str(fragment))
@@ -3128,7 +3129,7 @@ def create_cst_assignment_create_jobs(
                 )
             )
     operations.append((assignment_resource, "SEND"))
-    return create_cst_sync_jobs(connection, operations, workflow_type)
+    return create_cst_sync_jobs(connection, operations, workflow_type, defer_execution=defer_execution)
 
 def cst_exception_message(exc: Exception) -> str:
     if isinstance(exc, HTTPException):
@@ -3147,7 +3148,7 @@ def queue_cst_sync_jobs_best_effort(
     if not resource_operations:
         return []
     try:
-        return create_cst_sync_jobs(connection, resource_operations, workflow_type)
+        return create_cst_sync_jobs(connection, resource_operations, workflow_type, defer_execution=True)
     except Exception as exc:
         message = cst_exception_message(exc)
         record_audit(
@@ -3168,7 +3169,7 @@ def queue_cst_assignment_create_jobs_best_effort(
     workflow_type: str,
 ) -> list[CstSyncJob]:
     try:
-        return create_cst_assignment_create_jobs(connection, assignment, assignment_resource, workflow_type)
+        return create_cst_assignment_create_jobs(connection, assignment, assignment_resource, workflow_type, defer_execution=True)
     except Exception as exc:
         message = cst_exception_message(exc)
         record_audit(
@@ -3262,6 +3263,7 @@ def create_cst_sync_jobs(
     connection: sqlite3.Connection,
     resource_operations: list[tuple[ResourceRecord, str]],
     workflow_type: str,
+    defer_execution: bool = False,
 ) -> list[CstSyncJob]:
     eligible = [(resource, operation) for resource, operation in resource_operations if resource.ip_type == "PUBLIC"]
     if not eligible:
@@ -3298,6 +3300,10 @@ def create_cst_sync_jobs(
         elif prior_delete_unresolved and operation != "DELETE":
             status = "PENDING"
             last_error = cst_waiting_for_prior_delete_message()
+            response = {"temporaryStorage": True, "externalApiCalled": False, "accepted": False, "message": last_error}
+        elif defer_execution:
+            status = "PENDING"
+            last_error = "CST sync queued separately from the business workflow"
             response = {"temporaryStorage": True, "externalApiCalled": False, "accepted": False, "message": last_error}
         elif not config.enabled:
             status = "PENDING"
