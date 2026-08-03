@@ -2936,15 +2936,6 @@ def cst_real_api_enabled(config: CstConfig) -> bool:
     return True
 
 
-def cst_append_user_key_param(url: str, user_key: str) -> str:
-    if not user_key:
-        return url
-    parts = urllib_parse.urlsplit(url)
-    query_items = [(key, value) for key, value in urllib_parse.parse_qsl(parts.query, keep_blank_values=True) if key != "user_key"]
-    query_items.append(("user_key", user_key))
-    return urllib_parse.urlunsplit((parts.scheme, parts.netloc, parts.path, urllib_parse.urlencode(query_items), parts.fragment))
-
-
 def cst_redact_url(url: str) -> str:
     parts = urllib_parse.urlsplit(url)
     query_items = [(key, "***" if key == "user_key" else value) for key, value in urllib_parse.parse_qsl(parts.query, keep_blank_values=True)]
@@ -3032,8 +3023,8 @@ def ensure_cst_access_token(connection: sqlite3.Connection, config: CstConfig, f
     password = decrypt_secret(str(values.get("encrypted_auth_password") or ""))
     if not config.auth_username or not password:
         raise HTTPException(status_code=400, detail="CST authorization username/password is not configured")
-    user_key = decrypt_secret(str(values.get("encrypted_user_key") or ""))
-    token_url = cst_append_user_key_param(cst_token_url(config), user_key)
+    lir_api_key = decrypt_secret(str(values.get("encrypted_user_key") or ""))
+    token_url = cst_token_url(config)
     basic_value = base64.b64encode(f"{config.auth_username}:{password}".encode("utf-8")).decode("ascii")
     headers = {
         "Authorization": f"Basic {basic_value}",
@@ -3042,9 +3033,9 @@ def ensure_cst_access_token(connection: sqlite3.Connection, config: CstConfig, f
     }
     api_key = decrypt_secret(str(values.get("encrypted_api_access_key") or ""))
     if api_key:
-        headers["X-API-Key"] = api_key
-    if user_key:
-        headers["user_key"] = user_key
+        headers["x-Gateway-APIKey"] = api_key
+    if lir_api_key:
+        headers["apiKey"] = lir_api_key
     body = urllib_parse.urlencode({"grant_type": "client_credentials"}).encode("utf-8")
     status_code, response = cst_http_request(config, "POST", token_url, headers, body, config.connection_timeout)
     if status_code < 200 or status_code >= 300:
@@ -3078,10 +3069,9 @@ def execute_cst_real_api_job(connection: sqlite3.Connection, config: CstConfig, 
     api_key = decrypt_secret(str(row["encrypted_api_access_key"] or "")) if row else ""
     if api_key:
         headers["x-Gateway-APIKey"] = api_key
-    user_key = decrypt_secret(str(row["encrypted_user_key"] or "")) if row else ""
-    url = cst_append_user_key_param(url, user_key)
-    if user_key:
-        headers["user_key"] = user_key
+    lir_api_key = decrypt_secret(str(row["encrypted_user_key"] or "")) if row else ""
+    if lir_api_key:
+        headers["apiKey"] = lir_api_key
     body = None if method == "GET" else json.dumps(payload, sort_keys=True).encode("utf-8")
     status_code, response_body = cst_http_request(config, method, url, headers, body, config.read_timeout)
     accepted = 200 <= status_code < 300
@@ -3452,8 +3442,7 @@ def retry_cst_jobs(connection: sqlite3.Connection, job_rows: list[sqlite3.Row], 
                         request_id = request_at.strftime("%Y%m%d%H%M%S") + f"{request_at.microsecond // 1000:03d}"
                         config_row = connection.execute("SELECT encrypted_api_access_key, encrypted_user_key FROM cst_config WHERE id = 'default'").fetchone()
                         api_key = decrypt_secret(str(config_row["encrypted_api_access_key"] or "")) if config_row else ""
-                        user_key = decrypt_secret(str(config_row["encrypted_user_key"] or "")) if config_row else ""
-                        url = cst_append_user_key_param(url, user_key)
+                        lir_api_key = decrypt_secret(str(config_row["encrypted_user_key"] or "")) if config_row else ""
                         headers = {
                             "requestId": request_id,
                             "Accept-Language": config.accept_language or CST_DEFAULT_ACCEPT_LANGUAGE,
@@ -3463,8 +3452,8 @@ def retry_cst_jobs(connection: sqlite3.Connection, job_rows: list[sqlite3.Row], 
                         }
                         if api_key:
                             headers["x-Gateway-APIKey"] = api_key
-                        if user_key:
-                            headers["user_key"] = user_key
+                        if lir_api_key:
+                            headers["apiKey"] = lir_api_key
                         status_code, response = cst_http_request(config, "POST", url, headers, json.dumps(payload, sort_keys=True).encode("utf-8"), config.read_timeout)
                         status = "SUCCESS" if 200 <= status_code < 300 else "FAILED"
                         last_error = "" if status == "SUCCESS" else f"CST API HTTP {status_code}"

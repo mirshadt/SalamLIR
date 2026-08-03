@@ -4614,7 +4614,7 @@ function CstLirApiSettings(props: CstLirApiSettingsProps) {
           <div className="flex flex-wrap gap-2">
             <Badge variant={props.cstConfig?.auth_password_configured ? "success" : "warning"}>{props.cstConfig?.auth_password_configured ? "Password stored" : "Password missing"}</Badge>
             <Badge variant={props.cstConfig?.api_access_key_configured ? "success" : "warning"}>{props.cstConfig?.api_access_key_configured ? "Gateway API key stored" : "Gateway API key missing"}</Badge>
-            <Badge variant={props.cstConfig?.user_key_configured ? "success" : "warning"}>{props.cstConfig?.user_key_configured ? "User Key stored" : "User Key missing"}</Badge>
+            <Badge variant={props.cstConfig?.user_key_configured ? "success" : "warning"}>{props.cstConfig?.user_key_configured ? "LIR apiKey header stored" : "LIR apiKey header missing"}</Badge>
             <Badge variant={props.cstConfig?.token_cached ? "success" : "default"}>{props.cstConfig?.token_cached ? `Token cached until ${props.cstConfig.token_expires_at.slice(0, 19)}` : "No cached token"}</Badge>
           </div>
         </div>
@@ -4686,8 +4686,8 @@ function CstLirApiSettings(props: CstLirApiSettingsProps) {
             <Input name="cst-api-key" autoComplete="new-password" value={props.cstConfigForm.api_access_key ?? ""} onChange={(event) => props.onCstConfigForm({ ...props.cstConfigForm, api_access_key: event.target.value })} placeholder={props.cstConfig?.api_access_key_configured ? "Gateway API key configured" : "x-Gateway-APIKey value"} type="password" />
           </label>
           <label className="grid gap-1 md:col-span-2">
-            <span className="text-xs font-medium text-muted-foreground">User Key</span>
-            <Input name="cst-user-key" autoComplete="new-password" value={props.cstConfigForm.user_key ?? ""} onChange={(event) => props.onCstConfigForm({ ...props.cstConfigForm, user_key: event.target.value })} placeholder={props.cstConfig?.user_key_configured ? "User Key configured" : "user_key value"} type="password" />
+            <span className="text-xs font-medium text-muted-foreground">LIR apiKey header</span>
+            <Input name="cst-user-key" autoComplete="new-password" value={props.cstConfigForm.user_key ?? ""} onChange={(event) => props.onCstConfigForm({ ...props.cstConfigForm, user_key: event.target.value })} placeholder={props.cstConfig?.user_key_configured ? "apiKey header configured" : "apiKey header value"} type="password" />
           </label>
           <label className="grid gap-1">
             <span className="text-xs font-medium text-muted-foreground">Accept language</span>
