@@ -2936,6 +2936,28 @@ def cst_real_api_enabled(config: CstConfig) -> bool:
     return True
 
 
+def cst_base_url_from_host_port(host: object, port: object) -> str:
+    host_text = str(host or "").strip()
+    if "://" in host_text:
+        parsed = urllib_parse.urlsplit(host_text)
+        host_text = parsed.hostname or parsed.netloc
+    else:
+        host_text = host_text.split("/")[0].split(":")[0]
+    host_text = host_text.strip()
+    return f"https://{host_text}:{int(port or 443)}" if host_text else ""
+
+
+def cst_base_url_uses_placeholder_host(base_url: object) -> bool:
+    value = str(base_url or "").strip()
+    if not value:
+        return True
+    try:
+        return (urllib_parse.urlsplit(value).hostname or "").lower() == "host"
+    except Exception:
+        lowered = value.lower()
+        return lowered == "host" or lowered.startswith("https://host") or lowered.startswith("http://host")
+
+
 def cst_redact_url(url: str) -> str:
     parts = urllib_parse.urlsplit(url)
     query_items = [(key, "***" if key == "user_key" else value) for key, value in urllib_parse.parse_qsl(parts.query, keep_blank_values=True)]
@@ -5786,12 +5808,12 @@ def update_cst_config(payload: CstConfigUpdate) -> CstConfig:
             ZoneInfo(str(values["schedule_timezone"]))
         except Exception as exc:
             raise HTTPException(status_code=400, detail="Unsupported CST schedule timezone") from exc
-    if "host" in values and "base_url" not in values:
-        port = int(values.get("port") or get_cst_config().port or 443)
-        values["base_url"] = f"https://{str(values['host']).strip()}:{port}"
-    elif "port" in values and "base_url" not in values:
-        current = get_cst_config()
-        values["base_url"] = f"https://{current.host}:{int(values['port'])}"
+    current_config = get_cst_config()
+    effective_host = values.get("host") or current_config.host
+    effective_port = int(values.get("port") or current_config.port or 443)
+    if "host" in values or "port" in values or cst_base_url_uses_placeholder_host(values.get("base_url")):
+        if "base_url" not in values or cst_base_url_uses_placeholder_host(values.get("base_url")):
+            values["base_url"] = cst_base_url_from_host_port(effective_host, effective_port)
     values["verify_ssl"] = 0
     for boolean_field in ["enabled", "auto_execute", "scheduled_sync_enabled", "send_enabled", "update_enabled", "delete_enabled", "get_enabled"]:
         if boolean_field in values:

@@ -689,6 +689,9 @@ video {
 .max-h-\[180px\] {
   max-height: 180px;
 }
+.max-h-\[220px\] {
+  max-height: 220px;
+}
 .max-h-\[260px\] {
   max-height: 260px;
 }
@@ -718,9 +721,6 @@ video {
 }
 .max-h-\[90vh\] {
   max-height: 90vh;
-}
-.max-h-\[220px\] {
-  max-height: 220px;
 }
 .min-h-14 {
   min-height: 3.5rem;
@@ -1196,6 +1196,10 @@ video {
   padding-top: 1rem;
   padding-bottom: 1rem;
 }
+.py-5 {
+  padding-top: 1.25rem;
+  padding-bottom: 1.25rem;
+}
 .py-6 {
   padding-top: 1.5rem;
   padding-bottom: 1.5rem;
@@ -1203,10 +1207,6 @@ video {
 .py-8 {
   padding-top: 2rem;
   padding-bottom: 2rem;
-}
-.py-5 {
-  padding-top: 1.25rem;
-  padding-bottom: 1.25rem;
 }
 .pb-2 {
   padding-bottom: 0.5rem;
@@ -1758,12 +1758,12 @@ textarea {
 
 @media (min-width: 640px) {
 
-  .sm\:grid-cols-3 {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-  }
-
   .sm\:grid-cols-2 {
     grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .sm\:grid-cols-3 {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 
   .sm\:items-end {

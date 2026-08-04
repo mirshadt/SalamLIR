@@ -749,6 +749,36 @@ function ShellLoading() {
   );
 }
 
+function cstBaseUrlFromHostPort(host: string | undefined, port: number | string | undefined) {
+  const cleanHost = String(host ?? "")
+    .trim()
+    .replace(/^https?:\/\//i, "")
+    .split("/")[0]
+    .split(":")[0];
+  const cleanPort = Number(port) || 443;
+  return cleanHost ? `https://${cleanHost}:${cleanPort}` : "";
+}
+
+function cstBaseUrlUsesPlaceholderHost(baseUrl: string | undefined) {
+  const value = String(baseUrl ?? "").trim();
+  if (!value) {
+    return true;
+  }
+  try {
+    return new URL(value).hostname.toLowerCase() === "host";
+  } catch {
+    return value.toLowerCase() === "host" || value.toLowerCase().startsWith("https://host") || value.toLowerCase().startsWith("http://host");
+  }
+}
+
+function normalizeCstConfigFormForSave(form: CstConfigPayload): CstConfigPayload {
+  const derivedBaseUrl = cstBaseUrlFromHostPort(form.host, form.port);
+  return {
+    ...form,
+    base_url: cstBaseUrlUsesPlaceholderHost(form.base_url) ? derivedBaseUrl : form.base_url
+  };
+}
+
 function LoginScreen(props: {
   username: string;
   password: string;
@@ -963,7 +993,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
       integration_mode: cstConfig.integration_mode,
       host: cstConfig.host,
       port: cstConfig.port,
-      base_url: cstConfig.base_url,
+      base_url: cstBaseUrlUsesPlaceholderHost(cstConfig.base_url) ? cstBaseUrlFromHostPort(cstConfig.host, cstConfig.port) : cstConfig.base_url,
       token_path: cstConfig.token_path,
       send_path: cstConfig.send_path,
       update_path: cstConfig.update_path,
@@ -1734,9 +1764,9 @@ ${errorMessage(error)}`
                   void siebelConfigQuery.refetch();
                   setNotice({ title: "Siebel Test Succeeded", detail: `${result.message}\nDSN: ${result.dsn}\nTested: ${result.tested_at.slice(0, 19)}` });
                 })}
-                onSaveCstConfig={() => run(async () => { await updateCstConfig(cstConfigForm); void cstConfigQuery.refetch(); })}
+                onSaveCstConfig={() => run(async () => { await updateCstConfig(normalizeCstConfigFormForSave(cstConfigForm)); void cstConfigQuery.refetch(); })}
                 onTestCstConnection={() => run(async () => {
-                  await updateCstConfig(cstConfigForm);
+                  await updateCstConfig(normalizeCstConfigFormForSave(cstConfigForm));
                   const result = await testCstConnection();
                   void cstConfigQuery.refetch();
                   setNotice({ title: "CST Token Test Succeeded", detail: `${result.message}\nPath: ${result.token_path}\nToken expires: ${result.token_expires_at ? result.token_expires_at.slice(0, 19) : "not returned"}` });
