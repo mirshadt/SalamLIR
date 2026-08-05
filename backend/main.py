@@ -41,6 +41,7 @@ PUBLIC_FAVICON_PATH = Path(__file__).resolve().parent.parent / "public" / "favic
 DB_BUSY_TIMEOUT_MS = 30_000
 DB_WRITE_LOCK = threading.RLock()
 CST_API_CALL_LOCK = threading.RLock()
+CST_API_LOG_LOCK = threading.Lock()
 CST_PENDING_PUSH_LOCK = threading.Lock()
 CST_SCHEDULER_LOCK = threading.Lock()
 CST_SCHEDULER_STARTED = False
@@ -55,6 +56,9 @@ CST_FALLBACK_PHONE_NUMBER = "0000000000"
 CST_FALLBACK_ID_NUMBER = "0000000000"
 CST_DEFAULT_ACCEPT_LANGUAGE = "EN"
 CST_API_TIMEZONE = timezone(timedelta(hours=3))
+CST_API_LOG_PATH = Path(os.environ.get("CST_API_LOG_FILE") or Path(__file__).with_name("logs") / "cst_api_exchange.jsonl")
+CST_API_LOG_ENABLED = os.environ.get("CST_API_FILE_LOG_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+CST_LOG_SENSITIVE_KEYS = {"authorization", "x-gateway-apikey", "apikey", "api_key", "access_token", "token", "refresh_token", "client_secret", "password"}
 BULK_UNASSIGNED_FRAGMENT_SOURCE = "bulk_unassigned_fragment"
 AUDIT_SERVICE = AuditService(lambda: now_iso())
 
@@ -2304,6 +2308,15 @@ def cst_jobs_succeeded(jobs: list[CstSyncJob], operation: str) -> bool:
     return bool(jobs) and all(job.operation == operation and job.status == "SUCCESS" for job in jobs)
 
 
+def assert_cst_business_flow_succeeded(jobs: list[CstSyncJob], action: str) -> None:
+    if not jobs:
+        return
+    failed = next((job for job in jobs if job.status != "SUCCESS"), None)
+    if failed:
+        reason = failed.last_error or f"CST job remained {failed.status}"
+        raise HTTPException(status_code=502, detail=f"{action} failed because CST sync did not complete for {failed.cidr}: {reason}")
+
+
 def cst_unassigned_update_resource(resource: ResourceRecord) -> ResourceRecord:
     return resource.model_copy(update={
         "assignment_status_id": 1,
@@ -3007,7 +3020,56 @@ def cst_ssl_context(config: CstConfig) -> ssl.SSLContext | None:
     return ssl._create_unverified_context()
 
 
+def cst_redact_log_value(value: object) -> object:
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            key_text = str(key)
+            if key_text.lower() in CST_LOG_SENSITIVE_KEYS:
+                redacted[key_text] = "***"
+            else:
+                redacted[key_text] = cst_redact_log_value(item)
+        return redacted
+    if isinstance(value, list):
+        return [cst_redact_log_value(item) for item in value]
+    return value
+
+
+def cst_request_body_for_log(body: bytes | None) -> object:
+    if body is None:
+        return None
+    text = body.decode("utf-8", errors="replace")
+    try:
+        return cst_redact_log_value(json.loads(text))
+    except json.JSONDecodeError:
+        return text
+
+
+def cst_log_api_exchange(method: str, url: str, headers: dict[str, str], body: bytes | None, status_code: int | None, response_body: object, started_at: float, error: str = "") -> None:
+    if not CST_API_LOG_ENABLED:
+        return
+    try:
+        entry = {
+            "timestamp": now_iso(),
+            "durationMs": int((time.time() - started_at) * 1000),
+            "method": method,
+            "url": cst_redact_url(url),
+            "requestHeaders": cst_redact_log_value(headers),
+            "requestBody": cst_request_body_for_log(body),
+            "httpStatus": status_code,
+            "responseBody": cst_redact_log_value(response_body),
+            "error": error,
+        }
+        with CST_API_LOG_LOCK:
+            CST_API_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with CST_API_LOG_PATH.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+    except Exception:
+        pass
+
+
 def cst_http_request(config: CstConfig, method: str, url: str, headers: dict[str, str], body: bytes | None, timeout: int) -> tuple[int, dict]:
+    started_at = time.time()
     request = urllib_request.Request(url, data=body, headers=headers, method=method)
     try:
         with urllib_request.urlopen(request, timeout=timeout, context=cst_ssl_context(config)) as response:
@@ -3016,7 +3078,9 @@ def cst_http_request(config: CstConfig, method: str, url: str, headers: dict[str
                 parsed = json.loads(raw) if raw else {}
             except json.JSONDecodeError:
                 parsed = {"raw": raw}
-            return int(response.status), parsed
+            status_code = int(response.status)
+            cst_log_api_exchange(method, url, headers, body, status_code, parsed, started_at)
+            return status_code, parsed
     except urllib_error.HTTPError as exc:
         raw = exc.read().decode("utf-8", errors="replace")
         try:
@@ -3024,8 +3088,11 @@ def cst_http_request(config: CstConfig, method: str, url: str, headers: dict[str
         except json.JSONDecodeError:
             parsed = {"raw": raw}
         parsed.setdefault("error", exc.reason)
-        return int(exc.code), parsed
+        status_code = int(exc.code)
+        cst_log_api_exchange(method, url, headers, body, status_code, parsed, started_at, str(exc.reason))
+        return status_code, parsed
     except (TimeoutError, OSError, urllib_error.URLError) as exc:
+        cst_log_api_exchange(method, url, headers, body, None, {}, started_at, str(exc))
         raise HTTPException(status_code=502, detail=f"CST request failed: {exc}") from exc
 
 
@@ -3115,7 +3182,6 @@ def create_cst_assignment_create_jobs(
     assignment: Assignment,
     assignment_resource: ResourceRecord,
     workflow_type: str,
-    defer_execution: bool = False,
 ) -> list[CstSyncJob]:
     assigned_network = network_of(assignment)
     operations: list[tuple[ResourceRecord, str]] = []
@@ -3124,7 +3190,7 @@ def create_cst_assignment_create_jobs(
         container_network = normalize_network(str(row["cidr"]))
         if container_network == assigned_network:
             operations.append((assignment_resource, "UPDATE"))
-            return create_cst_sync_jobs(connection, operations, workflow_type, defer_execution=defer_execution)
+            return create_cst_sync_jobs(connection, operations, workflow_type)
         operations.append((container_resource, "DELETE"))
         for fragment in remaining_networks_after_subtract(container_network, assigned_network):
             fragment_uuid = stable_uuid("cst-fragment", str(row["transaction_id"]), assignment.id, str(fragment))
@@ -3141,94 +3207,7 @@ def create_cst_assignment_create_jobs(
                 )
             )
     operations.append((assignment_resource, "SEND"))
-    return create_cst_sync_jobs(connection, operations, workflow_type, defer_execution=defer_execution)
-
-def cst_exception_message(exc: Exception) -> str:
-    if isinstance(exc, HTTPException):
-        return str(exc.detail)
-    return str(exc)
-
-
-def queue_cst_sync_jobs_best_effort(
-    connection: sqlite3.Connection,
-    resource_operations: list[tuple[ResourceRecord, str]],
-    workflow_type: str,
-    audit_entity_type: str,
-    audit_entity_id: str,
-    old_value: str = "",
-) -> list[CstSyncJob]:
-    if not resource_operations:
-        return []
-    try:
-        return create_cst_sync_jobs(connection, resource_operations, workflow_type, defer_execution=True)
-    except Exception as exc:
-        message = cst_exception_message(exc)
-        record_audit(
-            connection,
-            "CST Sync Queue Deferred",
-            audit_entity_type,
-            audit_entity_id,
-            old_value,
-            json.dumps({"workflowType": workflow_type, "error": message, "operationCount": len(resource_operations)}),
-        )
-        return []
-
-
-def queue_cst_assignment_create_jobs_best_effort(
-    connection: sqlite3.Connection,
-    assignment: Assignment,
-    assignment_resource: ResourceRecord,
-    workflow_type: str,
-) -> list[CstSyncJob]:
-    try:
-        return create_cst_assignment_create_jobs(connection, assignment, assignment_resource, workflow_type, defer_execution=True)
-    except Exception as exc:
-        message = cst_exception_message(exc)
-        record_audit(
-            connection,
-            "CST Sync Queue Deferred",
-            "assignment",
-            assignment.id,
-            assignment.model_dump_json(),
-            json.dumps({"workflowType": workflow_type, "cidr": assignment.cidr, "error": message}),
-        )
-        connection.execute(
-            "UPDATE assignments SET cst_sync_status = ?, action_flag = ? WHERE id = ?",
-            ("PENDING", assignment.action_flag or "S", assignment.id),
-        )
-        connection.execute(
-            "UPDATE ip_resources SET cst_sync_status = ?, action_flag = ?, updated_at = ? WHERE resource_uuid = ?",
-            ("PENDING", assignment_resource.action_flag or "S", now_iso(), assignment_resource.resource_uuid),
-        )
-        return []
-
-
-def queue_partial_cst_jobs_best_effort(
-    connection: sqlite3.Connection,
-    operation_id: str,
-    workflow_type: str,
-    operations: list[tuple[str, ResourceRecord, str]],
-    old_value: str = "",
-) -> list[CstSyncJob]:
-    if not operations:
-        return []
-    try:
-        jobs = create_cst_sync_jobs(connection, [(resource, operation) for _kind, resource, operation in operations], workflow_type)
-    except Exception as exc:
-        message = cst_exception_message(exc)
-        record_audit(
-            connection,
-            "CST Partial Reassignment Queue Deferred",
-            "partial_reassignment",
-            operation_id,
-            old_value,
-            json.dumps({"workflowType": workflow_type, "error": message, "operationCount": len(operations)}),
-        )
-        return []
-    for (kind, resource, operation), job in zip(operations, jobs):
-        record_partial_fragment_job(connection, operation_id, kind, resource, operation, job)
-    return jobs
-
+    return create_cst_sync_jobs(connection, operations, workflow_type)
 
 def cst_waiting_for_prior_delete_message() -> str:
     return "Waiting for earlier CST operation in this batch to succeed before continuing dependent LIR changes"
@@ -3275,7 +3254,6 @@ def create_cst_sync_jobs(
     connection: sqlite3.Connection,
     resource_operations: list[tuple[ResourceRecord, str]],
     workflow_type: str,
-    defer_execution: bool = False,
 ) -> list[CstSyncJob]:
     eligible = [(resource, operation) for resource, operation in resource_operations if resource.ip_type == "PUBLIC"]
     if not eligible:
@@ -3312,10 +3290,6 @@ def create_cst_sync_jobs(
         elif prior_delete_unresolved and operation != "DELETE":
             status = "PENDING"
             last_error = cst_waiting_for_prior_delete_message()
-            response = {"temporaryStorage": True, "externalApiCalled": False, "accepted": False, "message": last_error}
-        elif defer_execution:
-            status = "PENDING"
-            last_error = "CST sync queued separately from the business workflow"
             response = {"temporaryStorage": True, "externalApiCalled": False, "accepted": False, "message": last_error}
         elif not config.enabled:
             status = "PENDING"
@@ -7636,12 +7610,13 @@ def continue_partial_reassignment(connection: sqlite3.Connection, operation_id: 
     if mode == "SHRINK" and original_reported_to_cst:
         jobs.extend(partial_ensure_fragment_job(connection, operation_id, "ORIGINAL_UPDATE_UNASSIGNED", cst_unassigned_update_resource(original_resource), "UPDATE"))
         if not partial_fragment_success(connection, operation_id, "ORIGINAL_UPDATE_UNASSIGNED"):
-            status = "PENDING" if any(job.status == "PENDING" for job in jobs) else "FAILED"
+            failed_job = next((job for job in jobs if job.operation == "UPDATE" and job.status != "SUCCESS"), None)
+            detail = failed_job.last_error if failed_job and failed_job.last_error else "CST UpdateLIRData to Unassigned did not complete successfully"
             set_partial_operation_status(
                 connection,
                 operation_id,
-                status,
-                "CST UpdateLIRData to Unassigned must succeed before DeleteLIRData can be sent",
+                "FAILED",
+                f"CST UpdateLIRData to Unassigned failed; DeleteLIRData was not sent and local partial reassignment was not completed. {detail}",
             )
             return partial_result_from_db(connection, operation_id, jobs)
 
@@ -7659,12 +7634,11 @@ def continue_partial_reassignment(connection: sqlite3.Connection, operation_id: 
         if not partial_fragment_success_for_resource(connection, operation_id, kind, resource.resource_uuid)
     ]
     if unresolved_deletes:
-        status = "PENDING" if any(job.status == "PENDING" for job in jobs) else "FAILED"
         set_partial_operation_status(
             connection,
             operation_id,
-            status,
-            f"{len(unresolved_deletes)} CST DeleteLIRData operation(s) must succeed before local partial reassignment is committed",
+            "FAILED",
+            f"{len(unresolved_deletes)} CST DeleteLIRData operation(s) failed or did not complete; local partial reassignment was not committed",
         )
         return partial_result_from_db(connection, operation_id, jobs)
 
@@ -7706,12 +7680,11 @@ def continue_partial_reassignment(connection: sqlite3.Connection, operation_id: 
 
     remaining = partial_non_success_fragments(connection, operation_id)
     if remaining:
-        status = "PENDING" if any(str(row["status"] or "") == "PENDING" for row in remaining) else "FAILED"
         set_partial_operation_status(
             connection,
             operation_id,
-            status,
-            f"{len(remaining)} CST transaction(s) must succeed before local partial reassignment is committed",
+            "FAILED",
+            f"{len(remaining)} CST transaction(s) failed or did not complete; local partial reassignment was not committed",
         )
         return partial_result_from_db(connection, operation_id, jobs)
 
@@ -7824,7 +7797,8 @@ def add_assignment(payload: AssignmentCreate) -> Assignment:
         insert_assignment(connection, assignment)
         resource = sync_assignment_resource(connection, assignment)
         if resource_requires_cst(resource):
-            queue_cst_assignment_create_jobs_best_effort(connection, assignment, resource, "ASSIGNMENT_CREATE")
+            jobs = create_cst_assignment_create_jobs(connection, assignment, resource, "ASSIGNMENT_CREATE")
+            assert_cst_business_flow_succeeded(jobs, "Assignment")
         record_audit(connection, "Subnet Allocation", "assignment", assignment.id, "", assignment.model_dump_json())
     return assignment
 
@@ -8045,7 +8019,8 @@ def update_assignment_status(assignment_id: str, payload: StatusUpdate) -> Assig
         resource = sync_assignment_resource(connection, after)
         if payload.status == "Retiring":
             if cst_resource_reported_to_cst(connection, resource) and not cst_resource_deleted_from_cst(connection, resource):
-                queue_cst_sync_jobs_best_effort(connection, [(cst_unassigned_update_resource(resource), "UPDATE")], "ASSIGNMENT_RELEASE", "assignment", assignment_id, before.model_dump_json())
+                jobs = create_cst_sync_jobs(connection, [(cst_unassigned_update_resource(resource), "UPDATE")], "ASSIGNMENT_RELEASE")
+                assert_cst_business_flow_succeeded(jobs, "Assignment release")
             else:
                 connection.execute(
                     "UPDATE assignments SET cst_sync_status = ?, action_flag = ? WHERE id = ?",
@@ -8056,7 +8031,8 @@ def update_assignment_status(assignment_id: str, payload: StatusUpdate) -> Assig
                     ("NOT_REQUIRED", before.action_flag or "D", now_iso(), resource.resource_uuid),
                 )
         elif resource_requires_cst(resource) and str(after.cst_sync_status or "").upper() != "SUCCESS":
-            queue_cst_sync_jobs_best_effort(connection, [(resource, "UPDATE")], "ASSIGNMENT_STATUS_CHANGE", "assignment", assignment_id, before.model_dump_json())
+            jobs = create_cst_sync_jobs(connection, [(resource, "UPDATE")], "ASSIGNMENT_STATUS_CHANGE")
+            assert_cst_business_flow_succeeded(jobs, "Assignment status change")
         after = assignment_from_row(connection.execute("SELECT * FROM assignments WHERE id = ?", (assignment_id,)).fetchone())
         record_audit(connection, "Assignment Changes", "assignment", assignment_id, before.model_dump_json(), after.model_dump_json())
     return after
@@ -8083,16 +8059,10 @@ def unassign(assignment_id: str) -> None:
             )
             retiring_assignment = assignment_from_row(connection.execute("SELECT * FROM assignments WHERE id = ?", (assignment_id,)).fetchone())
             resource = sync_assignment_resource(connection, retiring_assignment)
-            jobs = queue_cst_sync_jobs_best_effort(connection, [(cst_unassigned_update_resource(resource), "UPDATE")], "ASSIGNMENT_UNASSIGN", "assignment", assignment_id, assignment.model_dump_json())
-            if cst_jobs_succeeded(jobs, "UPDATE"):
-                audit_action = "CST Assignment Status Update"
-                audit_new_value = "Set CST LIR assignmentStatusId to 1 Unassigned and released locally"
-            else:
-                failed = next((job for job in jobs if job.status != "SUCCESS"), None)
-                detail = failed.last_error if failed and failed.last_error else "CST UpdateLIRData to Unassigned queued for later retry"
-                record_audit(connection, "CST Assignment Status Update Deferred", "assignment", assignment_id, assignment.model_dump_json(), detail)
-                audit_action = "Subnet Release"
-                audit_new_value = f"Released locally; CST UpdateLIRData to Unassigned deferred: {detail}"
+            jobs = create_cst_sync_jobs(connection, [(cst_unassigned_update_resource(resource), "UPDATE")], "ASSIGNMENT_UNASSIGN")
+            assert_cst_business_flow_succeeded(jobs, "Unassign")
+            audit_action = "CST Assignment Status Update"
+            audit_new_value = "Set CST LIR assignmentStatusId to 1 Unassigned and released locally"
 
         result = connection.execute("DELETE FROM assignments WHERE id = ?", (assignment_id,))
         if result.rowcount == 0:

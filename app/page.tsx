@@ -1563,8 +1563,8 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                         setNotice({
                           title: "Unassign Completed",
                           detail: ripeSynced
-                            ? `${assignment.cidr} was moved to RIPE removal pending. CST unassigned sync, if required, is tracked separately.`
-                            : `${assignment.cidr} was unassigned successfully. CST unassigned sync, if required, is tracked separately.`
+                            ? `${assignment.cidr} was moved to RIPE removal pending. CST was updated first when required.`
+                            : `${assignment.cidr} was unassigned successfully. CST was updated first when required.`
                         });
                       } catch (error) {
                         setNotice({
