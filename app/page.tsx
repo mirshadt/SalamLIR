@@ -882,6 +882,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
     read_timeout: 30,
     token_refresh_buffer_seconds: 300,
     batch_size_limit: 500,
+    send_payload_batch_size: 1,
     hourly_request_limit: 1000
   });
   const [ripePoolCsv, setRipePoolCsv] = useState("pool_name,cidr,allocation_type,source,created_date\nRIPE Allocation 5.42.224.0,5.42.224.0/19,RIPE Allocated Pool,RIPE Database,2026-06-01");
@@ -1009,6 +1010,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
       read_timeout: cstConfig.read_timeout,
       token_refresh_buffer_seconds: cstConfig.token_refresh_buffer_seconds,
       batch_size_limit: cstConfig.batch_size_limit,
+      send_payload_batch_size: cstConfig.send_payload_batch_size,
       hourly_request_limit: cstConfig.hourly_request_limit
     });
   }, [cstConfig]);
@@ -1296,7 +1298,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                   void cstJobsQuery.refetch();
                   void cstBatchesQuery.refetch();
                   void cstTransactionsQuery.refetch();
-                  setNotice({ title: "CST Pending Push", detail: `${result.processed_jobs}/${result.requested_jobs} pending job(s) processed sequentially for ${cstScopeLabel(result.resource_scope)}. Success: ${result.success_jobs}, failed: ${result.failed_jobs}, still pending: ${result.pending_jobs}. Batch limit: ${result.batch_size_limit}, hourly limit: ${result.hourly_request_limit}.` });
+                  setNotice({ title: "CST Pending Push", detail: `${result.processed_jobs}/${result.requested_jobs} pending job(s) processed sequentially for ${cstScopeLabel(result.resource_scope)}. Success: ${result.success_jobs}, failed: ${result.failed_jobs}, still pending: ${result.pending_jobs}. Job limit: ${result.batch_size_limit}, SendLIR records per API call: ${result.send_payload_batch_size}, hourly limit: ${result.hourly_request_limit}.` });
                 })}
                 onToggleCstEnabled={(enabled) => run(async () => { await updateCstConfig({ enabled }); })}
                 onToggleCstAutoExecute={(auto_execute) => run(async () => { await updateCstConfig({ auto_execute }); })}
@@ -1807,7 +1809,7 @@ ${errorMessage(error)}`
           if (!includedIds.length) {
             return;
           }
-          if (!window.confirm(`Create CST migration job with ${includedIds.length} included transaction(s)?`)) {
+          if (!window.confirm(`Create pending CST migration job with ${includedIds.length} included transaction(s)? CST API will not be called until you push pending jobs.`)) {
             return;
           }
           const result = await createCstMigrationJobFromReview({
@@ -1824,7 +1826,7 @@ ${errorMessage(error)}`
           void cstBatchesQuery.refetch();
           void cstTransactionsQuery.refetch();
           setNotice({
-            title: result.batch_id ? "CST Migration Job Created" : "CST Migration Job Not Created",
+            title: result.batch_id ? "Pending CST Migration Job Created" : "CST Migration Job Not Created",
             detail: `${result.message}\nJob ID: ${result.batch_id || "-"}\nIncluded: ${result.included_transactions}\nRejected/skipped: ${result.rejected_count + result.skipped_count}\nCreated: ${result.created_at.slice(0, 19)}\nCreated by: ${result.created_by}${result.rejected.length ? `\n\nRejected:\n${result.rejected.map((item) => `${item.review_id} ${item.cidr}: ${item.reason}`).join("\n")}` : ""}`
           });
         })}
@@ -4675,17 +4677,21 @@ function CstLirApiSettings(props: CstLirApiSettingsProps) {
             <p className="font-semibold">CST push rate limit</p>
             <p className="text-xs text-muted-foreground">Controls how many pending CST jobs can be submitted per run and how fast real CST API calls are paced.</p>
           </div>
-          <div className="grid gap-3 md:grid-cols-2">
+          <div className="grid gap-3 md:grid-cols-3">
             <label className="grid gap-1">
               <span className="text-xs font-medium text-muted-foreground">Max jobs per push</span>
               <Input min={1} type="number" value={String(props.cstConfigForm.batch_size_limit ?? 500)} onChange={(event) => props.onCstConfigForm({ ...props.cstConfigForm, batch_size_limit: Math.max(Number(event.target.value) || 500, 1) })} placeholder="500" />
+            </label>
+            <label className="grid gap-1">
+              <span className="text-xs font-medium text-muted-foreground">SendLIR records per API call</span>
+              <Input min={1} type="number" value={String(props.cstConfigForm.send_payload_batch_size ?? 1)} onChange={(event) => props.onCstConfigForm({ ...props.cstConfigForm, send_payload_batch_size: Math.max(Number(event.target.value) || 1, 1) })} placeholder="400" />
             </label>
             <label className="grid gap-1">
               <span className="text-xs font-medium text-muted-foreground">Max CST calls per hour</span>
               <Input min={1} type="number" value={String(props.cstConfigForm.hourly_request_limit ?? 1000)} onChange={(event) => props.onCstConfigForm({ ...props.cstConfigForm, hourly_request_limit: Math.max(Number(event.target.value) || 1000, 1) })} placeholder="1000" />
             </label>
           </div>
-          <p className="text-xs text-muted-foreground">Example: 1000 per hour means about 3.6 seconds between real CST calls. Jobs skipped by validation or disabled CST settings are not delayed.</p>
+          <p className="text-xs text-muted-foreground">Example: set SendLIR records per API call to 400 to send 400 LIR records inside one SendLIRData payload. Jobs skipped by validation or disabled CST settings are not delayed.</p>
         </div>
         <div className="grid gap-3 md:grid-cols-4">          <label className="grid gap-1">
             <span className="text-xs font-medium text-muted-foreground">Integration mode</span>
@@ -6075,6 +6081,8 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
     const reservedIps = childAssignments.filter((assignment) => assignment.status === "Reserved").reduce((sum, assignment) => sum + assignment.size, 0);
     const freeIps = Math.max(0, pool.size - usedIps - reservedIps);
     const poolStatus = poolAdministrativeStatus(pool);
+    const poolClassification = classifyCidr(pool.cidr);
+    const poolIsPublic = poolClassification === "PUBLIC";
     resources.push({
       id: pool.id,
       uuid: resourceUuid("pool", pool.id, pool.cidr),
@@ -6106,13 +6114,13 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
       utilization: pool.size ? round1(((usedIps + reservedIps) / pool.size) * 100) : 0,
       type: "Subnet",
       role: "Subnet",
-      classification: classifyCidr(pool.cidr),
+      classification: poolClassification,
       owner: "Salam LIR",
       status: poolStatus,
       administrativeStatus: poolStatus,
-      ripeSyncRequired: classifyCidr(pool.cidr) === "PUBLIC",
-      ripeSyncStatus: classifyCidr(pool.cidr) === "PUBLIC" ? "PENDING" : "EXCLUDED",
-      cstSyncStatus: "PENDING",
+      ripeSyncRequired: poolIsPublic,
+      ripeSyncStatus: poolIsPublic ? "PENDING" : "EXCLUDED",
+      cstSyncStatus: poolIsPublic ? "PENDING" : "NOT_REQUIRED",
       actionFlag: "N",
       accessTechnologyId: "",
       accessTechnology: "",
@@ -6136,6 +6144,8 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
       const assignmentRange = toRange(assignment);
       const reserved = assignment.status === "Reserved";
       const hideIndividualIdentity = assignmentIsIndividual(assignment);
+      const assignmentClassification = classifyCidr(assignment.cidr);
+      const assignmentIsPublic = assignmentClassification === "PUBLIC";
       resources.push({
         id: assignment.id,
         uuid: resourceUuid("assignment", assignment.id, assignment.cidr),
@@ -6167,13 +6177,13 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
         utilization: reserved ? 0 : 100,
         type: "Subnet",
         role: "Subnet",
-        classification: classifyCidr(assignment.cidr),
+        classification: assignmentClassification,
         owner: assignmentOwner(assignment),
         status: assignmentToAdministrativeStatus(assignment),
         administrativeStatus: assignmentToAdministrativeStatus(assignment),
-        ripeSyncRequired: classifyCidr(assignment.cidr) === "PUBLIC",
-        ripeSyncStatus: ripeStatusForAssignment(assignment, classifyCidr(assignment.cidr) === "PUBLIC"),
-        cstSyncStatus: normalizeCstSyncStatus(assignment.cst_sync_status),
+        ripeSyncRequired: assignmentIsPublic,
+        ripeSyncStatus: ripeStatusForAssignment(assignment, assignmentIsPublic),
+        cstSyncStatus: assignmentIsPublic ? normalizeCstSyncStatus(assignment.cst_sync_status) : "NOT_REQUIRED",
         actionFlag: assignment.action_flag || "N",
         accessTechnologyId: assignment.access_technology_id,
         accessTechnology: assignment.access_technology || accessTechnologyLabels[assignment.access_technology_id] || "",
