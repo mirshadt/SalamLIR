@@ -38,6 +38,8 @@ BULK_COLUMNS = [
     "commercialRegId",
     "unifiedNumber",
     "customerTypeId",
+    "customerType",
+    "subnetType",
     "regionId",
     "cityId",
     "fullName",
@@ -58,27 +60,6 @@ BULK_COLUMNS = [
     "region",
     "notes",
 ]
-
-IPTOOL_NOTE_COLUMNS = [
-    "Ip Address",
-    "Order Number",
-    "Product Type",
-    "ProductClass",
-    "CustomerSpecific",
-    "Subnet Type",
-    "Status",
-    "Subnet Mask",
-    "Sequence Number",
-    "VRF Name",
-    "RD",
-    "RT IMPORT",
-    "RT EXPORT",
-    "ASN",
-    "Remark",
-    "PublicIP",
-    "InetNum",
-]
-
 
 def read_text(path: Path) -> str:
     for encoding in ("utf-8-sig", "utf-8", "cp1256", "latin-1"):
@@ -199,6 +180,58 @@ def network_size(cidr: str, row: dict[str, str]) -> str:
     if size:
         return size
     return str(ipaddress.ip_network(cidr, strict=False).num_addresses)
+
+
+
+def normalize_lir_customer_type(value: str) -> str:
+    normalized = normalized_header(value).upper()
+    if not normalized:
+        return "NA"
+    if normalized in {"CORP", "CORPORATE", "BUSINESS", "B2B", "ENTERPRISE", "GOV", "GOVERNMENT", "GOVERNMENTAL"}:
+        return "CORP"
+    if normalized in {"RESI", "RES", "RESIDENTIAL", "INDIVIDUAL", "CONSUMER", "HOME", "PERSONAL"}:
+        return "RESI"
+    if normalized in {"COMP", "COMPANY"}:
+        return "COMP"
+    return normalized if normalized in {"CORP", "RESI", "COMP", "NA"} else "NA"
+
+
+def normalize_lir_subnet_type(value: str) -> str:
+    normalized = normalized_header(value).upper()
+    if not normalized:
+        return "NA"
+    if normalized in {"NA", *{f"LAN{index}" for index in range(1, 9)}, *{f"PTP{index}" for index in range(1, 4)}}:
+        return normalized
+    lan_match = re.fullmatch(r"LAN0*([1-8])", normalized)
+    if lan_match:
+        return f"LAN{lan_match.group(1)}"
+    ptp_match = re.fullmatch(r"PTP0*([1-3])", normalized)
+    if ptp_match:
+        return f"PTP{ptp_match.group(1)}"
+    return "NA"
+
+def location_from_iptool(row: dict[str, str]) -> tuple[str, str, str]:
+    site = row_get(row, "ShipToAddress", "Ship To Address", "ship_to_address")
+    city = row_get(row, "City", "city")
+    region = row_get(row, "Region", "region")
+    if site and (not city or not region):
+        parts = [part.strip() for part in site.split(",") if part.strip()]
+        if len(parts) >= 2 and not city:
+            city = parts[-1]
+        if len(parts) >= 3 and not region:
+            region = parts[-2]
+    return city, region, site
+
+
+def customer_type_id_from_iptool(row: dict[str, str], default_customer_type_id: str) -> str:
+    value = row_get(row, "CustomerType", "Customer Type", "customer_type")
+    normalized = normalized_header(value)
+    if normalized in {"gov", "government", "governmental"}:
+        return "1"
+    if normalized in {"corp", "corporate", "business", "b2b", "enterprise", "nongovernment", "private"}:
+        return "2"
+    return default_customer_type_id
+
 
 
 def load_simple_map(path: Path | None) -> dict[str, str]:
@@ -371,8 +404,7 @@ def build_siebel_index(rows: list[dict[str, str]], join_column: str) -> tuple[di
 def contact_name(siebel: dict[str, str]) -> str:
     parts = [row_get(siebel, "PER_TITLE"), row_get(siebel, "FST_NAME"), row_get(siebel, "LAST_NAME")]
     name = " ".join(part.strip() for part in parts if part and part.strip())
-    return name or row_get(siebel, "X_ITC_B2B_AP_NAME") or "Business Contact"
-
+    return name or row_get(siebel, "X_ITC_B2B_AP_NAME")
 
 def organization_identifier(siebel: dict[str, str], iptool: dict[str, str]) -> str:
     for value in (
@@ -394,31 +426,42 @@ def make_bulk_row(
     region_map: dict[str, str],
     city_map: dict[str, str],
 ) -> dict[str, str]:
-    warnings: list[str] = []
     cidr = cidr_from_iptool(iptool)
-    phone, phone_warning = normalize_sa_phone(row_get(siebel, "CON_PHONE_NUM", "MAIN_PH_NUM"), args.invalid_phone_fallback)
-    if phone_warning:
-        warnings.append(phone_warning)
-    main_phone, main_phone_warning = normalize_sa_phone(row_get(siebel, "MAIN_PH_NUM", "CON_PHONE_NUM"), args.invalid_phone_fallback)
-    if main_phone_warning and main_phone_warning not in warnings:
-        warnings.append(main_phone_warning)
+    iptool_city, iptool_region, iptool_site = location_from_iptool(iptool)
 
-    email = normalized_email(row_get(siebel, "CON_EMAIL")) or normalized_email(row_get(siebel, "MAIN_EMAIL_ADDR"))
-    customer_name = row_get(siebel, "ACCOUNT_NAME") or row_get(iptool, "CustomerName", "Customer Name")
+    customer_name = row_get(siebel, "ACCOUNT_NAME") or row_get(iptool, "CustomerName", "Customer Name") or "Business Customer"
     customer_id = row_get(siebel, "ACCOUNT_NUMBER") or row_get(iptool, "CustomerNumber", "Customer Number")
     org_id = organization_identifier(siebel, iptool) or customer_id
-    if org_id == customer_id:
-        warnings.append("organizationId/commercialRegId/unifiedNumber missing; customerId was used as organizationId for CST upload")
     commercial_reg = valid_10_digit(row_get(siebel, "X_ITC_B2B_COMMERCIAL_REGIS_NUM"))
     unified = valid_10_digit(row_get(siebel, "X_ITC_B2B_UNIFIED_NUMBER"))
-    region_text = row_get(siebel, "ACCOUNT_REGION") or row_get(iptool, "region", "Region")
-    city_text = row_get(siebel, "CITY") or row_get(iptool, "city", "City")
-    service_id = row_get(siebel, "SERIAL_NUM") or normalize_join_key(row_get(iptool, args.iptool_join_column))
-    service_description = row_get(siebel, "PRODUCT_NAME") or row_get(iptool, "Product Type", "ProductClass")
-    site = row_get(siebel, "ADDR_NAME") or row_get(iptool, "ShipToAddress")
-    name = contact_name(siebel)
+
+    region_text = row_get(siebel, "ACCOUNT_REGION", "REGION", "Region") or iptool_region
+    city_text = row_get(siebel, "CITY", "ACCOUNT_CITY", "City") or iptool_city
     city_id = resolve_city_id(city_text, city_map, args.city_id)
     region_id = resolve_region_id(region_text, city_id, region_map, args.region_id)
+
+    phone_source = row_get(siebel, "CON_PHONE_NUM", "MAIN_PH_NUM") or row_get(iptool, "MobileNumber", "Mobile Number", "ContactNumber", "Contact Number")
+    phone, _phone_warning = normalize_sa_phone(phone_source, args.invalid_phone_fallback)
+    main_phone_source = row_get(siebel, "MAIN_PH_NUM", "CON_PHONE_NUM") or row_get(iptool, "ContactNumber", "Contact Number", "MobileNumber", "Mobile Number")
+    main_phone, _main_phone_warning = normalize_sa_phone(main_phone_source, args.invalid_phone_fallback)
+
+    email = (
+        normalized_email(row_get(siebel, "CON_EMAIL"))
+        or normalized_email(row_get(siebel, "MAIN_EMAIL_ADDR"))
+        or normalized_email(row_get(iptool, "Email", "ContactEmail", "Contact Email"))
+        or args.default_email
+    )
+    name = (
+        contact_name(siebel)
+        or row_get(iptool, "ContactName", "Contact Name", "FullName", "Full Name")
+        or args.default_contact_name
+        or customer_name
+        or "Business Contact"
+    )
+
+    service_id = row_get(siebel, "SERIAL_NUM") or normalize_join_key(row_get(iptool, args.iptool_join_column))
+    service_description = row_get(siebel, "PRODUCT_NAME") or row_get(iptool, "Product Type", "ProductClass", "Product Class")
+    site = row_get(siebel, "ADDR_NAME", "ADDRESS", "SITE") or iptool_site
 
     return {
         "assignmentType": "BUSINESS",
@@ -433,7 +476,9 @@ def make_bulk_row(
         "organizationId": org_id,
         "commercialRegId": commercial_reg,
         "unifiedNumber": unified,
-        "customerTypeId": args.customer_type_id,
+        "customerTypeId": customer_type_id_from_iptool(iptool, args.customer_type_id),
+        "customerType": normalize_lir_customer_type(row_get(iptool, "CustomerType", "Customer Type", "customer_type")),
+        "subnetType": normalize_lir_subnet_type(row_get(iptool, "Subnet Type", "SubnetType", "subnet_type")),
         "regionId": region_id,
         "cityId": city_id,
         "fullName": name,
@@ -448,13 +493,12 @@ def make_bulk_row(
         "serviceDescription": service_description,
         "accessTechnologyId": args.access_technology_id,
         "owner": "Business Customer",
-        "assignmentPurpose": service_description or row_get(iptool, "ProductClass"),
+        "assignmentPurpose": service_description or row_get(iptool, "ProductClass", "Product Class"),
         "site": site,
         "city": city_text,
         "region": region_text,
-        "notes": ""
+        "notes": "Assigned to Business",
     }
-
 
 def write_csv(path: Path, rows: Iterable[dict[str, str]], fieldnames: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -486,6 +530,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--city-map", type=Path, help="Optional CSV map with source,id columns")
     parser.add_argument("--access-technology-id", default="1")
     parser.add_argument("--default-id-number", default="0000000000")
+    parser.add_argument("--default-contact-name", default="Business Contact", help="Fallback contact name when neither Siebel nor IP Tool has a contact name")
+    parser.add_argument("--default-email", default="", help="Fallback contact email when neither Siebel nor IP Tool has an email")
     parser.add_argument("--invalid-phone-fallback", default="0000000000")
     parser.add_argument("--include-non-public", action="store_true", help="Include IP Tool rows where PublicIP is not Yes")
     return parser.parse_args()
@@ -535,7 +581,6 @@ def main() -> int:
             continue
         try:
             output = make_bulk_row(iptool, siebel, args, region_map, city_map)
-            output["notes"] = ""
             output_rows.append(output)
         except Exception as exc:
             missing = dict(iptool)

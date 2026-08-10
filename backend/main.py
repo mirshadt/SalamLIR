@@ -48,12 +48,19 @@ CST_SCHEDULER_STARTED = False
 DEFAULT_SERVICE_PROVIDER_ID = "5"
 DEFAULT_SERVICE_PROVIDER_NAME = "Salam"
 DEFAULT_ASN = "AS35753"
+LIR_CUSTOMER_TYPE_CODES = {"CORP", "RESI", "COMP", "NA"}
+LIR_SUBNET_TYPE_CODES = {"NA", *{f"LAN{index}" for index in range(1, 9)}, *{f"PTP{index}" for index in range(1, 4)}}
 CST_SEND_LIR_PATH = "/api/rest/v1.0/LIRDataService/SendLIRData"
 CST_UPDATE_LIR_PATH = "/api/rest/v1.0/LIRDataService/UpdateLIRData"
 CST_DELETE_LIR_PATH = "/api/rest/v1.0/LIRDataService/DeleteLIRData"
 CST_GET_LIR_PATH = "/api/rest/v1.0/LIRDataService/GetLIRData"
 CST_FALLBACK_PHONE_NUMBER = "0000000000"
 CST_FALLBACK_ID_NUMBER = "0000000000"
+CST_FALLBACK_EMAIL = "cst-migration@salam.sa"
+CST_FALLBACK_FULL_NAME = "CST Migration Contact"
+CST_FALLBACK_ORGANIZATION_NAME = "CST Migration Organization"
+CST_FALLBACK_CUSTOMER_TYPE_ID = 2
+CST_FALLBACK_ACCESS_TECHNOLOGY_ID = 1
 CST_FALLBACK_REGION_ID = 1
 CST_FALLBACK_CITY_ID = 153
 CST_DEFAULT_ACCEPT_LANGUAGE = "EN"
@@ -194,7 +201,8 @@ class AssignmentCreate(BaseModel):
     product_instance_id: str = ""
     customer_id: str = ""
     customer_name: str
-    customer_type: str = "Enterprise"
+    customer_type: str = "NA"
+    subnet_type: str = "NA"
     organization_name: str = ""
     organization_id: str = ""
     customer_type_id: str = ""
@@ -1170,6 +1178,9 @@ def assignment_from_network(network: IPv4Network, payload: AssignmentCreate) -> 
     data["asn"] = data.get("asn") or DEFAULT_ASN
     data["service_id"] = data.get("service_id") or data.get("service_instance_id") or ""
     data["service_description"] = data.get("service_description") or data.get("service") or data.get("assignment_purpose") or ""
+    business_customer_assignment = data["assignment_status_id"] == 3 or (data.get("assignment_target_type") or "").lower() == "business_customer"
+    data["customer_type"] = normalize_lir_customer_type(data.get("customer_type")) if business_customer_assignment else "NA"
+    data["subnet_type"] = normalize_lir_subnet_type(data.get("subnet_type"))
     data["logical_resource_id"] = data.get("logical_resource_id") or assignment_id
     data["assignment_name"] = data.get("assignment_name") or f"Subnet assignment {network}"
     data["service_instance_name"] = data.get("service_instance_name") or data.get("service") or f"Service for {network}"
@@ -1860,10 +1871,10 @@ def cst_phone_without_extension(value: object) -> str:
 
 def normalize_cst_mobile_number(value: object) -> str:
     digits = re.sub(r"\D", "", cst_phone_without_extension(value))
-    if digits.startswith("00"):
-        digits = digits[2:]
     if digits == CST_FALLBACK_PHONE_NUMBER:
         return CST_FALLBACK_PHONE_NUMBER
+    if digits.startswith("00"):
+        digits = digits[2:]
     if digits.startswith("0") and len(digits) == 10 and digits[1] in {"1", "5"}:
         digits = "966" + digits[1:]
     elif len(digits) == 9 and digits[0] in {"1", "5"}:
@@ -2057,6 +2068,34 @@ def validate_siebel_query(query_sql: str) -> str:
     return query
 
 
+
+def normalize_lir_customer_type(value: object) -> str:
+    normalized = str(value or "").strip().upper().replace("-", "").replace("_", "").replace(" ", "")
+    if not normalized:
+        return "NA"
+    if normalized in {"CORP", "CORPORATE", "BUSINESS", "B2B", "ENTERPRISE", "GOV", "GOVERNMENT", "GOVERNMENTAL"}:
+        return "CORP"
+    if normalized in {"RESI", "RES", "RESIDENTIAL", "INDIVIDUAL", "CONSUMER", "HOME", "PERSONAL"}:
+        return "RESI"
+    if normalized in {"COMP", "COMPANY"}:
+        return "COMP"
+    return normalized if normalized in LIR_CUSTOMER_TYPE_CODES else "NA"
+
+
+def normalize_lir_subnet_type(value: object) -> str:
+    normalized = str(value or "").strip().upper().replace("-", "").replace("_", "").replace(" ", "")
+    if not normalized:
+        return "NA"
+    if normalized in LIR_SUBNET_TYPE_CODES:
+        return normalized
+    lan_match = re.fullmatch(r"LAN0*([1-8])", normalized)
+    if lan_match:
+        return f"LAN{lan_match.group(1)}"
+    ptp_match = re.fullmatch(r"PTP0*([1-3])", normalized)
+    if ptp_match:
+        return f"PTP{ptp_match.group(1)}"
+    return "NA"
+
 def add_missing_columns(connection: sqlite3.Connection, table: str, model: type[BaseModel]) -> None:
     existing = {row["name"] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
     for field_name, field in model.model_fields.items():
@@ -2157,6 +2196,26 @@ def cst_job_from_row(row: sqlite3.Row) -> CstSyncJob:
 def cst_ledger_from_row(row: sqlite3.Row) -> CstTransactionLedger:
     return CstTransactionLedger(**dict(row))
 
+
+def backfill_missing_cst_transaction_ledger(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        INSERT INTO cst_transaction_ledger (
+          transaction_id, cidr, resource_uuid, service_provider_id, first_used_at,
+          last_status, retired_at, retired_reason, batch_id, correlation_id
+        )
+        SELECT j.transaction_id, j.cidr, j.resource_uuid, j.service_provider_id,
+               COALESCE(NULLIF(j.created_at, ''), ?), j.status, '', '', j.batch_id, ''
+        FROM cst_sync_jobs j
+        WHERE COALESCE(j.transaction_id, '') != ''
+          AND NOT EXISTS (
+            SELECT 1
+            FROM cst_transaction_ledger l
+            WHERE l.transaction_id = j.transaction_id
+          )
+        """,
+        (now_iso(),),
+    )
 
 def cst_scheduler_run_from_row(row: sqlite3.Row) -> CstSchedulerRun:
     return CstSchedulerRun(**dict(row))
@@ -2392,6 +2451,31 @@ def cst_transaction_id_for_resource(connection: sqlite3.Connection, resource: Re
         return str(existing["transaction_id"])
     preferred_transaction_id = str(resource.transaction_id or "").strip()
     if operation != "SEND" and preferred_transaction_id:
+        existing_transaction = connection.execute(
+            "SELECT 1 FROM cst_transaction_ledger WHERE transaction_id = ?",
+            (preferred_transaction_id,),
+        ).fetchone()
+        if existing_transaction is None:
+            created_at = now_iso()
+            connection.execute(
+                """
+                INSERT INTO cst_transaction_ledger (
+                  transaction_id, cidr, resource_uuid, service_provider_id, first_used_at,
+                  last_status, retired_at, retired_reason, batch_id, correlation_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, '', '', ?, ?)
+                """,
+                (
+                    preferred_transaction_id,
+                    resource.cidr,
+                    resource.resource_uuid,
+                    resource.service_provider_id or DEFAULT_SERVICE_PROVIDER_ID,
+                    created_at,
+                    "PENDING",
+                    batch_id,
+                    correlation_id,
+                ),
+            )
         return preferred_transaction_id
 
     service_provider_id = resource.service_provider_id or DEFAULT_SERVICE_PROVIDER_ID
@@ -2492,19 +2576,49 @@ def cst_date_value(value: str, default: str = "") -> str:
     return parsed.isoformat(timespec="seconds")
 
 
+
+def cst_payload_service_description(resource: ResourceRecord, assignment_status_id: int) -> str:
+    value = str(resource.service_description or resource.description or "").strip()
+    if value:
+        return value
+    if assignment_status_id == 2:
+        return "Internal IP assignment"
+    if assignment_status_id == 3:
+        return "Business IP assignment"
+    if assignment_status_id == 4:
+        return "Individual IP assignment"
+    return "IP subnet migration"
+
+
+def cst_payload_email(value: object, require_default: bool = False) -> str:
+    normalized = normalize_cst_email(str(value or ""))
+    if normalized:
+        return normalized
+    return CST_FALLBACK_EMAIL if require_default else ""
+
+
+def cst_payload_full_name(resource: ResourceRecord, require_default: bool = False) -> str:
+    value = str(resource.full_name or getattr(resource, "contact_name", "") or "").strip()
+    if value:
+        return value
+    return CST_FALLBACK_FULL_NAME if require_default else ""
+
 def cst_payload_for_resource(resource: ResourceRecord, operation: str, transaction_id: str, correlation_id: str) -> dict:
     service_provider_id = str(resource.service_provider_id or DEFAULT_SERVICE_PROVIDER_ID)
     if operation == "SEND":
         today_text = datetime.now(timezone.utc).date().isoformat()
+        assignment_status_id = cst_int_value(resource.assignment_status_id, 1) or 1
+        business_like = assignment_status_id == 3 or str(resource.ownership_type or "").upper() == "BUSINESS"
+        individual_like = assignment_status_id == 4 or str(resource.ownership_type or "").upper() == "INDIVIDUAL"
         record = {
             "transactionId": transaction_id,
             "ipSubnet": resource.cidr,
             "asn": resource.asn or DEFAULT_ASN,
             "ipVersionId": cst_int_value(resource.ip_version, 1),
-            "assignmentStatusId": cst_int_value(resource.assignment_status_id, 1),
-            "serviceDescription": resource.service_description or resource.description or "",
+            "assignmentStatusId": assignment_status_id,
+            "serviceDescription": cst_payload_service_description(resource, assignment_status_id),
         }
-        organization_name = (resource.organization_name or resource.customer_name or "").strip()
+        organization_name = (resource.organization_name or resource.customer_name or "").strip() or (CST_FALLBACK_ORGANIZATION_NAME if business_like else "")
         optional_text_fields = {
             "organizationName": organization_name,
             "organizationId": resource.organization_id,
@@ -2513,14 +2627,16 @@ def cst_payload_for_resource(resource: ResourceRecord, operation: str, transacti
         for key, value in optional_text_fields.items():
             if str(value or "").strip():
                 record[key] = str(value).strip()
-        optional_int_fields = {
-            "customerTypeId": resource.customer_type_id,
-            "accessTechnologyId": resource.access_technology_id,
-        }
-        for key, value in optional_int_fields.items():
-            int_value = cst_int_value(value)
-            if int_value is not None:
-                record[key] = int_value
+        customer_type_id = cst_int_value(resource.customer_type_id)
+        if business_like:
+            record["customerTypeId"] = customer_type_id if customer_type_id in {1, 2} else CST_FALLBACK_CUSTOMER_TYPE_ID
+        elif customer_type_id is not None:
+            record["customerTypeId"] = customer_type_id
+        access_technology_id = cst_int_value(resource.access_technology_id)
+        if individual_like:
+            record["accessTechnologyId"] = access_technology_id if access_technology_id in CST_ACCESS_TECHNOLOGY_BY_ID else CST_FALLBACK_ACCESS_TECHNOLOGY_ID
+        elif access_technology_id is not None:
+            record["accessTechnologyId"] = access_technology_id
         region_id = cst_payload_region_id(resource)
         if region_id is not None:
             record["regionId"] = region_id
@@ -2528,10 +2644,10 @@ def cst_payload_for_resource(resource: ResourceRecord, operation: str, transacti
         if city_id is not None:
             record["cityId"] = city_id
         mobile_number = cst_payload_mobile_number(resource)
-        id_number = normalize_cst_id_number(resource.id_number) or (CST_FALLBACK_ID_NUMBER if resource.ownership_type in {"BUSINESS", "INDIVIDUAL"} else str(resource.id_number or "").strip())
-        email = normalize_cst_email(resource.email) or str(resource.email or "").strip()
+        id_number = normalize_cst_id_number(resource.id_number) or (CST_FALLBACK_ID_NUMBER if business_like or individual_like else str(resource.id_number or "").strip())
+        email = cst_payload_email(resource.email, require_default=business_like)
         contact = {
-            "fullName": str(resource.full_name or "").strip(),
+            "fullName": cst_payload_full_name(resource, require_default=business_like),
             "mobileNumber": mobile_number,
             "idNumber": id_number,
             "email": email,
@@ -2539,7 +2655,7 @@ def cst_payload_for_resource(resource: ResourceRecord, operation: str, transacti
         contact = {key: value for key, value in contact.items() if value}
         if contact:
             record["contact"] = contact
-        include_customer_dates = resource.ownership_type in {"BUSINESS", "INDIVIDUAL"} or bool(organization_name or contact)
+        include_customer_dates = business_like or individual_like or bool(organization_name or contact)
         if resource.assignment_date or include_customer_dates:
             record["assignmentDate"] = cst_date_value(resource.assignment_date, today_text)
         if resource.update_date or include_customer_dates:
@@ -2550,20 +2666,18 @@ def cst_payload_for_resource(resource: ResourceRecord, operation: str, transacti
         }
     if operation == "UPDATE":
         today_text = datetime.now(timezone.utc).date().isoformat()
-        status_id = cst_int_value(resource.assignment_status_id, 1)
+        status_id = cst_int_value(resource.assignment_status_id, 1) or 1
         record = {
             "transactionId": transaction_id,
             "assignmentStatusId": status_id,
         }
         if status_id == 3:
-            organization_name = (resource.organization_name or resource.customer_name or "").strip()
-            if organization_name:
-                record["organizationName"] = organization_name
+            organization_name = (resource.organization_name or resource.customer_name or "").strip() or CST_FALLBACK_ORGANIZATION_NAME
+            record["organizationName"] = organization_name
             if str(resource.organization_id or "").strip():
                 record["organizationId"] = str(resource.organization_id).strip()
             customer_type_id = cst_int_value(resource.customer_type_id)
-            if customer_type_id is not None:
-                record["customerTypeId"] = customer_type_id
+            record["customerTypeId"] = customer_type_id if customer_type_id in {1, 2} else CST_FALLBACK_CUSTOMER_TYPE_ID
             region_id = cst_payload_region_id(resource)
             if region_id is not None:
                 record["regionId"] = region_id
@@ -2571,16 +2685,16 @@ def cst_payload_for_resource(resource: ResourceRecord, operation: str, transacti
             if city_id is not None:
                 record["cityId"] = city_id
             contact = {
-                "fullName": str(resource.full_name or "").strip(),
+                "fullName": cst_payload_full_name(resource, require_default=True),
                 "mobileNumber": cst_payload_mobile_number(resource),
                 "idNumber": normalize_cst_id_number(resource.id_number) or CST_FALLBACK_ID_NUMBER,
-                "email": normalize_cst_email(resource.email) or str(resource.email or "").strip(),
+                "email": cst_payload_email(resource.email, require_default=True),
             }
             record["contact"] = {key: value for key, value in contact.items() if value}
             record["assignmentDate"] = cst_date_value(resource.assignment_date, today_text)
             record["updateDate"] = cst_date_value(resource.update_date, today_text)
         elif status_id == 2:
-            record["serviceDescription"] = resource.service_description or resource.description or "Internal IP assignment"
+            record["serviceDescription"] = cst_payload_service_description(resource, status_id)
             if str(resource.description or "").strip():
                 record["description"] = str(resource.description).strip()
         elif status_id == 4:
@@ -2591,19 +2705,18 @@ def cst_payload_for_resource(resource: ResourceRecord, operation: str, transacti
             if city_id is not None:
                 record["cityId"] = city_id
             access_technology_id = cst_int_value(resource.access_technology_id)
-            if access_technology_id is not None:
-                record["accessTechnologyId"] = access_technology_id
+            record["accessTechnologyId"] = access_technology_id if access_technology_id in CST_ACCESS_TECHNOLOGY_BY_ID else CST_FALLBACK_ACCESS_TECHNOLOGY_ID
             contact = {
-                "fullName": str(resource.full_name or "").strip(),
+                "fullName": cst_payload_full_name(resource, require_default=False),
                 "mobileNumber": cst_payload_mobile_number(resource),
                 "idNumber": normalize_cst_id_number(resource.id_number) or CST_FALLBACK_ID_NUMBER,
-                "email": normalize_cst_email(resource.email) or str(resource.email or "").strip(),
+                "email": cst_payload_email(resource.email),
             }
             contact = {key: value for key, value in contact.items() if value}
             if contact:
                 record["contact"] = contact
-        if status_id != 2 and str(resource.service_description or "").strip():
-            record["serviceDescription"] = str(resource.service_description).strip()
+        if status_id != 2:
+            record["serviceDescription"] = cst_payload_service_description(resource, status_id)
         if str(resource.description or "").strip():
             record["description"] = str(resource.description).strip()
         return {
@@ -4466,6 +4579,11 @@ def init_db() -> None:
         ensure_assignment_cidr_conflicts_allowed(connection)
         add_missing_columns(connection, "pools", Pool)
         add_missing_columns(connection, "assignments", Assignment)
+        connection.execute("UPDATE assignments SET customer_type = 'NA' WHERE customer_type IS NULL OR TRIM(customer_type) = ''")
+        connection.execute("UPDATE assignments SET subnet_type = 'NA' WHERE subnet_type IS NULL OR TRIM(subnet_type) = ''")
+        connection.execute("UPDATE assignments SET customer_type = 'CORP' WHERE UPPER(TRIM(customer_type)) IN ('ENTERPRISE', 'CORPORATE', 'BUSINESS', 'B2B', 'GOV', 'GOVERNMENT', 'GOVERNMENTAL')")
+        connection.execute("UPDATE assignments SET customer_type = 'RESI' WHERE UPPER(TRIM(customer_type)) IN ('INDIVIDUAL', 'RESIDENTIAL', 'CONSUMER', 'HOME', 'PERSONAL')")
+        connection.execute("UPDATE assignments SET customer_type = 'NA' WHERE COALESCE(assignment_target_type, '') != 'business_customer' AND COALESCE(assignment_status_id, 0) != 3")
         add_missing_columns(connection, "ip_resources", ResourceRecord)
         add_missing_columns(connection, "assignment_details", AssignmentDetailRecord)
         bss_audit_columns = {row["name"] for row in connection.execute("PRAGMA table_info(bss_sync_audit)").fetchall()}
@@ -5171,7 +5289,9 @@ def assignment_payload_from_bulk_row(row: dict[str, str], network: IPv4Network, 
         email = contact_email
     region_text = csv_value(row, "region")
     city_text = csv_value(row, "city")
-    customer_type_value = csv_value(row, "customerTypeId", "customer_type_id", "customerType", "customer_type")
+    customer_type_value = csv_value(row, "customerTypeId", "customer_type_id")
+    lir_customer_type = normalize_lir_customer_type(csv_value(row, "customerType", "customer_type", "lirCustomerType", "lir_customer_type")) if assignment_type == "BUSINESS" else "NA"
+    subnet_type = normalize_lir_subnet_type(csv_value(row, "subnetType", "subnet_type", "Subnet Type", "subnet type"))
     region_id_value = csv_value(row, "regionId", "region_id")
     city_id_value = csv_value(row, "cityId", "city_id")
     access_technology_value = csv_value(row, "accessTechnologyId", "access_technology_id", "accessTechnology", "access_technology")
@@ -5212,6 +5332,8 @@ def assignment_payload_from_bulk_row(row: dict[str, str], network: IPv4Network, 
         customer_name=customer_name,
         organization_name=csv_value(row, "organizationName", "organization_name") or customer_name,
         organization_id=organization_id,
+        customer_type=lir_customer_type,
+        subnet_type=subnet_type,
         customer_type_id=customer_type_id,
         region_id=region_id,
         city_id=city_id,
@@ -6157,9 +6279,28 @@ def list_cst_jobs() -> list[CstSyncJob]:
 @app.get("/cst/transactions", response_model=list[CstTransactionLedger])
 def list_cst_transactions() -> list[CstTransactionLedger]:
     with connect() as connection:
-        rows = connection.execute("SELECT * FROM cst_transaction_ledger ORDER BY first_used_at DESC LIMIT 500").fetchall()
+        backfill_missing_cst_transaction_ledger(connection)
+        rows = connection.execute(
+            """
+            SELECT l.*
+            FROM cst_transaction_ledger l
+            LEFT JOIN (
+              SELECT transaction_id,
+                     MAX(created_at) AS latest_job_at,
+                     MAX(CASE WHEN status IN ('PENDING', 'RUNNING', 'FAILED', 'BLOCKED') THEN 1 ELSE 0 END) AS active_job
+              FROM cst_sync_jobs
+              GROUP BY transaction_id
+            ) j ON j.transaction_id = l.transaction_id
+            ORDER BY
+              CASE
+                WHEN l.last_status IN ('PENDING', 'RUNNING', 'FAILED', 'BLOCKED') OR COALESCE(j.active_job, 0) = 1 THEN 0
+                ELSE 1
+              END,
+              COALESCE(j.latest_job_at, l.first_used_at) DESC
+            LIMIT 500
+            """
+        ).fetchall()
     return [cst_ledger_from_row(row) for row in rows]
-
 
 def cst_review_id(operation: str, resource_uuid: str) -> str:
     return f"{operation.upper()}:{resource_uuid}"
@@ -6268,6 +6409,185 @@ def cst_review_matches_filter(item: CstMigrationReviewItem, request: CstMigratio
     return True
 
 
+def cst_assignment_review_where(request: CstMigrationReviewRequest) -> tuple[str, list[object], bool]:
+    filters = [
+        "r.source_entity_type = 'assignment'",
+        "r.ip_type = 'PUBLIC'",
+        "r.status != 'RETIRED'",
+        "r.assignment_status_id IN (2, 3, 4)",
+        "(COALESCE(a.migration_conflict_status, '') IN ('', 'ACCEPTED'))",
+        """
+        NOT EXISTS (
+          SELECT 1
+          FROM cst_sync_jobs j
+          INNER JOIN cst_sync_batches b ON b.id = j.batch_id
+          WHERE j.resource_uuid = r.resource_uuid
+            AND b.workflow_type IN ('MANUAL_LIR_MIGRATION', 'INITIAL_MIGRATION')
+            AND j.status IN ('PENDING', 'RUNNING', 'SUCCESS', 'FAILED', 'NOT_REQUIRED')
+        )
+        """,
+    ]
+    params: list[object] = []
+    if not request.include_existing_transactions:
+        filters.append("r.resource_uuid NOT IN (SELECT resource_uuid FROM cst_transaction_ledger)")
+
+    search = str(request.search or "").strip().lower()
+    if search:
+        filters.append(
+            """
+            lower(
+              COALESCE(r.cidr, '') || ' ' || COALESCE(r.start_ip, '') || ' ' || COALESCE(r.end_ip, '') || ' ' ||
+              COALESCE(r.customer_name, '') || ' ' || COALESCE(r.organization_name, '') || ' ' || COALESCE(r.organization_id, '') || ' ' ||
+              COALESCE(r.service_id, '') || ' ' || COALESCE(r.transaction_id, '') || ' ' || COALESCE(r.resource_uuid, '')
+            ) LIKE ?
+            """
+        )
+        params.append(f"%{search}%")
+
+    assignment_status = str(request.assignment_status or "all").strip().lower()
+    if assignment_status not in {"", "all"}:
+        if assignment_status.isdigit():
+            filters.append("r.assignment_status_id = ?")
+            params.append(int(assignment_status))
+        else:
+            status_map = {"internal": 2, "business": 3, "individual": 4, "unassigned": 1}
+            status_id = status_map.get(assignment_status)
+            if status_id is None:
+                return "1 = 0", [], True
+            filters.append("r.assignment_status_id = ?")
+            params.append(status_id)
+
+    transaction_type = str(request.transaction_type or "all").strip().upper()
+    if transaction_type not in {"", "ALL", "SEND"}:
+        return "1 = 0", [], True
+
+    validation_status = str(request.validation_status or "all").strip().upper()
+    if validation_status == "VALID":
+        filters.append("COALESCE(a.cst_sync_ready, 0) = 1")
+    elif validation_status == "INVALID":
+        filters.append("COALESCE(a.cst_sync_ready, 0) = 0")
+    elif validation_status not in {"", "ALL"}:
+        return "1 = 0", [], True
+
+    if request.created_from:
+        filters.append("substr(r.created_at, 1, 10) >= ?")
+        params.append(request.created_from)
+    if request.created_to:
+        filters.append("substr(r.created_at, 1, 10) <= ?")
+        params.append(request.created_to)
+
+    return " AND ".join(filters), params, False
+
+
+def cst_assignment_review_response(connection: sqlite3.Connection, request: CstMigrationReviewRequest) -> CstMigrationReviewResponse:
+    where_sql, params, empty = cst_assignment_review_where(request)
+    if empty:
+        return CstMigrationReviewResponse(
+            page=request.page,
+            page_size=request.page_size,
+            total=0,
+            resource_scope=request.resource_scope,
+            generated_at=now_iso(),
+            items=[],
+            all_matching_review_ids=[],
+            counts=CstMigrationReviewCounts(),
+        )
+
+    base_from = """
+        FROM ip_resources r
+        LEFT JOIN assignments a ON r.source_entity_type = 'assignment' AND r.source_entity_id = a.id
+        WHERE {where_sql}
+    """
+    total_row = connection.execute(
+        f"""
+        SELECT COUNT(*) AS total,
+               SUM(CASE WHEN COALESCE(a.cst_sync_ready, 0) = 1 THEN 1 ELSE 0 END) AS valid,
+               SUM(CASE WHEN COALESCE(a.cst_sync_ready, 0) = 0 THEN 1 ELSE 0 END) AS invalid
+        {base_from.format(where_sql=where_sql)}
+        """,
+        params,
+    ).fetchone()
+    total = int(total_row["total"] or 0)
+    valid_count = int(total_row["valid"] or 0)
+    invalid_count = int(total_row["invalid"] or 0)
+    all_ids = [
+        str(row["review_id"])
+        for row in connection.execute(
+            f"""
+            SELECT 'SEND:' || r.resource_uuid AS review_id
+            {base_from.format(where_sql=where_sql)}
+            ORDER BY datetime(r.created_at) DESC, r.created_at DESC, r.prefix DESC, r.cidr
+            """,
+            params,
+        ).fetchall()
+    ]
+    offset = (request.page - 1) * request.page_size
+    rows = connection.execute(
+        f"""
+        SELECT r.*
+        {base_from.format(where_sql=where_sql)}
+        ORDER BY datetime(r.created_at) DESC, r.created_at DESC, r.prefix DESC, r.cidr
+        LIMIT ? OFFSET ?
+        """,
+        [*params, request.page_size, offset],
+    ).fetchall()
+    page_items = [cst_review_operation_item(connection, resource_from_row(row), "SEND") for row in rows]
+    return CstMigrationReviewResponse(
+        page=request.page,
+        page_size=request.page_size,
+        total=total,
+        resource_scope=request.resource_scope,
+        generated_at=now_iso(),
+        items=page_items,
+        all_matching_review_ids=all_ids,
+        counts=CstMigrationReviewCounts(
+            total_matching=total,
+            included_default=total,
+            excluded=0,
+            selected=0,
+            valid=valid_count,
+            invalid=invalid_count,
+        ),
+    )
+
+def cst_assignment_review_items_for_ids(connection: sqlite3.Connection, review_ids: list[str]) -> dict[str, CstMigrationReviewItem]:
+    resource_uuids = []
+    for review_id in review_ids:
+        operation, resource_uuid = parse_cst_review_id(review_id)
+        if operation == "SEND" and resource_uuid:
+            resource_uuids.append(resource_uuid)
+    resource_uuids = list(dict.fromkeys(resource_uuids))
+    if not resource_uuids:
+        return {}
+    placeholders = ", ".join("?" for _ in resource_uuids)
+    rows = connection.execute(
+        f"""
+        SELECT r.*
+        FROM ip_resources r
+        LEFT JOIN assignments a ON r.source_entity_type = 'assignment' AND r.source_entity_id = a.id
+        WHERE r.resource_uuid IN ({placeholders})
+          AND r.source_entity_type = 'assignment'
+          AND r.ip_type = 'PUBLIC'
+          AND r.status != 'RETIRED'
+          AND r.assignment_status_id IN (2, 3, 4)
+          AND r.resource_uuid NOT IN (SELECT resource_uuid FROM cst_transaction_ledger)
+          AND COALESCE(a.migration_conflict_status, '') IN ('', 'ACCEPTED')
+          AND NOT EXISTS (
+            SELECT 1
+            FROM cst_sync_jobs j
+            INNER JOIN cst_sync_batches b ON b.id = j.batch_id
+            WHERE j.resource_uuid = r.resource_uuid
+              AND b.workflow_type IN ('MANUAL_LIR_MIGRATION', 'INITIAL_MIGRATION')
+              AND j.status IN ('PENDING', 'RUNNING', 'SUCCESS', 'FAILED', 'NOT_REQUIRED')
+          )
+        """,
+        resource_uuids,
+    ).fetchall()
+    return {
+        cst_review_id("SEND", str(row["resource_uuid"])): cst_review_operation_item(connection, resource_from_row(row), "SEND")
+        for row in rows
+    }
+
 def cst_migration_review_items(connection: sqlite3.Connection, request: CstMigrationReviewRequest) -> list[CstMigrationReviewItem]:
     scope = normalize_cst_resource_scope(request.resource_scope)
     payload = CstManualMigrationRequest(
@@ -6340,7 +6660,7 @@ def cst_migration_resource_rows(connection: sqlite3.Connection, payload: CstManu
         FROM ip_resources r
         LEFT JOIN assignments a ON r.source_entity_type = 'assignment' AND r.source_entity_id = a.id
         WHERE {where_sql}
-        ORDER BY r.prefix, r.cidr
+        ORDER BY datetime(r.created_at) DESC, r.created_at DESC, r.prefix DESC, r.cidr
         {limit_sql}
         """,
         query_params,
@@ -6492,6 +6812,8 @@ def review_cst_migration_jobs(request: CstMigrationReviewRequest | None = None) 
     request.page = max(int(request.page or 1), 1)
     request.page_size = min(max(int(request.page_size or 25), 1), 500)
     with connect() as connection:
+        if request.resource_scope == "assigned":
+            return cst_assignment_review_response(connection, request)
         items = cst_migration_review_items(connection, request)
     total = len(items)
     valid_count = sum(1 for item in items if item.validation_status == "VALID")
@@ -6540,7 +6862,10 @@ def create_cst_migration_job_from_review(request: CstMigrationReviewCreateReques
             include_existing_transactions=False,
             validation_status="all",
         )
-        current_items = {item.review_id: item for item in cst_migration_review_items(connection, review_request)}
+        if request.resource_scope == "assigned":
+            current_items = cst_assignment_review_items_for_ids(connection, included_ids)
+        else:
+            current_items = {item.review_id: item for item in cst_migration_review_items(connection, review_request)}
         operations: list[tuple[ResourceRecord, str]] = []
         for review_id in included_ids:
             operation, resource_uuid = parse_cst_review_id(review_id)
@@ -6557,10 +6882,13 @@ def create_cst_migration_job_from_review(request: CstMigrationReviewCreateReques
                 rejected.append(CstMigrationReviewRejectedItem(review_id=review_id, resource_uuid=resource_uuid, cidr=resource.cidr, operation=operation, reason="Already assigned to an active or completed CST migration job"))
                 continue
             validation_payload = cst_payload_for_resource(resource, "SEND" if operation not in {"SEND", "UPDATE"} else operation, resource.transaction_id or resource_uuid, "migration-review-create")
-            issues = [*cst_resource_integrity_issues(connection, resource), *cst_data_quality_issues(resource, operation, validation_payload)]
-            if issues:
-                rejected.append(CstMigrationReviewRejectedItem(review_id=review_id, resource_uuid=resource_uuid, cidr=resource.cidr, operation=operation, reason="; ".join(issues)))
+            integrity_issues = cst_resource_integrity_issues(connection, resource)
+            data_quality_warnings = cst_data_quality_issues(resource, operation, validation_payload)
+            if integrity_issues:
+                rejected.append(CstMigrationReviewRejectedItem(review_id=review_id, resource_uuid=resource_uuid, cidr=resource.cidr, operation=operation, reason="; ".join(integrity_issues)))
                 continue
+            if data_quality_warnings:
+                record_audit(connection, "CST Migration Defaults Applied", "ip_resource", resource.resource_uuid, "", json.dumps({"reviewId": review_id, "cidr": resource.cidr, "operation": operation, "warnings": data_quality_warnings}))
             operations.append((resource, operation))
         if operations:
             jobs = create_cst_sync_jobs(connection, operations, "MANUAL_LIR_MIGRATION", queue_only=True)
@@ -6841,14 +7169,38 @@ def retry_failed_cst_batch(batch_id: str) -> list[CstSyncJob]:
     try:
         with connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM cst_sync_jobs WHERE batch_id = ? AND status IN ('FAILED', 'BLOCKED', 'PENDING') ORDER BY sequence_no",
+                "SELECT * FROM cst_sync_jobs WHERE batch_id = ? AND status IN ('FAILED', 'BLOCKED', 'PENDING', 'RUNNING') ORDER BY sequence_no",
                 (batch_id,),
             ).fetchall()
-            updated_jobs: list[CstSyncJob] = []
-            for row in rows:
-                updated_jobs.append(process_cst_job_sequentially(connection, row))
-                connection.commit()
-            return updated_jobs
+            if not rows:
+                return []
+            now = now_iso()
+            connection.execute(
+                """
+                UPDATE cst_sync_jobs
+                SET status = 'PENDING', last_error = '', updated_at = ?
+                WHERE batch_id = ? AND status IN ('FAILED', 'BLOCKED', 'RUNNING')
+                """,
+                (now, batch_id),
+            )
+            connection.execute(
+                """
+                UPDATE cst_transaction_ledger
+                SET last_status = 'PENDING'
+                WHERE batch_id = ? AND last_status IN ('FAILED', 'BLOCKED', 'RUNNING')
+                """,
+                (batch_id,),
+            )
+            connection.execute(
+                """
+                UPDATE cst_sync_batches
+                SET status = 'PENDING', failed_jobs = 0, blocked_jobs = 0, completed_at = ''
+                WHERE id = ?
+                """,
+                (batch_id,),
+            )
+            connection.commit()
+            return process_cst_batch_pending_jobs(connection, batch_id)
     finally:
         CST_PENDING_PUSH_LOCK.release()
 
@@ -7178,7 +7530,8 @@ def partition_pool(payload: PartitionRequest) -> PartitionResult:
         service_category="IPAM Internal Service",
         customer_id="internal-ipam",
         customer_name="Internal IPAM partition",
-        customer_type="Internal",
+        customer_type="NA",
+        subnet_type="NA",
         customer_segment="Internal",
         commercial_reg_id="N/A",
         unified_number="N/A",
@@ -8652,5 +9005,21 @@ def accept_conflicting_assignment(assignment_id: str) -> Assignment:
         record_audit(connection, "Bulk Assignment Conflict Accepted", "assignment", assignment_id, before.model_dump_json(), after.model_dump_json())
     return after
 
-init_db()
+def init_db_with_retry(max_attempts: int = 6) -> None:
+    for attempt in range(1, max_attempts + 1):
+        try:
+            init_db()
+            return
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "database is locked" not in message and "database is busy" not in message:
+                raise
+            if attempt == max_attempts:
+                raise
+            delay_seconds = min(2 * attempt, 10)
+            print(f"SQLite database is locked during startup migration; retrying in {delay_seconds}s ({attempt}/{max_attempts})")
+            time.sleep(delay_seconds)
+
+
+init_db_with_retry()
 

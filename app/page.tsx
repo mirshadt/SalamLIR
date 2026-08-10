@@ -192,6 +192,8 @@ type ManagedResource = {
   organizationName: string;
   organizationId: string;
   customerTypeId: string;
+  customerType: string;
+  subnetType: string;
   regionId: string;
   cityId: string;
   fullName: string;
@@ -323,9 +325,9 @@ const SEARCH_FILTER_FIELDS: Array<{ value: SearchFilterField; label: string; mod
 
 
 const CST_BULK_ASSIGNMENT_TEMPLATE = [
-  "assignmentType,cidr,startIp,endIp,size,status,assignmentDate,customerName,organizationName,organizationId,commercialRegId,unifiedNumber,customerTypeId,regionId,cityId,fullName,mobileNumber,idNumber,email,contactName,contactNumber,contactEmail,customerId,serviceId,serviceDescription,accessTechnologyId,owner,assignmentPurpose,site,city,region,notes",
-  "BUSINESS,5.42.224.0/30,,,4,3,2026-06-03,Example Enterprise,Example Enterprise LLC,1010112916,1010112916,,2,14,41,Primary Contact,+966501234567,1234567890,contact@example.com,Primary Contact,+966501234567,contact@example.com,CUST-10001,SVC-10001,Enterprise L3 service,1,Business Customer,Customer L3 service,Riyadh HQ,Riyadh,Riyadh,Ready business example",
-  "INTERNAL,5.42.224.4/30,,,4,2,2026-06-03,Salam Internal,,,,,,14,41,Network Operations,+966501234568,1234567891,noc@salam.sa,Network Operations,+966501234568,noc@salam.sa,,INT-SVC-10001,Internal firewall management,1,Network Operations,Firewall installation,Riyadh DC,Riyadh,Riyadh,Ready internal example"
+  "assignmentType,cidr,startIp,endIp,size,status,assignmentDate,customerName,organizationName,organizationId,commercialRegId,unifiedNumber,customerTypeId,customerType,subnetType,regionId,cityId,fullName,mobileNumber,idNumber,email,contactName,contactNumber,contactEmail,customerId,serviceId,serviceDescription,accessTechnologyId,owner,assignmentPurpose,site,city,region,notes",
+  "BUSINESS,5.42.224.0/30,,,4,3,2026-06-03,Example Enterprise,Example Enterprise LLC,1010112916,1010112916,,2,CORP,LAN1,14,41,Primary Contact,+966501234567,1234567890,contact@example.com,Primary Contact,+966501234567,contact@example.com,CUST-10001,SVC-10001,Enterprise L3 service,1,Business Customer,Customer L3 service,Riyadh HQ,Riyadh,Riyadh,Ready business example",
+  "INTERNAL,5.42.224.4/30,,,4,2,2026-06-03,Salam Internal,,,,,,NA,NA,14,41,Network Operations,+966501234568,1234567891,noc@salam.sa,Network Operations,+966501234568,noc@salam.sa,,INT-SVC-10001,Internal firewall management,1,Network Operations,Firewall installation,Riyadh DC,Riyadh,Riyadh,Ready internal example"
 ].join("\n");
 const navigation: Array<{ id: ViewKey; label: string; icon: React.ReactNode }> = [
   { id: "executive", label: "Home", icon: <Gauge className="h-4 w-4" /> },
@@ -436,6 +438,17 @@ const assignmentStatusByTarget: Record<AssignmentPayload["assignment_target_type
 
 const assignedToOptions: AssignmentPayload["assignment_target_type"][] = ["internal", "business_customer", "individual"];
 const operationalStatuses: AssignmentStatus[] = ["Active", "Blocked"];
+const lirCustomerTypeOptions = [
+  { value: "CORP", label: "CORP" },
+  { value: "RESI", label: "RESI" },
+  { value: "COMP", label: "COMP" },
+  { value: "NA", label: "NA" }
+];
+const subnetTypeOptions = [
+  ...Array.from({ length: 8 }, (_, index) => ({ value: `LAN${index + 1}`, label: `LAN${index + 1}` })),
+  ...Array.from({ length: 3 }, (_, index) => ({ value: `PTP${index + 1}`, label: `PTP${index + 1}` })),
+  { value: "NA", label: "NA" }
+];
 const customerTypeOptions = [
   { value: "1", label: "1 Government" },
   { value: "2", label: "2 Non-Government" }
@@ -469,7 +482,8 @@ const pendingBssBusinessDefaults: Partial<AssignmentPayload> = {
   city: "BSS-PENDING-CITY",
   region: "BSS-PENDING-REGION",
   site: "BSS Pending Site",
-  customer_type: "Enterprise",
+  customer_type: "CORP",
+  subnet_type: "NA",
   customer_segment: "Enterprise",
   l3_service: "MPLS L3VPN",
   service: "Business IP assignment",
@@ -478,7 +492,9 @@ const pendingBssBusinessDefaults: Partial<AssignmentPayload> = {
 
 const businessBssFields: AssignmentFieldDefinition[] = [
   { key: "bss_customer_id", label: "bssCustomerId", placeholder: "Auto sync from BSS after assignment", disabled: true },
-  { key: "customer_type_id", label: "customerTypeId", placeholder: "Select customer type", required: true, options: customerTypeOptions },
+  { key: "customer_type_id", label: "customerTypeId", placeholder: "Select CST customer type", required: true, options: customerTypeOptions },
+  { key: "customer_type", label: "customerType", placeholder: "Select LIR customer type", options: lirCustomerTypeOptions },
+  { key: "subnet_type", label: "subnetType", placeholder: "Select subnet type", options: subnetTypeOptions },
   { key: "service_description", label: "serviceDescription", placeholder: "Auto-populated based on Assigned to" },
   { key: "organization_name", label: "organizationName", placeholder: "Auto sync from BSS after assignment", disabled: true },
   { key: "organization_id", label: "organizationId", placeholder: "Auto sync from BSS after assignment", disabled: true },
@@ -562,7 +578,8 @@ const emptyAssignment: AssignmentPayload = {
   product_instance_id: "",
   customer_id: "",
   customer_name: "",
-  customer_type: "Enterprise",
+  customer_type: "NA",
+  subnet_type: "NA",
   organization_name: "",
   organization_id: "",
   customer_type_id: "",
@@ -1766,7 +1783,11 @@ ${errorMessage(error)}`
                   void siebelConfigQuery.refetch();
                   setNotice({ title: "Siebel Test Succeeded", detail: `${result.message}\nDSN: ${result.dsn}\nTested: ${result.tested_at.slice(0, 19)}` });
                 })}
-                onSaveCstConfig={() => run(async () => { await updateCstConfig(normalizeCstConfigFormForSave(cstConfigForm)); void cstConfigQuery.refetch(); })}
+                onSaveCstConfig={() => run(async () => {
+                  const saved = await updateCstConfig(normalizeCstConfigFormForSave(cstConfigForm));
+                  void cstConfigQuery.refetch();
+                  setNotice({ title: "CST Settings Saved", detail: `Operation switches and CST API settings were saved. Mode: ${saved.auto_execute ? "Auto execute" : "Queue only"}.` });
+                })}
                 onTestCstConnection={() => run(async () => {
                   await updateCstConfig(normalizeCstConfigFormForSave(cstConfigForm));
                   const result = await testCstConnection();
@@ -2614,6 +2635,8 @@ function ResourceSummary({
           ["Organization Name", resource.organizationName],
           ["Organization ID", resource.organizationId],
           ["Customer Type ID", resource.customerTypeId],
+          ["Customer Type", resource.customerType],
+          ["Subnet Type", resource.subnetType],
           ["Region ID", resource.regionId],
           ["City ID", resource.cityId],
           ["Full Name", resource.fullName],
@@ -3734,7 +3757,7 @@ function BulkOperations(props: {
                 </div>
               </div>
               <div className="mt-3 grid gap-2 text-xs text-muted-foreground md:grid-cols-2">
-                <p><span className="font-semibold text-foreground">Business mandatory:</span> assignmentType, CIDR/range, status, assignmentDate, customerId, serviceId, organization, customerTypeId, regionId, contact name, mobile, idNumber, email.</p>
+                <p><span className="font-semibold text-foreground">Business mandatory:</span> assignmentType, CIDR/range, status, assignmentDate, customerId, serviceId, organization, customerTypeId, regionId, contact name, mobile, idNumber, email. Optional local fields: customerType (CORP/RESI/COMP/NA), subnetType (LAN1-LAN8/PTP1-PTP3/NA).</p>
                 <p><span className="font-semibold text-foreground">Internal mandatory:</span> assignmentType, CIDR/range, status, assignmentDate, serviceDescription, owner, assignmentPurpose, site/address, region/city, contact name, mobile, email.</p>
               </div>
             </div>
@@ -4670,7 +4693,13 @@ function CstLirApiSettings(props: CstLirApiSettingsProps) {
             <ToggleSwitch label="GetLIR" description="Read paged LIR data from CST." checked={props.cstConfigForm.get_enabled !== false} onChange={(checked) => setSwitch("get_enabled", checked)} />
           </div>
           <CstResourceScopeSelector value={props.cstResourceScope} onChange={props.onCstResourceScope} />
-          <p className="text-xs text-muted-foreground">When auto execute is disabled, new CST jobs stay PENDING and do not call CST until you retry them manually from the CST Sync Monitor.</p>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className="text-xs text-muted-foreground">When auto execute is disabled, new CST jobs stay PENDING and do not call CST until you retry them manually from the CST Sync Monitor.</p>
+            <Button size="sm" variant="secondary" onClick={props.onSaveCstConfig}>
+              <Shield className="h-4 w-4" />
+              Save Operation Switches
+            </Button>
+          </div>
                 </div>
         <div className="grid gap-3 rounded-md border bg-muted/20 p-3">
           <div>
@@ -4873,7 +4902,7 @@ function CstMigrationReviewDialog(props: {
             <ReportMetric label="Excluded" value={String(props.excludedIds.length)} detail="Kept pending for later" />
             <ReportMetric label="Selected" value={String(selectedCount)} detail="Current selection" />
             <ReportMetric label="Valid" value={String(validCount)} detail="Server validation passed" />
-            <ReportMetric label="Invalid" value={String(invalidCount)} detail="Rejected on create" />
+            <ReportMetric label="Invalid" value={String(invalidCount)} detail="Defaults applied on create" />
           </div>
           <div className="flex flex-wrap gap-2">
             <Button size="sm" variant="outline" onClick={() => mergeSelected(visibleIds)} disabled={!visibleIds.length}>Select All on Page</Button>
@@ -5000,7 +5029,7 @@ function CstIntegrationMonitor(props: CstMonitorProps) {
         <div className="flex flex-wrap items-center gap-2">
           <Badge variant={props.cstConfig?.enabled ? "success" : "warning"}>{props.cstConfig?.enabled ? "CST enabled" : "CST disabled"}</Badge>
           <Badge variant={props.cstConfig?.scheduled_sync_enabled ? "success" : "default"}>{props.cstConfig?.scheduled_sync_enabled ? `Daily ${props.cstConfig?.schedule_time ?? "00:30"} ${props.cstConfig?.schedule_timezone ?? "Asia/Riyadh"}` : "Schedule off"}</Badge>
-          <Badge variant="success">Auto execution</Badge>
+          <Badge variant={props.cstConfig?.auto_execute ? "success" : "warning"}>{props.cstConfig?.auto_execute ? "Auto execution" : "Queue only"}</Badge>
           <Badge variant="success">Real API only</Badge>
           <Badge variant="default">Service provider {props.cstConfig?.service_provider_id ?? "5"}</Badge>
           <Button size="sm" variant="outline" onClick={() => props.onToggleCstEnabled(!props.cstConfig?.enabled)}>
@@ -5093,6 +5122,7 @@ function CstIntegrationMonitor(props: CstMonitorProps) {
                       <TableCell>
                         <p className="font-semibold">{job.cidr}</p>
                         <p className="font-mono text-xs text-muted-foreground">{job.transaction_id}</p>
+                        <p className="font-mono text-xs text-muted-foreground">{formatDateTime(job.created_at)}</p>
                       </TableCell>
                       <TableCell>{job.operation}</TableCell>
                       <TableCell><Badge variant={job.status === "SUCCESS" ? "success" : job.status === "FAILED" || job.status === "BLOCKED" ? "danger" : job.status === "PENDING" ? "warning" : "default"}>{job.status}</Badge></TableCell>
@@ -5760,7 +5790,8 @@ function assignmentDefaultsForTarget(target: AssignmentPayload["assignment_targe
     assignment_target_type: target,
     assignment_status_id: assignmentStatusByTarget[target],
     status: (form.status === "Blocked" ? "Blocked" : "Active") as AssignmentStatus,
-    customer_type: businessLike ? form.customer_type || "Enterprise" : individual ? form.customer_type || "Individual" : form.customer_type,
+    customer_type: businessLike ? form.customer_type || "CORP" : "NA",
+    subnet_type: form.subnet_type || "NA",
     customer_segment: businessLike ? form.customer_segment || "Enterprise" : individual ? form.customer_segment || "Residential" : form.customer_segment,
     customer_type_id: businessLike ? form.customer_type_id || pendingBssBusinessDefaults.customer_type_id || "2" : form.customer_type_id,
     service_specification_name: businessLike || individual ? form.service_specification_name || "L3 Connectivity Service" : form.service_specification_name || "IP Resource Service",
@@ -5795,6 +5826,8 @@ function normalizeAssignmentPayload(form: AssignmentPayload) {
     email: target === "individual" ? "" : form.email,
     service_id: form.service_id || form.service_instance_id,
     access_technology: form.access_technology || accessTechnologyLabels[form.access_technology_id] || "",
+    customer_type: target === "business_customer" ? form.customer_type || "CORP" : "NA",
+    subnet_type: form.subnet_type || "NA",
     service_description: form.service_description || form.service || form.assignment_purpose,
     assignment_name: form.assignment_name || `${ownerName} ${form.cidr}`,
     assignment_description: form.assignment_description || form.service_description || form.notes
@@ -6096,6 +6129,8 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
       organizationName: "",
       organizationId: "",
       customerTypeId: "",
+      customerType: "NA",
+      subnetType: "NA",
       regionId: "",
       cityId: "",
       fullName: "",
@@ -6159,6 +6194,8 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
         organizationName: assignment.organization_name || assignment.customer_name,
         organizationId: assignment.organization_id || assignment.customer_id,
         customerTypeId: assignment.customer_type_id,
+        customerType: assignment.customer_type || "NA",
+        subnetType: assignment.subnet_type || "NA",
         regionId: assignment.region_id,
         cityId: assignment.city_id,
         fullName: hideIndividualIdentity ? "" : assignment.full_name,
@@ -6224,6 +6261,8 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
             organizationName: "",
             organizationId: "",
             customerTypeId: "",
+            customerType: "NA",
+            subnetType: "NA",
             regionId: "",
             cityId: "",
             fullName: "",
@@ -6385,6 +6424,8 @@ const REGISTRY_EXPORT_COLUMNS: Array<{ key: string; header: string }> = [
   { key: "organizationName", header: "organizationName" },
   { key: "organizationId", header: "organizationId" },
   { key: "customerTypeId", header: "customerTypeId" },
+  { key: "customerType", header: "customerType" },
+  { key: "subnetType", header: "subnetType" },
   { key: "regionId", header: "regionId" },
   { key: "cityId", header: "cityId" },
   { key: "fullName", header: "fullName" },
@@ -6475,6 +6516,7 @@ const RESOURCE_UTILIZATION_COLUMNS: Array<{ key: string; header: string }> = [
   { key: "customer_id", header: "Customer ID" },
   { key: "customer_name", header: "Customer Name" },
   { key: "customer_type", header: "Customer Type" },
+  { key: "subnet_type", header: "Subnet Type" },
   { key: "customer_account_id", header: "Customer Account ID" },
   { key: "customer_segment", header: "Customer Segment" },
   { key: "commercial_reg_id", header: "Commercial Registration ID" },
@@ -6518,6 +6560,8 @@ function registryExportRows(resources: ManagedResource[]): ResourceUtilizationRo
     organizationName: resource.organizationName,
     organizationId: resource.organizationId,
     customerTypeId: resource.customerTypeId,
+    customerType: resource.customerType,
+    subnetType: resource.subnetType,
     regionId: resource.regionId,
     cityId: resource.cityId,
     fullName: resource.fullName,
@@ -6689,7 +6733,8 @@ function resourceUtilizationRows(resources: ManagedResource[]): ResourceUtilizat
       service: assignment?.service ?? "",
       customer_id: assignment?.customer_id ?? "",
       customer_name: assignment?.customer_name ?? "",
-      customer_type: assignment?.customer_type ?? "",
+      customer_type: assignment?.customer_type ?? "NA",
+      subnet_type: assignment?.subnet_type ?? "NA",
       customer_account_id: assignment?.customer_account_id ?? "",
       customer_segment: assignment?.customer_segment ?? "",
       commercial_reg_id: assignment?.commercial_reg_id ?? "",
@@ -6865,7 +6910,7 @@ function normalizeAssignmentImportCsv(csvText: string) {
         ["customerId", ["customerid", "customer_id", "bsscustomerid", "bss_customer_id"]],
         ["organizationName", ["organizationname", "organization_name", "customername", "customer_name"]],
         ["organizationId/commercialRegId/unifiedNumber/customerId", ["organizationid", "organization_id", "commercialregid", "commercial_reg_id", "unifiednumber", "unified_number", "customerid", "customer_id", "bsscustomerid", "bss_customer_id"]],
-        ["customerTypeId", ["customertypeid", "customer_type_id", "customertype", "customer_type"]],
+        ["customerTypeId", ["customertypeid", "customer_type_id"]],
         ["regionId/region", ["regionid", "region_id", "region"]],
         ["fullName/contactName", ["fullname", "full_name", "contactname", "contact_name"]],
         ["mobileNumber/contactNumber", ["mobilenumber", "mobile_number", "contactnumber", "contact_number"]],

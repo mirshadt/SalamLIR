@@ -145,6 +145,7 @@ export type Assignment = {
   customer_id: string;
   customer_name: string;
   customer_type: string;
+  subnet_type: string;
   organization_name: string;
   organization_id: string;
   customer_type_id: string;
@@ -887,6 +888,7 @@ export type AssignmentPayload = {
   customer_id: string;
   customer_name: string;
   customer_type: string;
+  subnet_type: string;
   organization_name: string;
   organization_id: string;
   customer_type_id: string;

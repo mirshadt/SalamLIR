@@ -93,6 +93,56 @@ class CstMigrationReviewWorkflowTest(unittest.TestCase):
         self.assertIn(exclude_id, next_review.all_matching_review_ids)
 
 
+    def test_review_orders_newest_bulk_assignment_candidates_first(self):
+        old_resource = self.add_resource("128.127.224.0/25", "Old Bulk Customer", "SVC-OLD")
+        new_resource = self.add_resource("128.127.225.128/30", "Newest Bulk Customer", "SVC-NEW")
+        with app.connect() as connection:
+            connection.execute("UPDATE ip_resources SET created_at = '2026-07-01T00:00:00+00:00' WHERE resource_uuid = ?", (old_resource.resource_uuid,))
+            connection.execute("UPDATE ip_resources SET created_at = '2026-08-06T11:02:59+00:00' WHERE resource_uuid = ?", (new_resource.resource_uuid,))
+        review = app.review_cst_migration_jobs(app.CstMigrationReviewRequest(resource_scope="assigned", page=1, page_size=1))
+        self.assertEqual(review.total, 2)
+        self.assertEqual(review.items[0].resource_uuid, new_resource.resource_uuid)
+
+    def test_queued_update_job_creates_transaction_ledger_entry(self):
+        resource = self.add_resource("128.127.225.0/30")
+        transaction_id = str(uuid4())
+        resource = resource.model_copy(update={"transaction_id": transaction_id})
+        with app.connect() as connection:
+            jobs = app.create_cst_sync_jobs(connection, [(resource, "UPDATE")], "MANUAL_LIR_MIGRATION", queue_only=True)
+            ledger = connection.execute(
+                "SELECT * FROM cst_transaction_ledger WHERE transaction_id = ?",
+                (transaction_id,),
+            ).fetchone()
+        self.assertEqual(len(jobs), 1)
+        self.assertIsNotNone(ledger)
+        self.assertEqual(ledger["last_status"], "PENDING")
+        self.assertEqual(ledger["batch_id"], jobs[0].batch_id)
+
+    def test_cst_transactions_backfills_and_orders_pending_jobs_first(self):
+        old_resource = self.add_resource("128.127.225.0/30", "Old Customer", "SVC-OLD")
+        new_resource = self.add_resource("128.127.226.0/30", "New Customer", "SVC-NEW")
+        old_transaction_id = str(uuid4())
+        new_transaction_id = str(uuid4())
+        with app.connect() as connection:
+            app.create_cst_sync_jobs(
+                connection,
+                [(old_resource.model_copy(update={"transaction_id": old_transaction_id}), "UPDATE")],
+                "MANUAL_LIR_MIGRATION",
+                queue_only=True,
+            )
+            app.create_cst_sync_jobs(
+                connection,
+                [(new_resource.model_copy(update={"transaction_id": new_transaction_id}), "UPDATE")],
+                "MANUAL_LIR_MIGRATION",
+                queue_only=True,
+            )
+            connection.execute("DELETE FROM cst_transaction_ledger WHERE transaction_id = ?", (new_transaction_id,))
+            connection.execute("UPDATE cst_transaction_ledger SET last_status = 'SUCCESS' WHERE transaction_id = ?", (old_transaction_id,))
+        transactions = app.list_cst_transactions()
+        transaction_ids = [transaction.transaction_id for transaction in transactions]
+        self.assertIn(new_transaction_id, transaction_ids)
+        self.assertLess(transaction_ids.index(new_transaction_id), transaction_ids.index(old_transaction_id))
+
     def test_bulk_assignment_extra_csv_values_reports_row_error(self):
         csv_text = "\n".join([
             "assignmentType,cidr,status,assignmentDate,customerName,customerId,serviceId",
