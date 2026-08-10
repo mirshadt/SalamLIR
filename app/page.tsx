@@ -327,7 +327,7 @@ const SEARCH_FILTER_FIELDS: Array<{ value: SearchFilterField; label: string; mod
 const CST_BULK_ASSIGNMENT_TEMPLATE = [
   "assignmentType,cidr,startIp,endIp,size,status,assignmentDate,customerName,organizationName,organizationId,commercialRegId,unifiedNumber,customerTypeId,customerType,subnetType,regionId,cityId,fullName,mobileNumber,idNumber,email,contactName,contactNumber,contactEmail,customerId,serviceId,serviceDescription,accessTechnologyId,owner,assignmentPurpose,site,city,region,notes",
   "BUSINESS,5.42.224.0/30,,,4,3,2026-06-03,Example Enterprise,Example Enterprise LLC,1010112916,1010112916,,2,CORP,LAN1,14,41,Primary Contact,+966501234567,1234567890,contact@example.com,Primary Contact,+966501234567,contact@example.com,CUST-10001,SVC-10001,Enterprise L3 service,1,Business Customer,Customer L3 service,Riyadh HQ,Riyadh,Riyadh,Ready business example",
-  "INTERNAL,5.42.224.4/30,,,4,2,2026-06-03,Salam Internal,,,,,,NA,NA,14,41,Network Operations,+966501234568,1234567891,noc@salam.sa,Network Operations,+966501234568,noc@salam.sa,,INT-SVC-10001,Internal firewall management,1,Network Operations,Firewall installation,Riyadh DC,Riyadh,Riyadh,Ready internal example"
+  "INTERNAL,5.42.224.4/30,,,4,2,2026-06-03,,,,,,,,,,,,,,,,,,,,Internal firewall management,,,,,,,Ready internal example"
 ].join("\n");
 const navigation: Array<{ id: ViewKey; label: string; icon: React.ReactNode }> = [
   { id: "executive", label: "Home", icon: <Gauge className="h-4 w-4" /> },
@@ -2080,7 +2080,7 @@ function ResourceRegistry(props: {
   onSyncCstLir: (pool: RipeDiscoveredRootPool) => void;
   onPushToRipe: (resource: ManagedResource) => void;
 } & CstMonitorProps) {
-  const visible = filterResources(presentationResources(props.resources), props.globalSearch);
+  const visible = filterResources(registryAllocatedPools(props.resources), props.globalSearch);
   const activeRegistryPanel = props.activePanel;
   const registryPanels: Array<{ id: RegistryPanelId; label: string; icon: React.ReactNode; disabled?: boolean }> = [
     { id: "lir-discovery", label: "RIPE Discovery", icon: <Radar className="h-6 w-6" /> },
@@ -2424,7 +2424,7 @@ function SubnetNavigator({
         <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <div>
             <CardTitle>Subnet Navigator</CardTitle>
-            <CardDescription>All CIDRs are modeled as subnets. Select a row to drill into the common Resource Summary page.</CardDescription>
+            <CardDescription>Only allocated pools are shown here. Select a row to drill into the common Resource Summary page.</CardDescription>
           </div>
           {onQuery ? (
             <Input className="md:max-w-sm" value={query ?? ""} onChange={(event) => onQuery(event.target.value)} placeholder="Search CIDR, resource ID, owner, status, netname" />
@@ -2485,6 +2485,10 @@ function SubnetNavigator({
 
 function presentationSubnets(resources: ManagedResource[]) {
   return presentationResources(resources.filter((resource) => resource.type === "Subnet"));
+}
+
+function registryAllocatedPools(resources: ManagedResource[]) {
+  return presentationResources(resources.filter((resource) => isRegisteredSubnet(resource) && isRipeAllocatedPoolResource(resource)));
 }
 
 function presentationResources(resources: ManagedResource[]) {
@@ -3744,7 +3748,7 @@ function BulkOperations(props: {
               <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
                 <div>
                   <p className="text-sm font-semibold">CST assignment data template</p>
-                  <p className="text-xs text-muted-foreground">Includes Business and Internal rows with CST readiness fields: customer, service, organization, address, contact, purpose, and validation report columns.</p>
+                  <p className="text-xs text-muted-foreground">Includes Business and Internal rows. Internal rows only need the assignment basics and serviceDescription; customer/contact/address fields are optional.</p>
                 </div>
                 <div className="flex flex-wrap gap-2">
                   <Button size="sm" variant="outline" onClick={() => { props.onAssignmentCsv(CST_BULK_ASSIGNMENT_TEMPLATE); props.onAssignmentFileName("cst-lir-assignment-template.csv"); }}>
@@ -3758,7 +3762,7 @@ function BulkOperations(props: {
               </div>
               <div className="mt-3 grid gap-2 text-xs text-muted-foreground md:grid-cols-2">
                 <p><span className="font-semibold text-foreground">Business mandatory:</span> assignmentType, CIDR/range, status, assignmentDate, customerId, serviceId, organization, customerTypeId, regionId, contact name, mobile, idNumber, email. Optional local fields: customerType (CORP/RESI/COMP/NA), subnetType (LAN1-LAN8/PTP1-PTP3/NA).</p>
-                <p><span className="font-semibold text-foreground">Internal mandatory:</span> assignmentType, CIDR/range, status, assignmentDate, serviceDescription, owner, assignmentPurpose, site/address, region/city, contact name, mobile, email.</p>
+                <p><span className="font-semibold text-foreground">Internal mandatory:</span> assignmentType, CIDR/range, status, assignmentDate, serviceDescription. Customer, organization, contact, location, serviceId, owner, purpose, and email fields are optional.</p>
               </div>
             </div>
             <Button className="w-fit" onClick={props.onImportAssignments} disabled={!props.assignmentCsv.trim()}>
@@ -5842,6 +5846,9 @@ function buildAssignmentPayload(form: AssignmentPayload, poolDraft: PoolAssignme
   if (!normalizedForm.customer_name && !normalizedForm.internal_application_name) {
     throw new Error("Resource owner name or internal application name is required.");
   }
+  if ((normalizedForm.assignment_target_type === "internal" || normalizedForm.assignment_status_id === 2) && !normalizedForm.service_description.trim()) {
+    throw new Error("serviceDescription is mandatory when assignmentStatusId = 2 (Internal).");
+  }
   const cidr = assignmentSelectionCidr(normalizedForm, poolDraft, resources);
   if (!cidr.trim()) {
     throw new Error("CIDR is required.");
@@ -6920,14 +6927,7 @@ function normalizeAssignmentImportCsv(csvText: string) {
     }
     if (assignmentType === "INTERNAL") {
       requireFields(normalized, rowNumber, [
-        ["serviceDescription", ["servicedescription", "service_description", "service"]],
-        ["owner", ["owner"]],
-        ["assignmentPurpose", ["assignmentpurpose", "assignment_purpose", "purpose"]],
-        ["site/locationName", ["site", "locationname", "location_name"]],
-        ["regionId/region", ["regionid", "region_id", "region"]],
-        ["fullName/contactName", ["fullname", "full_name", "contactname", "contact_name"]],
-        ["mobileNumber/contactNumber", ["mobilenumber", "mobile_number", "contactnumber", "contact_number"]],
-        ["email/contactEmail", ["email", "contactemail", "contact_email"]]
+        ["serviceDescription", ["servicedescription", "service_description", "service"]]
       ]);
     }
     if (cidr) {
@@ -7484,3 +7484,6 @@ function errorMessage(error: unknown) {
   }
   return error instanceof Error ? error.message : "Unknown error";
 }
+
+
+

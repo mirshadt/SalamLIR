@@ -68,6 +68,7 @@ class CstMigrationReviewWorkflowTest(unittest.TestCase):
         cases = [
             ("128.127.225.0/30", ""),
             ("128.127.225.4/30", "bad-email"),
+            ("128.127.225.8/30", "e.kashkash@it-absolute.com;"),
         ]
         for cidr, raw_email in cases:
             with self.subTest(raw_email=raw_email):
@@ -77,6 +78,105 @@ class CstMigrationReviewWorkflowTest(unittest.TestCase):
 
                 self.assertEqual(record["contact"]["email"], app.CST_FALLBACK_EMAIL)
                 self.assertNotIn("contact.email", "; ".join(app.cst_data_quality_issues(resource, "SEND", payload)))
+
+    def test_cst_send_payload_for_internal_assignment_is_minimal(self):
+        resource = self.add_resource("128.127.225.12/30").model_copy(update={
+            "ownership_type": "INTERNAL",
+            "assignment_status_id": 2,
+            "customer_name": "Salam Internal",
+            "organization_name": "Should Not Be Sent",
+            "organization_id": "1234567890",
+            "customer_type_id": "2",
+            "region_id": "14",
+            "city_id": "1",
+            "full_name": "Internal Contact",
+            "mobile_number": "966500000000",
+            "id_number": "0000000000",
+            "email": "internal@example.com",
+            "description": "Should Not Be Sent",
+            "assignment_date": "2026-08-11",
+            "update_date": "2026-08-11",
+            "service_description": "Internal firewall management",
+        })
+        payload = app.cst_payload_for_resource(resource, "SEND", "tx-internal-test", "unit-test")
+        record = app.cst_payload_record(payload)
+
+        self.assertEqual(set(record), {
+            "transactionId",
+            "ipSubnet",
+            "asn",
+            "ipVersionId",
+            "assignmentStatusId",
+            "serviceDescription",
+        })
+        self.assertEqual(record["transactionId"], "tx-internal-test")
+        self.assertEqual(record["ipSubnet"], "128.127.225.12/30")
+        self.assertEqual(record["assignmentStatusId"], 2)
+        self.assertEqual(record["serviceDescription"], "Internal firewall management")
+
+    def test_minimal_internal_bulk_assignment_does_not_require_customer_fields(self):
+        parent_pool = app.pool_from_network(ip_network("128.127.225.0/24"), "Internal root", "Central")
+        with app.connect() as connection:
+            app.insert_pool(connection, parent_pool)
+            app.sync_pool_resource(connection, parent_pool)
+
+        csv_text = "\n".join([
+            "assignmentType,cidr,size,status,assignmentDate,serviceDescription",
+            "INTERNAL,128.127.225.16/30,4,,2026-08-11,Internal firewall management",
+        ])
+        result = app.process_assignment_bulk(csv_text)
+
+        self.assertEqual(result.imported, 1)
+        self.assertEqual(result.blocked, 0)
+        self.assertEqual(result.output_rows[0].processingStatus, "SUCCESS")
+        self.assertEqual(result.output_rows[0].status, "2")
+        self.assertEqual(result.output_rows[0].cstValidationErrors, "")
+        self.assertEqual(result.output_rows[0].cstValidationWarnings, "")
+
+        with app.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM ip_resources WHERE cidr = ?",
+                ("128.127.225.16/30",),
+            ).fetchone()
+        self.assertIsNotNone(row)
+        resource = app.resource_from_row(row)
+        payload = app.cst_payload_for_resource(resource, "SEND", "tx-internal-bulk", "unit-test")
+        record = app.cst_payload_record(payload)
+        self.assertEqual(set(record), {
+            "transactionId",
+            "ipSubnet",
+            "asn",
+            "ipVersionId",
+            "assignmentStatusId",
+            "serviceDescription",
+        })
+        self.assertEqual(record["assignmentStatusId"], 2)
+
+    def test_cst_batch_transaction_result_uses_individual_response(self):
+        response = {
+            "externalApiCalled": True,
+            "accepted": False,
+            "body": {
+                "data": {
+                    "success": [{"transactionId": "ok-tx"}],
+                    "failure": [{"transactionId": "bad-tx", "message": "Internal Server Error"}],
+                },
+                "status": {"httpCode": "440", "status": "false"},
+            },
+        }
+
+        ok_status, ok_error, ok_response = app.cst_batch_transaction_result("FAILED", "CST API HTTP 440", response, "ok-tx")
+        bad_status, bad_error, bad_response = app.cst_batch_transaction_result("FAILED", "CST API HTTP 440", response, "bad-tx")
+
+        self.assertEqual(ok_status, "SUCCESS")
+        self.assertEqual(ok_error, "")
+        self.assertTrue(ok_response["accepted"])
+        self.assertEqual(ok_response["individualTransactionStatus"], "SUCCESS")
+        self.assertEqual(bad_status, "FAILED")
+        self.assertEqual(bad_error, "Internal Server Error")
+        self.assertFalse(bad_response["accepted"])
+        self.assertEqual(bad_response["individualTransactionStatus"], "FAILED")
+
     def test_final_create_requires_confirmation(self):
         self.add_resource("128.127.225.0/30")
         review = app.review_cst_migration_jobs(app.CstMigrationReviewRequest(resource_scope="assigned"))

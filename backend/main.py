@@ -1891,7 +1891,8 @@ def normalize_cst_id_number(value: object) -> str:
 
 def normalize_cst_email(value: object) -> str:
     email = str(value or "").strip().lower()
-    return email if re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) else ""
+    pattern = r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+"
+    return email if re.fullmatch(pattern, email) else ""
 
 
 def normalize_cst_contact_fields(patch: dict[str, str]) -> None:
@@ -2610,6 +2611,7 @@ def cst_payload_for_resource(resource: ResourceRecord, operation: str, transacti
         assignment_status_id = cst_int_value(resource.assignment_status_id, 1) or 1
         business_like = assignment_status_id == 3 or str(resource.ownership_type or "").upper() == "BUSINESS"
         individual_like = assignment_status_id == 4 or str(resource.ownership_type or "").upper() == "INDIVIDUAL"
+        internal_like = assignment_status_id == 2 or str(resource.ownership_type or "").upper() == "INTERNAL"
         record = {
             "transactionId": transaction_id,
             "ipSubnet": resource.cidr,
@@ -2618,6 +2620,11 @@ def cst_payload_for_resource(resource: ResourceRecord, operation: str, transacti
             "assignmentStatusId": assignment_status_id,
             "serviceDescription": cst_payload_service_description(resource, assignment_status_id),
         }
+        if internal_like:
+            return {
+                "serviceProviderId": cst_int_value(service_provider_id, cst_int_value(DEFAULT_SERVICE_PROVIDER_ID, 1)),
+                "data": [record],
+            }
         organization_name = (resource.organization_name or resource.customer_name or "").strip() or (CST_FALLBACK_ORGANIZATION_NAME if business_like else "")
         optional_text_fields = {
             "organizationName": organization_name,
@@ -3390,6 +3397,51 @@ def cst_enriched_api_error(last_error: str, payload: dict, response: dict) -> st
         parts.append(f"Sent: {context}")
     return " | ".join(parts)
 
+
+def cst_response_transaction_outcomes(response: dict) -> dict[str, tuple[str, str]]:
+    if not isinstance(response, dict):
+        return {}
+    body = response.get("body")
+    if not isinstance(body, dict):
+        return {}
+    data = body.get("data")
+    if not isinstance(data, dict):
+        return {}
+    outcomes: dict[str, tuple[str, str]] = {}
+    success_items = data.get("success")
+    if isinstance(success_items, list):
+        for item in success_items:
+            if isinstance(item, dict) and str(item.get("transactionId") or "").strip():
+                outcomes[str(item.get("transactionId")).strip()] = ("SUCCESS", str(item.get("message") or ""))
+    failure_items = data.get("failure")
+    if isinstance(failure_items, list):
+        for item in failure_items:
+            if isinstance(item, dict) and str(item.get("transactionId") or "").strip():
+                message = str(item.get("message") or "CST transaction failed")
+                outcomes[str(item.get("transactionId")).strip()] = ("FAILED", message)
+    return outcomes
+
+
+def cst_batch_transaction_result(batch_status: str, batch_last_error: str, batch_response: dict, transaction_id: str) -> tuple[str, str, dict]:
+    outcomes = cst_response_transaction_outcomes(batch_response)
+    if not outcomes:
+        return batch_status, batch_last_error, batch_response
+    response = dict(batch_response) if isinstance(batch_response, dict) else {}
+    response["individualTransactionId"] = transaction_id
+    if transaction_id not in outcomes:
+        response["accepted"] = False
+        response["individualTransactionStatus"] = "MISSING"
+        message = f"CST batch response did not include transactionId {transaction_id}"
+        response["individualTransactionMessage"] = message
+        return "FAILED", message, response
+    status, message = outcomes[transaction_id]
+    response["accepted"] = status == "SUCCESS"
+    response["individualTransactionStatus"] = status
+    response["individualTransactionMessage"] = message
+    if status == "SUCCESS":
+        return "SUCCESS", "", response
+    return "FAILED", message or batch_last_error or "CST transaction failed", response
+
 def create_cst_assignment_create_jobs(
     connection: sqlite3.Connection,
     assignment: Assignment,
@@ -3680,9 +3732,7 @@ def create_cst_sync_jobs(
                 last_error = ""
                 response = {"temporaryStorage": True, "externalApiCalled": False, "accepted": False, "message": "CST auto-execute is disabled in Administration; job queued for manual retry", "processedAt": now_iso()}
             elif should_batch_call:
-                status = batched_status
-                last_error = batched_last_error
-                response = batched_response
+                status, last_error, response = cst_batch_transaction_result(batched_status, batched_last_error, batched_response, transaction_id)
             else:
                 try:
                     with CST_API_CALL_LOCK:
@@ -3814,14 +3864,15 @@ def retry_cst_send_jobs_batch(connection: sqlite3.Connection, job_rows: list[sql
     updated_jobs: list[CstSyncJob] = []
     updated_at = now_iso()
     for job, resource, payload in entries:
+        job_status, job_last_error, job_response = cst_batch_transaction_result(status, last_error, response, job.transaction_id)
         update_existing_cst_job_result(
             connection,
             job=job,
             resource=resource,
             payload=payload,
-            status=status,
-            last_error=last_error,
-            response=response,
+            status=job_status,
+            last_error=job_last_error,
+            response=job_response,
             updated_at=updated_at,
         )
         updated = connection.execute("SELECT * FROM cst_sync_jobs WHERE id = ?", (job.id,)).fetchone()
@@ -5286,18 +5337,8 @@ def cst_bulk_readiness_for_assignment(connection: sqlite3.Connection, assignment
         if not str(assignment.customer_id or assignment.bss_customer_id or "").strip():
             errors.append("customerId is required for Business assignment and preserved for BSS traceability")
     if assignment_type == "internal" or assignment.assignment_status_id == 2:
-        if not str(assignment.owner or "").strip():
-            errors.append("owner is required for Internal assignment")
-        if not str(assignment.assignment_purpose or "").strip():
-            errors.append("assignmentPurpose is required for Internal assignment")
         if not str(assignment.service_description or assignment.service or "").strip():
             errors.append("serviceDescription is required for Internal assignment")
-        if not str(assignment.site or assignment.location_name or "").strip():
-            errors.append("site or locationName is required for Internal assignment")
-        if not str(assignment.full_name or assignment.contact_name or "").strip():
-            errors.append("fullName or contactName is required for Internal assignment")
-        if not str(assignment.email or assignment.contact_email or "").strip():
-            warnings.append(f"email/contactEmail missing; CST default {CST_FALLBACK_EMAIL} will be used")
     unique_errors = list(dict.fromkeys(errors))
     unique_warnings = list(dict.fromkeys(warnings))
     ready = not unique_errors
@@ -5315,6 +5356,10 @@ def bulk_assignment_status(row: dict[str, str], is_pr_format: bool) -> tuple[int
 def assignment_payload_from_bulk_row(row: dict[str, str], network: IPv4Network, assignment_status_id: int, assignment_status: str, row_number: int = 0) -> AssignmentCreate:
     warnings: list[str] = []
     assignment_type = bulk_assignment_type(row, assignment_status_id)
+    is_internal_assignment = assignment_type == "INTERNAL"
+    if is_internal_assignment:
+        assignment_status_id = 2
+        assignment_status = "Active"
     assignment_date = csv_value(row, "assignmentDate", "assignment_date")
     customer_name = csv_value(row, "customerName", "customer_name", "organizationName", "organization_name", "fullName", "full_name")
     service_id = csv_value(row, "serviceId", "service_id", "service_instance_id")
@@ -5331,7 +5376,7 @@ def assignment_payload_from_bulk_row(row: dict[str, str], network: IPv4Network, 
     contact_number = normalize_bulk_cst_phone(csv_value(row, "contact_number", "contactNumber"), row_number, "contactNumber", warnings)
     if not mobile_number and contact_number:
         mobile_number = contact_number
-    if not mobile_number:
+    if not mobile_number and not is_internal_assignment:
         mobile_number = CST_FALLBACK_PHONE_NUMBER
         warnings.append(f"mobileNumber is missing and was defaulted to {CST_FALLBACK_PHONE_NUMBER}")
     full_name = csv_value(row, "fullName", "full_name") or csv_value(row, "contact_name", "contactName")
@@ -5350,16 +5395,18 @@ def assignment_payload_from_bulk_row(row: dict[str, str], network: IPv4Network, 
     customer_type_id = str(cst_customer_type_id(customer_type_value) or customer_type_value or "")
     mapped_city_id = cst_city_id(city_id_value or city_text)
     if mapped_city_id is None:
-        city_id = str(CST_FALLBACK_CITY_ID)
+        city_id = "" if is_internal_assignment else str(CST_FALLBACK_CITY_ID)
         source = city_id_value or city_text
-        warnings.append(f"cityId/city value '{source}' is missing or invalid and was defaulted to {CST_FALLBACK_CITY_ID}" if source else f"cityId/city is missing and was defaulted to {CST_FALLBACK_CITY_ID}")
+        if not is_internal_assignment:
+            warnings.append(f"cityId/city value '{source}' is missing or invalid and was defaulted to {CST_FALLBACK_CITY_ID}" if source else f"cityId/city is missing and was defaulted to {CST_FALLBACK_CITY_ID}")
     else:
         city_id = str(mapped_city_id)
     mapped_region_id = cst_region_id(region_id_value or region_text)
     if mapped_region_id is None:
-        region_id = str(CST_FALLBACK_REGION_ID)
+        region_id = "" if is_internal_assignment else str(CST_FALLBACK_REGION_ID)
         source = region_id_value or region_text
-        warnings.append(f"regionId/region value '{source}' is missing or invalid and was defaulted to {CST_FALLBACK_REGION_ID}" if source else f"regionId/region is missing and was defaulted to {CST_FALLBACK_REGION_ID}")
+        if not is_internal_assignment:
+            warnings.append(f"regionId/region value '{source}' is missing or invalid and was defaulted to {CST_FALLBACK_REGION_ID}" if source else f"regionId/region is missing and was defaulted to {CST_FALLBACK_REGION_ID}")
     else:
         region_id = str(mapped_region_id)
     access_technology_id = str(cst_access_technology_id(access_technology_value) or access_technology_value or "")
@@ -9074,4 +9121,5 @@ def init_db_with_retry(max_attempts: int = 6) -> None:
 
 
 init_db_with_retry()
+
 
