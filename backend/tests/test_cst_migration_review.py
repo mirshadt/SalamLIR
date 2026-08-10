@@ -64,6 +64,19 @@ class CstMigrationReviewWorkflowTest(unittest.TestCase):
         self.assertEqual(self.table_count("cst_sync_jobs"), 0)
         self.assertEqual(self.table_count("cst_transaction_ledger"), 0)
 
+    def test_cst_payload_defaults_missing_or_invalid_business_email(self):
+        cases = [
+            ("128.127.225.0/30", ""),
+            ("128.127.225.4/30", "bad-email"),
+        ]
+        for cidr, raw_email in cases:
+            with self.subTest(raw_email=raw_email):
+                resource = self.add_resource(cidr).model_copy(update={"email": raw_email, "contact_email": raw_email})
+                payload = app.cst_payload_for_resource(resource, "SEND", "tx-email-test", "unit-test")
+                record = app.cst_payload_record(payload)
+
+                self.assertEqual(record["contact"]["email"], app.CST_FALLBACK_EMAIL)
+                self.assertNotIn("contact.email", "; ".join(app.cst_data_quality_issues(resource, "SEND", payload)))
     def test_final_create_requires_confirmation(self):
         self.add_resource("128.127.225.0/30")
         review = app.review_cst_migration_jobs(app.CstMigrationReviewRequest(resource_scope="assigned"))

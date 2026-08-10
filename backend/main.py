@@ -56,7 +56,7 @@ CST_DELETE_LIR_PATH = "/api/rest/v1.0/LIRDataService/DeleteLIRData"
 CST_GET_LIR_PATH = "/api/rest/v1.0/LIRDataService/GetLIRData"
 CST_FALLBACK_PHONE_NUMBER = "0000000000"
 CST_FALLBACK_ID_NUMBER = "0000000000"
-CST_FALLBACK_EMAIL = "cst-migration@salam.sa"
+CST_FALLBACK_EMAIL = "NA@NA.com"
 CST_FALLBACK_FULL_NAME = "CST Migration Contact"
 CST_FALLBACK_ORGANIZATION_NAME = "CST Migration Organization"
 CST_FALLBACK_CUSTOMER_TYPE_ID = 2
@@ -2635,7 +2635,7 @@ def cst_payload_for_resource(resource: ResourceRecord, operation: str, transacti
         access_technology_id = cst_int_value(resource.access_technology_id)
         if individual_like:
             record["accessTechnologyId"] = access_technology_id if access_technology_id in CST_ACCESS_TECHNOLOGY_BY_ID else CST_FALLBACK_ACCESS_TECHNOLOGY_ID
-        elif access_technology_id is not None:
+        elif not business_like and access_technology_id is not None:
             record["accessTechnologyId"] = access_technology_id
         region_id = cst_payload_region_id(resource)
         if region_id is not None:
@@ -2645,7 +2645,7 @@ def cst_payload_for_resource(resource: ResourceRecord, operation: str, transacti
             record["cityId"] = city_id
         mobile_number = cst_payload_mobile_number(resource)
         id_number = normalize_cst_id_number(resource.id_number) or (CST_FALLBACK_ID_NUMBER if business_like or individual_like else str(resource.id_number or "").strip())
-        email = cst_payload_email(resource.email, require_default=business_like)
+        email = cst_payload_email(resource.email, require_default=assignment_status_id in {2, 3, 4})
         contact = {
             "fullName": cst_payload_full_name(resource, require_default=business_like),
             "mobileNumber": mobile_number,
@@ -3341,6 +3341,55 @@ def execute_cst_real_api_job(connection: sqlite3.Connection, config: CstConfig, 
     return ("SUCCESS" if accepted else "FAILED", "" if accepted else f"CST API HTTP {status_code}", response)
 
 
+def cst_error_text(value: object, limit: int = 260) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    else:
+        text = str(value)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit]
+
+
+def cst_payload_error_context(payload: dict) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    data = payload.get("data")
+    if not isinstance(data, list) or not data:
+        return ""
+    if len(data) == 1 and isinstance(data[0], dict):
+        record = data[0]
+        contact = record.get("contact") if isinstance(record.get("contact"), dict) else {}
+        parts = [
+            f"transactionId={record.get('transactionId') or '-'}",
+            f"ipSubnet={record.get('ipSubnet') or '-'}",
+            f"assignmentStatusId={record.get('assignmentStatusId') or '-'}",
+            f"contact.email={contact.get('email') or '<blank>'}",
+        ]
+        return ", ".join(parts)
+    email_parts: list[str] = []
+    for record in data[:8]:
+        if not isinstance(record, dict):
+            continue
+        contact = record.get("contact") if isinstance(record.get("contact"), dict) else {}
+        email_parts.append(f"{record.get('transactionId') or '-'}:{contact.get('email') or '<blank>'}")
+    suffix = ", ..." if len(data) > 8 else ""
+    return f"records={len(data)}, transactionId:email=[{', '.join(email_parts)}{suffix}]"
+
+
+def cst_enriched_api_error(last_error: str, payload: dict, response: dict) -> str:
+    if not last_error or not isinstance(response, dict) or not response.get("externalApiCalled") or response.get("accepted") is True:
+        return last_error
+    parts = [last_error]
+    body_text = cst_error_text(response.get("body") or response.get("message"))
+    if body_text and body_text not in parts:
+        parts.append(f"CST response: {body_text}")
+    context = cst_payload_error_context(payload)
+    if context:
+        parts.append(f"Sent: {context}")
+    return " | ".join(parts)
+
 def create_cst_assignment_create_jobs(
     connection: sqlite3.Connection,
     assignment: Assignment,
@@ -3454,6 +3503,7 @@ def insert_cst_sync_job_result(
     response: dict,
 ) -> CstSyncJob:
     updated_at = now_iso()
+    last_error = cst_enriched_api_error(last_error, payload, response)
     job = CstSyncJob(
         id=f"cst-job-{uuid4().hex[:12]}",
         batch_id=batch_id,
@@ -3682,6 +3732,7 @@ def update_existing_cst_job_result(
     response: dict,
     updated_at: str,
 ) -> None:
+    last_error = cst_enriched_api_error(last_error, payload, response)
     connection.execute(
         """
         UPDATE cst_sync_jobs
@@ -3867,6 +3918,7 @@ def retry_cst_jobs(connection: sqlite3.Connection, job_rows: list[sqlite3.Row], 
             last_error = ""
             message = "Local resource was removed before CST reporting; CST API call is not required"
             response = {"temporaryStorage": False, "externalApiCalled": False, "accepted": True, "message": message, "processedAt": now_iso()}
+        last_error = cst_enriched_api_error(last_error, payload, response)
         connection.execute(
             """
             UPDATE cst_sync_jobs
@@ -5245,7 +5297,7 @@ def cst_bulk_readiness_for_assignment(connection: sqlite3.Connection, assignment
         if not str(assignment.full_name or assignment.contact_name or "").strip():
             errors.append("fullName or contactName is required for Internal assignment")
         if not str(assignment.email or assignment.contact_email or "").strip():
-            errors.append("email or contactEmail is required for Internal assignment")
+            warnings.append(f"email/contactEmail missing; CST default {CST_FALLBACK_EMAIL} will be used")
     unique_errors = list(dict.fromkeys(errors))
     unique_warnings = list(dict.fromkeys(warnings))
     ready = not unique_errors

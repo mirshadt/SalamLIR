@@ -1324,7 +1324,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                   setRipeDiscoveryStatus("running");
                   run(async () => {
                     try {
-                      const { data } = await api.get<RipeDiscoveryResponse>("/ripe/discovery/root-pools");
+                      const { data } = await api.get<RipeDiscoveryResponse>("/ripe/discovery/root-pools", { timeout: 120000 });
                       setRipeDiscoveryResult(data);
                       setRipeDiscoveryStatus("complete");
                     } catch (error) {
@@ -1339,7 +1339,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                   run(async () => {
                     try {
                       await api.post("/ripe/discovery/root-pools/sync", pool);
-                      const { data } = await api.get<RipeDiscoveryResponse>("/ripe/discovery/root-pools");
+                      const { data } = await api.get<RipeDiscoveryResponse>("/ripe/discovery/root-pools", { timeout: 120000 });
                       setRipeDiscoveryResult(data);
                       refresh();
                     } finally {
@@ -1353,7 +1353,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                   run(async () => {
                     try {
                       await api.post("/ripe/discovery/root-pools/cst-sync", pool);
-                      const { data } = await api.get<RipeDiscoveryResponse>("/ripe/discovery/root-pools");
+                      const { data } = await api.get<RipeDiscoveryResponse>("/ripe/discovery/root-pools", { timeout: 120000 });
                       setRipeDiscoveryResult(data);
                       refresh();
                     } finally {
