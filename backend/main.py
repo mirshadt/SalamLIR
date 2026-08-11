@@ -4702,6 +4702,9 @@ def init_db() -> None:
         if "service_id" not in bss_audit_columns:
             connection.execute("ALTER TABLE bss_sync_audit ADD COLUMN service_id TEXT NOT NULL DEFAULT ''")
         add_missing_columns(connection, "cst_config", CstConfig)
+        add_missing_columns(connection, "cst_sync_batches", CstSyncBatch)
+        add_missing_columns(connection, "cst_sync_jobs", CstSyncJob)
+        add_missing_columns(connection, "cst_transaction_ledger", CstTransactionLedger)
         cst_config_columns = {row["name"] for row in connection.execute("PRAGMA table_info(cst_config)").fetchall()}
         if "accept_language" not in cst_config_columns:
             connection.execute("ALTER TABLE cst_config ADD COLUMN accept_language TEXT NOT NULL DEFAULT 'EN'")
@@ -6391,7 +6394,7 @@ def list_cst_batches() -> list[CstSyncBatch]:
 @app.get("/cst/jobs", response_model=list[CstSyncJob])
 def list_cst_jobs() -> list[CstSyncJob]:
     with connect() as connection:
-        rows = connection.execute("SELECT * FROM cst_sync_jobs ORDER BY created_at DESC, sequence_no DESC LIMIT 500").fetchall()
+        rows = connection.execute("SELECT * FROM cst_sync_jobs ORDER BY updated_at DESC, created_at DESC, sequence_no DESC LIMIT 500").fetchall()
     return [cst_job_from_row(row) for row in rows]
 
 
