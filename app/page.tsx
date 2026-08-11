@@ -2426,9 +2426,15 @@ function SubnetNavigator({
             <CardTitle>Subnet Navigator</CardTitle>
             <CardDescription>Only allocated pools are shown here. Select a row to drill into the common Resource Summary page.</CardDescription>
           </div>
-          {onQuery ? (
-            <Input className="md:max-w-sm" value={query ?? ""} onChange={(event) => onQuery(event.target.value)} placeholder="Search CIDR, resource ID, owner, status, netname" />
-          ) : null}
+          <div className="flex flex-col gap-2 md:flex-row md:items-center">
+            {onQuery ? (
+              <Input className="md:max-w-sm" value={query ?? ""} onChange={(event) => onQuery(event.target.value)} placeholder="Search CIDR, resource ID, owner, status, netname" />
+            ) : null}
+            <Button variant="outline" onClick={() => exportLocalAllocatedPoolUtilizationRows(localAllocatedPoolUtilizationRows(displayResources), "csv")} disabled={!displayResources.length}>
+              <FileDown className="h-4 w-4" />
+              Export CSV
+            </Button>
+          </div>
         </div>
       </CardHeader>
       <CardContent>
@@ -4198,18 +4204,21 @@ function Reporting({
   onRunRipeReport: () => void;
   onClearRipeReport: () => void;
 }) {
-  const [activeReport, setActiveReport] = useState<"pool-summary" | "cst-lir" | "resource-utilization" | "ripe-allocation" | null>(null);
+  const [activeReport, setActiveReport] = useState<"pool-summary" | "local-allocated-pool-utilization" | "cst-lir" | "resource-utilization" | "ripe-allocation" | null>(null);
   const [poolSummaryFilters, setPoolSummaryFilters] = useState<Record<string, string>>({});
   const [poolSummaryVisibleRows, setPoolSummaryVisibleRows] = useState(REPORT_BATCH_SIZE);
+  const [localAllocatedPoolVisibleRows, setLocalAllocatedPoolVisibleRows] = useState(REPORT_BATCH_SIZE);
   const [registryVisibleRows, setRegistryVisibleRows] = useState(REPORT_BATCH_SIZE);
   const [utilizationVisibleRows, setUtilizationVisibleRows] = useState(REPORT_BATCH_SIZE);
   const [ripeVisibleRows, setRipeVisibleRows] = useState(REPORT_BATCH_SIZE);
   const poolSummaryRows = poolSummaryReportRows(resources);
+  const localAllocatedPoolRows = localAllocatedPoolUtilizationRows(resources);
   const filteredPoolSummaryRows = filterReportRows(poolSummaryRows, poolSummaryFilters, POOL_SUMMARY_COLUMNS);
   const reportingResources = presentationResources(resources);
   const utilizationRows = resourceUtilizationRows(reportingResources);
   const registryRows = registryExportRows(reportingResources);
   const visiblePoolSummaryRows = filteredPoolSummaryRows.slice(0, poolSummaryVisibleRows);
+  const visibleLocalAllocatedPoolRows = localAllocatedPoolRows.slice(0, localAllocatedPoolVisibleRows);
   const visibleRegistryRows = registryRows.slice(0, registryVisibleRows);
   const visibleUtilizationRows = utilizationRows.slice(0, utilizationVisibleRows);
   const ripeRows = ripeReportResult?.rows ?? [];
@@ -4217,6 +4226,7 @@ function Reporting({
   const visibleRipeRows = ripeRows.slice(0, ripeVisibleRows);
   useEffect(() => {
     setPoolSummaryVisibleRows(REPORT_BATCH_SIZE);
+    setLocalAllocatedPoolVisibleRows(REPORT_BATCH_SIZE);
   }, [poolSummaryFilters, resources.length]);
   useEffect(() => {
     setRegistryVisibleRows(REPORT_BATCH_SIZE);
@@ -4228,6 +4238,11 @@ function Reporting({
   const loadMorePoolSummaryRows = (event: UIEvent<HTMLDivElement>) => {
     if (shouldLoadNextReportBatch(event, poolSummaryVisibleRows, filteredPoolSummaryRows.length)) {
       setPoolSummaryVisibleRows((current) => Math.min(current + REPORT_BATCH_SIZE, filteredPoolSummaryRows.length));
+    }
+  };
+  const loadMoreLocalAllocatedPoolRows = (event: UIEvent<HTMLDivElement>) => {
+    if (shouldLoadNextReportBatch(event, localAllocatedPoolVisibleRows, localAllocatedPoolRows.length)) {
+      setLocalAllocatedPoolVisibleRows((current) => Math.min(current + REPORT_BATCH_SIZE, localAllocatedPoolRows.length));
     }
   };
   const loadMoreRegistryRows = (event: UIEvent<HTMLDivElement>) => {
@@ -4253,6 +4268,7 @@ function Reporting({
   };
   const reportRows = [
     { id: "pool-summary", activeId: "pool-summary" as const, name: "Subnet Summary Report", scope: `${filteredPoolSummaryRows.length} of ${poolSummaryRows.length} registered subnets`, status: "Available" },
+    { id: "local-allocated-pool-utilization", activeId: "local-allocated-pool-utilization" as const, name: "Local Allocated Pool Utilization Report", scope: `${localAllocatedPoolRows.length} allocated pools`, status: "Available" },
     { id: "resource-utilization", activeId: "resource-utilization" as const, name: "Resource Utilization Report", scope: `${reportingResources.length} resources`, status: "Available" },
     { id: "cst-lir", activeId: "cst-lir" as const, name: "CST/LIR Registry Report", scope: `${registryRows.length} CIDRs`, status: "Available" },
     { id: "ripe-assignment", activeId: "ripe-allocation" as const, name: "RIPE Assignment Report", scope: "Maintainer ITC-NOC-MNT inetnum assignments", status: "Available" },
@@ -4454,6 +4470,78 @@ function Reporting({
           </div>
           <p className="mt-3 text-xs text-muted-foreground">
             Showing {Math.min(poolSummaryVisibleRows, filteredPoolSummaryRows.length)} of {filteredPoolSummaryRows.length} rows. Scroll down to load the next {REPORT_BATCH_SIZE}. Export includes all matching rows.
+          </p>
+        </CardContent>
+      </Card>
+      ) : null}
+      {activeReport === "local-allocated-pool-utilization" ? (
+        <Card>
+        <CardHeader>
+          <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+            <div>
+              <CardTitle>Local Allocated Pool Utilization Report</CardTitle>
+              <CardDescription>Allocated pools shown in Subnet Navigator, with total, usable, in-use, reserved, free, utilization, RIPE/CST status, and source registry details.</CardDescription>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <Button variant="outline" onClick={() => setActiveReport(null)}>
+                Back to Reports
+              </Button>
+              <Button variant="outline" onClick={() => exportLocalAllocatedPoolUtilizationRows(localAllocatedPoolRows, "csv")}>
+                <FileDown className="h-4 w-4" />
+                Export CSV
+              </Button>
+              <Button onClick={() => exportLocalAllocatedPoolUtilizationRows(localAllocatedPoolRows, "xlsx")}>
+                <FileDown className="h-4 w-4" />
+                Export XLSX
+              </Button>
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent>
+          <div className="max-h-[620px] overflow-auto rounded-md border" onScroll={loadMoreLocalAllocatedPoolRows}>
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Pool</TableHead>
+                  <TableHead>Total</TableHead>
+                  <TableHead>Usable</TableHead>
+                  <TableHead>In Use</TableHead>
+                  <TableHead>Reserved</TableHead>
+                  <TableHead>Free</TableHead>
+                  <TableHead>Usage %</TableHead>
+                  <TableHead>Status</TableHead>
+                  <TableHead>RIPE</TableHead>
+                  <TableHead>Last Updated</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {visibleLocalAllocatedPoolRows.map((row, rowIndex) => (
+                  <TableRow key={reportRowKey(row, rowIndex, "local-allocated-pool-utilization")}>
+                    <TableCell>
+                      <p className="font-semibold">{row.allocation}</p>
+                      <p className="text-xs text-muted-foreground">{row.pool_name}</p>
+                    </TableCell>
+                    <TableCell>{formatHosts(Number(row.total))}</TableCell>
+                    <TableCell>{formatHosts(Number(row.usable))}</TableCell>
+                    <TableCell>{formatHosts(Number(row.in_use))}</TableCell>
+                    <TableCell>{formatHosts(Number(row.reserved))}</TableCell>
+                    <TableCell>{formatHosts(Number(row.free))}</TableCell>
+                    <TableCell>{row.usage_percent}%</TableCell>
+                    <TableCell><Badge variant={badgeForStatus(row.status)}>{row.status}</Badge></TableCell>
+                    <TableCell><Badge variant={row.ripe_sync_status === "FAILED" ? "danger" : row.ripe_sync_status === "PENDING" ? "warning" : "default"}>{row.ripe_sync_status}</Badge></TableCell>
+                    <TableCell>{row.last_updated}</TableCell>
+                  </TableRow>
+                ))}
+                {!localAllocatedPoolRows.length ? (
+                  <TableRow>
+                    <TableCell colSpan={10} className="py-6 text-center text-muted-foreground">No local allocated pools available to export.</TableCell>
+                  </TableRow>
+                ) : null}
+              </TableBody>
+            </Table>
+          </div>
+          <p className="mt-3 text-xs text-muted-foreground">
+            Showing {Math.min(localAllocatedPoolVisibleRows, localAllocatedPoolRows.length)} of {localAllocatedPoolRows.length} allocated pools. Export includes all rows and all report columns.
           </p>
         </CardContent>
       </Card>
@@ -6463,6 +6551,25 @@ const POOL_SUMMARY_COLUMNS: Array<{ key: string; header: string }> = [
   { key: "status", header: "Status" }
 ];
 
+
+const LOCAL_ALLOCATED_POOL_UTILIZATION_COLUMNS: Array<{ key: string; header: string }> = [
+  { key: "pool_name", header: "Pool Name" },
+  { key: "allocation", header: "Allocation" },
+  { key: "resource_uuid", header: "Resource UUID" },
+  { key: "classification", header: "Classification" },
+  { key: "total", header: "Total IPs" },
+  { key: "usable", header: "Usable IPs" },
+  { key: "in_use", header: "In Use IPs" },
+  { key: "reserved", header: "Reserved IPs" },
+  { key: "free", header: "Free IPs" },
+  { key: "usage_percent", header: "Usage %" },
+  { key: "status", header: "Status" },
+  { key: "ripe_sync_status", header: "RIPE Status" },
+  { key: "cst_sync_status", header: "CST Status" },
+  { key: "source_registry", header: "Source Registry" },
+  { key: "transaction_id", header: "Transaction ID" },
+  { key: "last_updated", header: "Last Updated" }
+];
 const RESOURCE_UTILIZATION_COLUMNS: Array<{ key: string; header: string }> = [
   { key: "resource_id", header: "Resource ID" },
   { key: "resource_uuid", header: "Resource UUID" },
@@ -6632,6 +6739,40 @@ function poolSummaryReportRows(resources: ManagedResource[]): ResourceUtilizatio
   });
 }
 
+
+function localAllocatedPoolUtilizationRows(resources: ManagedResource[]): ResourceUtilizationRow[] {
+  return registryAllocatedPools(resources).map((pool) => ({
+    pool_name: pool.netname,
+    allocation: pool.cidr,
+    resource_uuid: pool.uuid,
+    classification: pool.classification,
+    total: pool.totalIps,
+    usable: usableAddressCount(pool),
+    in_use: pool.usedIps,
+    reserved: pool.reservedIps,
+    free: pool.freeIps,
+    usage_percent: pool.utilization,
+    status: pool.administrativeStatus,
+    ripe_sync_status: pool.ripeSyncStatus,
+    cst_sync_status: pool.cstSyncStatus,
+    source_registry: pool.sourceRegistry,
+    transaction_id: pool.transactionId,
+    last_updated: pool.lastUpdated
+  }));
+}
+
+function exportLocalAllocatedPoolUtilizationRows(rows: ResourceUtilizationRow[], format: "csv" | "xlsx") {
+  const values = rows.map((row) => LOCAL_ALLOCATED_POOL_UTILIZATION_COLUMNS.map((column) => row[column.key] ?? ""));
+  if (format === "csv") {
+    downloadBlob(`local-allocated-pool-utilization-${today()}.csv`, "text/csv;charset=utf-8", buildColumnCsv(LOCAL_ALLOCATED_POOL_UTILIZATION_COLUMNS, rows));
+    return;
+  }
+  downloadBlob(
+    `local-allocated-pool-utilization-${today()}.xlsx`,
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    buildXlsx("Local Allocated Pool Utilization", LOCAL_ALLOCATED_POOL_UTILIZATION_COLUMNS.map((column) => column.header), values)
+  );
+}
 function exportPoolSummary(resources: ManagedResource[], format: "csv" | "xlsx") {
   exportPoolSummaryRows(poolSummaryReportRows(resources), format);
 }
@@ -7484,6 +7625,8 @@ function errorMessage(error: unknown) {
   }
   return error instanceof Error ? error.message : "Unknown error";
 }
+
+
 
 
 
