@@ -2145,6 +2145,8 @@ def cst_config_from_row(row: sqlite3.Row) -> CstConfig:
     host = str(values.get("host") or "cst-oa-unified-gw-stg-fop.apps.apldev-sit-opshift.itc.local")
     port = int(values.get("port") or 443)
     base_url = str(values.get("base_url") or f"https://{host}:{port}")
+    if cst_base_url_uses_placeholder_host(base_url):
+        base_url = cst_base_url_from_host_port(host, port)
     return CstConfig(
         id=str(values.get("id", "default")),
         enabled=bool(values.get("enabled", 1)),
@@ -2243,7 +2245,14 @@ def ensure_cst_config(connection: sqlite3.Connection) -> CstConfig:
             (DEFAULT_SERVICE_PROVIDER_ID, CST_SEND_LIR_PATH, CST_UPDATE_LIR_PATH, CST_DELETE_LIR_PATH, CST_GET_LIR_PATH, now_iso()),
         )
         row = connection.execute("SELECT * FROM cst_config WHERE id = 'default'").fetchone()
-    return cst_config_from_row(row)
+    config = cst_config_from_row(row)
+    stored_base_url = str(row["base_url"] or "") if row else ""
+    if stored_base_url != config.base_url:
+        connection.execute(
+            "UPDATE cst_config SET base_url = ?, updated_at = ? WHERE id = 'default'",
+            (config.base_url, now_iso()),
+        )
+    return config
 
 
 def resource_requires_cst(resource: ResourceRecord) -> bool:
@@ -6320,7 +6329,14 @@ def update_cst_config(payload: CstConfigUpdate) -> CstConfig:
         set_sql = ", ".join(f"{key} = ?" for key in values)
         connection.execute(f"UPDATE cst_config SET {set_sql} WHERE id = 'default'", tuple(values.values()))
         row = connection.execute("SELECT * FROM cst_config WHERE id = 'default'").fetchone()
-    return cst_config_from_row(row)
+    config = cst_config_from_row(row)
+    stored_base_url = str(row["base_url"] or "") if row else ""
+    if stored_base_url != config.base_url:
+        connection.execute(
+            "UPDATE cst_config SET base_url = ?, updated_at = ? WHERE id = 'default'",
+            (config.base_url, now_iso()),
+        )
+    return config
 
 
 @app.get("/cst/summary", response_model=CstSyncSummary)
