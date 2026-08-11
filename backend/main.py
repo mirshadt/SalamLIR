@@ -6316,9 +6316,11 @@ def update_cst_config(payload: CstConfigUpdate) -> CstConfig:
     current_config = get_cst_config()
     effective_host = values.get("host") or current_config.host
     effective_port = int(values.get("port") or current_config.port or 443)
-    if "host" in values or "port" in values or cst_base_url_uses_placeholder_host(values.get("base_url")):
-        if "base_url" not in values or cst_base_url_uses_placeholder_host(values.get("base_url")):
-            values["base_url"] = cst_base_url_from_host_port(effective_host, effective_port)
+    derived_base_url = cst_base_url_from_host_port(effective_host, effective_port)
+    if derived_base_url:
+        values["base_url"] = derived_base_url
+    elif "base_url" in values and cst_base_url_uses_placeholder_host(values.get("base_url")):
+        values["base_url"] = current_config.base_url
     values["verify_ssl"] = 0
     for boolean_field in ["enabled", "auto_execute", "scheduled_sync_enabled", "send_enabled", "update_enabled", "delete_enabled", "get_enabled"]:
         if boolean_field in values:

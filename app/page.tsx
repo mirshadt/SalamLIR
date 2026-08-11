@@ -792,7 +792,7 @@ function normalizeCstConfigFormForSave(form: CstConfigPayload): CstConfigPayload
   const derivedBaseUrl = cstBaseUrlFromHostPort(form.host, form.port);
   return {
     ...form,
-    base_url: cstBaseUrlUsesPlaceholderHost(form.base_url) ? derivedBaseUrl : form.base_url
+    base_url: derivedBaseUrl
   };
 }
 
@@ -902,6 +902,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
     send_payload_batch_size: 1,
     hourly_request_limit: 1000
   });
+  const [cstConfigFormDirty, setCstConfigFormDirty] = useState(false);
   const [ripePoolCsv, setRipePoolCsv] = useState("pool_name,cidr,allocation_type,source,created_date\nRIPE Allocation 5.42.224.0,5.42.224.0/19,RIPE Allocated Pool,RIPE Database,2026-06-01");
   const [ripeReportForm, setRipeReportForm] = useState({ dateFrom: "", dateTo: "", reportType: "RIPE Assignment Report" });
   const [ripeReportResult, setRipeReportResult] = useState<RipeReportResponse | null>(null);
@@ -962,6 +963,11 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   const cstTransactions = cstTransactionsQuery.data ?? [];
   const bulkBatches = bulkBatchesQuery.data ?? [];
 
+  const updateCstConfigForm = (value: CstConfigPayload) => {
+    setCstConfigFormDirty(true);
+    setCstConfigForm(value);
+  };
+
   useEffect(() => {
     setSignedInUser(window.localStorage.getItem("ipam-username") ?? "admin");
     const storedRole = window.localStorage.getItem("ipam-role");
@@ -997,7 +1003,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   }, [siebelConfig]);
 
   useEffect(() => {
-    if (!cstConfig) {
+    if (!cstConfig || cstConfigFormDirty) {
       return;
     }
     setCstConfigForm({
@@ -1030,7 +1036,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
       send_payload_batch_size: cstConfig.send_payload_batch_size,
       hourly_request_limit: cstConfig.hourly_request_limit
     });
-  }, [cstConfig]);
+  }, [cstConfig, cstConfigFormDirty]);
 
   useEffect(() => {
     const applyRoute = () => {
@@ -1764,7 +1770,7 @@ ${errorMessage(error)}`
                 onRipeConfigForm={setRipeConfigForm}
                 onSiebelConfigForm={setSiebelConfigForm}
                 onDatabaseConnectionForm={setDatabaseConnectionForm}
-                onCstConfigForm={setCstConfigForm}
+                onCstConfigForm={updateCstConfigForm}
                 onCstResourceScope={setCstResourceScope}
                 onRipePoolCsv={setRipePoolCsv}
                 onAddUser={() => run(async () => { await api.post("/users", newUser); setNewUser({ username: "", password: "", role: "operator" }); })}
@@ -1785,11 +1791,17 @@ ${errorMessage(error)}`
                 })}
                 onSaveCstConfig={() => run(async () => {
                   const saved = await updateCstConfig(normalizeCstConfigFormForSave(cstConfigForm));
+                  setCstConfigForm({ ...normalizeCstConfigFormForSave(saved), auth_password: "", api_access_key: "", user_key: "" });
+                  setCstConfigFormDirty(false);
+                  queryClient.setQueryData(["cst-config"], saved);
                   void cstConfigQuery.refetch();
                   setNotice({ title: "CST Settings Saved", detail: `Operation switches and CST API settings were saved. Mode: ${saved.auto_execute ? "Auto execute" : "Queue only"}.` });
                 })}
                 onTestCstConnection={() => run(async () => {
-                  await updateCstConfig(normalizeCstConfigFormForSave(cstConfigForm));
+                  const saved = await updateCstConfig(normalizeCstConfigFormForSave(cstConfigForm));
+                  setCstConfigForm({ ...normalizeCstConfigFormForSave(saved), auth_password: "", api_access_key: "", user_key: "" });
+                  setCstConfigFormDirty(false);
+                  queryClient.setQueryData(["cst-config"], saved);
                   const result = await testCstConnection();
                   void cstConfigQuery.refetch();
                   setNotice({ title: "CST Token Test Succeeded", detail: `${result.message}\nPath: ${result.token_path}\nToken expires: ${result.token_expires_at ? result.token_expires_at.slice(0, 19) : "not returned"}` });
@@ -4821,15 +4833,15 @@ function CstLirApiSettings(props: CstLirApiSettingsProps) {
           </label>
           <label className="grid gap-1 md:col-span-2">
             <span className="text-xs font-medium text-muted-foreground">Host</span>
-            <Input value={props.cstConfigForm.host ?? ""} onChange={(event) => props.onCstConfigForm({ ...props.cstConfigForm, host: event.target.value, base_url: `https://${event.target.value}:${props.cstConfigForm.port ?? 443}` })} placeholder="cst-oa-unified-gw-stg-fop.apps.apldev-sit-opshift.itc.local" />
+            <Input value={props.cstConfigForm.host ?? ""} onChange={(event) => props.onCstConfigForm({ ...props.cstConfigForm, host: event.target.value, base_url: cstBaseUrlFromHostPort(event.target.value, props.cstConfigForm.port) })} placeholder="cst-oa-unified-gw-stg-fop.apps.apldev-sit-opshift.itc.local" />
           </label>
           <label className="grid gap-1">
             <span className="text-xs font-medium text-muted-foreground">Port</span>
-            <Input value={String(props.cstConfigForm.port ?? 443)} onChange={(event) => { const port = Number(event.target.value) || 443; props.onCstConfigForm({ ...props.cstConfigForm, port, base_url: `https://${props.cstConfigForm.host ?? ""}:${port}` }); }} placeholder="443" />
+            <Input value={String(props.cstConfigForm.port ?? 443)} onChange={(event) => { const port = Number(event.target.value) || 443; props.onCstConfigForm({ ...props.cstConfigForm, port, base_url: cstBaseUrlFromHostPort(props.cstConfigForm.host, port) }); }} placeholder="443" />
           </label>
           <label className="grid gap-1 md:col-span-4">
             <span className="text-xs font-medium text-muted-foreground">Base URL</span>
-            <Input value={props.cstConfigForm.base_url ?? ""} onChange={(event) => props.onCstConfigForm({ ...props.cstConfigForm, base_url: event.target.value })} placeholder="https://host:443" />
+            <Input value={cstBaseUrlFromHostPort(props.cstConfigForm.host, props.cstConfigForm.port)} readOnly placeholder="https://cst-host.example:443" />
           </label>
           <label className="grid gap-1 md:col-span-2">
             <span className="text-xs font-medium text-muted-foreground">Authorization username</span>
