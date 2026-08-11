@@ -6329,13 +6329,15 @@ def update_cst_config(payload: CstConfigUpdate) -> CstConfig:
         set_sql = ", ".join(f"{key} = ?" for key in values)
         connection.execute(f"UPDATE cst_config SET {set_sql} WHERE id = 'default'", tuple(values.values()))
         row = connection.execute("SELECT * FROM cst_config WHERE id = 'default'").fetchone()
-    config = cst_config_from_row(row)
-    stored_base_url = str(row["base_url"] or "") if row else ""
-    if stored_base_url != config.base_url:
-        connection.execute(
-            "UPDATE cst_config SET base_url = ?, updated_at = ? WHERE id = 'default'",
-            (config.base_url, now_iso()),
-        )
+        config = cst_config_from_row(row)
+        stored_base_url = str(row["base_url"] or "") if row else ""
+        if stored_base_url != config.base_url:
+            connection.execute(
+                "UPDATE cst_config SET base_url = ?, updated_at = ? WHERE id = 'default'",
+                (config.base_url, now_iso()),
+            )
+            row = connection.execute("SELECT * FROM cst_config WHERE id = 'default'").fetchone()
+            config = cst_config_from_row(row)
     return config
 
 

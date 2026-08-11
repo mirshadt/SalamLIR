@@ -4745,6 +4745,7 @@ type CstLirApiSettingsProps = {
 };
 
 function CstLirApiSettings(props: CstLirApiSettingsProps) {
+  const configLoaded = Boolean(props.cstConfig);
   const setSwitch = (key: keyof CstConfigPayload, checked: boolean) => props.onCstConfigForm({ ...props.cstConfigForm, [key]: checked });
   return (
     <Card>
@@ -4892,11 +4893,11 @@ function CstLirApiSettings(props: CstLirApiSettingsProps) {
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <Button variant="secondary" onClick={props.onSaveCstConfig}>
+          <Button variant="secondary" onClick={props.onSaveCstConfig} disabled={!configLoaded}>
             <Shield className="h-4 w-4" />
             Save CST LIR API Settings
           </Button>
-          <Button variant="outline" onClick={props.onTestCstConnection}>
+          <Button variant="outline" onClick={props.onTestCstConnection} disabled={!configLoaded}>
             <CheckCircle2 className="h-4 w-4" />
             Test connection
           </Button>
