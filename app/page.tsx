@@ -5002,14 +5002,16 @@ function CstMigrationReviewDialog(props: {
   const selectedSet = new Set(props.selectedIds);
   const excludedSet = new Set(props.excludedIds);
   const matchingIds = review?.all_matching_review_ids ?? [];
-  const includedIds = matchingIds.filter((id) => !excludedSet.has(id));
+  const matchingSet = new Set(matchingIds);
+  const includedIds = props.selectedIds.filter((id) => matchingSet.has(id) && !excludedSet.has(id));
   const visibleIds = review?.items.map((item) => item.review_id) ?? [];
   const validCount = review?.counts.valid ?? 0;
   const invalidCount = review?.counts.invalid ?? 0;
-  const selectedCount = props.selectedIds.length;
+  const selectedCount = includedIds.length;
   const totalPages = review ? Math.max(Math.ceil(review.total / review.page_size), 1) : 1;
   const setFilter = (key: keyof CstMigrationReviewFilters, value: string) => props.onFilters({ ...props.filters, [key]: value });
-  const mergeSelected = (ids: string[]) => props.onSelectedIds(Array.from(new Set([...props.selectedIds, ...ids])));
+  const mergeSelected = (ids: string[]) => props.onSelectedIds(Array.from(new Set([...props.selectedIds, ...ids])).filter((id) => !excludedSet.has(id)));
+  const selectFirstMatching = (limit: number) => props.onSelectedIds(matchingIds.filter((id) => !excludedSet.has(id)).slice(0, limit));
   const removeSelected = (ids: string[]) => props.onSelectedIds(props.selectedIds.filter((id) => !ids.includes(id)));
   const excludeSelected = () => {
     props.onExcludedIds(Array.from(new Set([...props.excludedIds, ...props.selectedIds])));
@@ -5054,7 +5056,7 @@ function CstMigrationReviewDialog(props: {
             </label>
           </div>
           <div className="grid gap-2 md:grid-cols-5">
-            <ReportMetric label="Included" value={String(includedIds.length)} detail="Will be submitted" />
+            <ReportMetric label="Included" value={String(includedIds.length)} detail="Selected to submit" />
             <ReportMetric label="Excluded" value={String(props.excludedIds.length)} detail="Kept pending for later" />
             <ReportMetric label="Selected" value={String(selectedCount)} detail="Current selection" />
             <ReportMetric label="Valid" value={String(validCount)} detail="Server validation passed" />
@@ -5062,7 +5064,8 @@ function CstMigrationReviewDialog(props: {
           </div>
           <div className="flex flex-wrap gap-2">
             <Button size="sm" variant="outline" onClick={() => mergeSelected(visibleIds)} disabled={!visibleIds.length}>Select All on Page</Button>
-            <Button size="sm" variant="outline" onClick={() => props.onSelectedIds(matchingIds)} disabled={!matchingIds.length}>Select All Matching Results</Button>
+            <Button size="sm" variant="outline" onClick={() => selectFirstMatching(200)} disabled={!matchingIds.length}>Select First 200</Button>
+            <Button size="sm" variant="outline" onClick={() => props.onSelectedIds(matchingIds.filter((id) => !excludedSet.has(id)))} disabled={!matchingIds.length}>Select All Matching Results</Button>
             <Button size="sm" variant="secondary" onClick={excludeSelected} disabled={!selectedCount}>Exclude Selected</Button>
             <Button size="sm" variant="secondary" onClick={includeSelected} disabled={!selectedCount}>Include Selected</Button>
             <Button size="sm" variant="outline" onClick={() => props.onSelectedIds([])} disabled={!selectedCount}>Clear Selection</Button>
@@ -5093,7 +5096,7 @@ function CstMigrationReviewDialog(props: {
                       <TableCell>
                         <input type="checkbox" checked={isSelected} onChange={(event) => event.target.checked ? mergeSelected([item.review_id]) : removeSelected([item.review_id])} aria-label={`Select ${item.cidr}`} />
                       </TableCell>
-                      <TableCell><Badge variant={isExcluded ? "warning" : "success"}>{isExcluded ? "Excluded" : "Included"}</Badge></TableCell>
+                      <TableCell><Badge variant={isExcluded ? "warning" : isSelected ? "success" : "default"}>{isExcluded ? "Excluded" : isSelected ? "Selected" : "Pending"}</Badge></TableCell>
                       <TableCell>{item.operation}</TableCell>
                       <TableCell>{item.cidr}</TableCell>
                       <TableCell>{item.start_ip} - {item.end_ip}</TableCell>

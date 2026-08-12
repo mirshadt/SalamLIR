@@ -5,6 +5,7 @@ Generate Salam LIR bulk-assignment import CSV by joining IP Tool data with Siebe
 Default join:
   1. IP Tool "Order Number" -> Siebel "SERIAL_NUM", when SERIAL_NUM exists
   2. IP Tool "CustomerNumber" -> Siebel "ACCOUNT_NUMBER", for the simplified Siebel template
+  3. IP Tool "CustomerName" -> Siebel "ACCOUNT_NAME", for reduced IP Tool templates without IDs
 
 Outputs:
   1. Salam LIR bulk assignment CSV
@@ -40,6 +41,7 @@ BULK_COLUMNS = [
     "customerTypeId",
     "customerType",
     "subnetType",
+    "productClass",
     "regionId",
     "cityId",
     "fullName",
@@ -460,7 +462,9 @@ def make_bulk_row(
     )
 
     service_id = row_get(siebel, "SERIAL_NUM") or normalize_join_key(row_get(iptool, args.iptool_join_column))
-    service_description = row_get(siebel, "PRODUCT_NAME") or row_get(iptool, "Product Type", "ProductClass", "Product Class")
+    product_type = row_get(iptool, "Product Type", "ProductType", "product_type")
+    product_class = row_get(iptool, "ProductClass", "Product Class", "product_class")
+    service_description = row_get(siebel, "PRODUCT_NAME") or product_type or product_class
     site = row_get(siebel, "ADDR_NAME", "ADDRESS", "SITE") or iptool_site
 
     return {
@@ -479,6 +483,7 @@ def make_bulk_row(
         "customerTypeId": customer_type_id_from_iptool(iptool, args.customer_type_id),
         "customerType": normalize_lir_customer_type(row_get(iptool, "CustomerType", "Customer Type", "customer_type")),
         "subnetType": normalize_lir_subnet_type(row_get(iptool, "Subnet Type", "SubnetType", "subnet_type")),
+        "productClass": product_class,
         "regionId": region_id,
         "cityId": city_id,
         "fullName": name,
@@ -493,7 +498,7 @@ def make_bulk_row(
         "serviceDescription": service_description,
         "accessTechnologyId": args.access_technology_id,
         "owner": "Business Customer",
-        "assignmentPurpose": service_description or row_get(iptool, "ProductClass", "Product Class"),
+        "assignmentPurpose": service_description or product_class,
         "site": site,
         "city": city_text,
         "region": region_text,
@@ -516,11 +521,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=Path("bulk_assignments_from_iptool_siebel.csv"))
     parser.add_argument("--missing-output", type=Path, default=Path("missing_siebel_records.csv"))
     parser.add_argument("--duplicates-output", type=Path, default=Path("duplicate_siebel_join_keys.csv"))
-    parser.add_argument("--join-mode", choices=["auto", "service", "account"], default="auto", help="auto tries service join first, then account join. account supports the simplified Siebel template without SERIAL_NUM.")
+    parser.add_argument("--join-mode", choices=["auto", "service", "account", "customer"], default="auto", help="auto tries service join first, then account, then customer name. customer supports reduced IP Tool templates without IDs.")
     parser.add_argument("--iptool-join-column", default="Order Number", help="IP Tool service/order join column used for service join")
     parser.add_argument("--siebel-join-column", default="SERIAL_NUM", help="Siebel service join column used when available")
     parser.add_argument("--iptool-account-column", default="CustomerNumber", help="IP Tool account/customer join column used for simplified Siebel exports")
     parser.add_argument("--siebel-account-column", default="ACCOUNT_NUMBER", help="Siebel account join column used for simplified Siebel exports")
+    parser.add_argument("--iptool-customer-column", default="CustomerName", help="IP Tool customer-name join column used for reduced IP Tool exports")
+    parser.add_argument("--siebel-customer-column", default="ACCOUNT_NAME", help="Siebel customer-name join column used for reduced IP Tool exports")
     parser.add_argument("--assignment-date", default=date.today().isoformat())
     parser.add_argument("--assignment-status", default="3", help="CST LIRAssignmentStatusId. Default 3 Business")
     parser.add_argument("--customer-type-id", default="2")
@@ -545,6 +552,7 @@ def main() -> int:
     city_map = load_simple_map(args.city_map)
     service_by_key, duplicate_service = build_siebel_index(siebel_rows, args.siebel_join_column)
     account_by_key, duplicate_account = build_siebel_index(siebel_rows, args.siebel_account_column)
+    customer_by_key, duplicate_customer = build_siebel_index(siebel_rows, args.siebel_customer_column)
 
     output_rows: list[dict[str, str]] = []
     missing_rows: list[dict[str, str]] = []
@@ -556,6 +564,7 @@ def main() -> int:
             continue
         service_key = normalize_join_key(row_get(iptool, args.iptool_join_column))
         account_key = normalize_join_key(row_get(iptool, args.iptool_account_column, "Customer Number", "CustomerNumber"))
+        customer_key = normalize_join_key(row_get(iptool, args.iptool_customer_column, "Customer Name", "CustomerName"))
         siebel = None
         join_type = ""
         join_key = ""
@@ -569,13 +578,20 @@ def main() -> int:
             if siebel:
                 join_type = "account"
                 join_key = account_key
+        if siebel is None and args.join_mode in {"auto", "customer"} and customer_key:
+            siebel = customer_by_key.get(customer_key)
+            if siebel:
+                join_type = "customer"
+                join_key = customer_key
         if not siebel:
             missing = dict(iptool)
             missing["normalizedServiceJoinKey"] = service_key
             missing["normalizedAccountJoinKey"] = account_key
+            missing["normalizedCustomerJoinKey"] = customer_key
             missing["missingReason"] = (
-                f"No Siebel row found. Tried {args.iptool_join_column}->{args.siebel_join_column}={service_key or '<blank>'} "
-                f"and {args.iptool_account_column}->{args.siebel_account_column}={account_key or '<blank>'}."
+                f"No Siebel row found. Tried {args.iptool_join_column}->{args.siebel_join_column}={service_key or '<blank>'}, "
+                f"{args.iptool_account_column}->{args.siebel_account_column}={account_key or '<blank>'}, "
+                f"and {args.iptool_customer_column}->{args.siebel_customer_column}={customer_key or '<blank>'}."
             )
             missing_rows.append(missing)
             continue
@@ -586,6 +602,7 @@ def main() -> int:
             missing = dict(iptool)
             missing["normalizedServiceJoinKey"] = service_key
             missing["normalizedAccountJoinKey"] = account_key
+            missing["normalizedCustomerJoinKey"] = customer_key
             missing["matchedJoinType"] = join_type
             missing["matchedJoinKey"] = join_key
             missing["missingReason"] = f"Matched Siebel but failed to build output row: {exc}"
@@ -593,13 +610,14 @@ def main() -> int:
             errors.append(f"IP Tool row {index}, {join_type} key {join_key}: {exc}")
 
     write_csv(args.output, output_rows, BULK_COLUMNS)
-    missing_headers = sorted({key for row in missing_rows for key in row.keys()}) or ["normalizedServiceJoinKey", "normalizedAccountJoinKey", "missingReason"]
+    missing_headers = sorted({key for row in missing_rows for key in row.keys()}) or ["normalizedServiceJoinKey", "normalizedAccountJoinKey", "normalizedCustomerJoinKey", "missingReason"]
     write_csv(args.missing_output, missing_rows, missing_headers)
 
     duplicate_rows: list[dict[str, str]] = []
     for join_type, duplicates, selected_index in (
         ("service", duplicate_service, service_by_key),
         ("account", duplicate_account, account_by_key),
+        ("customer", duplicate_customer, customer_by_key),
     ):
         for key, rows in duplicates.items():
             selected = selected_index[key]
