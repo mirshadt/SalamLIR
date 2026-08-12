@@ -9233,48 +9233,40 @@ def auto_resolve_exact_duplicate_conflicts() -> ConflictAutoResolveResult:
 
     resolved_groups = 0
     accepted_count = 0
-    rejected_count = 0
+    removed_count = 0
     skipped_groups = 0
     with connect() as connection:
         for (cidr, _customer_key), group in groups.items():
             if len(group) < 2:
                 continue
-            resource_rows = connection.execute(
-                "SELECT source_entity_id FROM ip_resources WHERE source_entity_type = 'assignment' AND cidr = ?",
-                (cidr,),
-            ).fetchall()
-            existing_resource_ids = {str(row["source_entity_id"] or "") for row in resource_rows}
-            if len(existing_resource_ids) > 1:
+            ordered = sorted(group, key=lambda item: (item.created_at, item.id))
+            reported: list[Assignment] = []
+            for item in ordered:
+                resource = find_resource_by_source(connection, "assignment", item.id)
+                if resource and cst_resource_reported_to_cst(connection, resource):
+                    reported.append(item)
+            if len(reported) > 1:
                 skipped_groups += 1
                 continue
-            ordered = sorted(group, key=lambda item: (item.created_at, item.id))
-            keeper = next((item for item in ordered if item.id in existing_resource_ids), ordered[0])
-            rejected_this_group = 0
-            for duplicate in ordered:
-                if duplicate.id == keeper.id:
-                    continue
+            keeper = reported[0] if reported else ordered[0]
+            duplicates = [item for item in ordered if item.id != keeper.id]
+            before_keeper = keeper
+            for duplicate in duplicates:
+                before_json = duplicate.model_dump_json()
                 resource = find_resource_by_source(connection, "assignment", duplicate.id)
-                if resource and cst_resource_reported_to_cst(connection, resource):
-                    skipped_groups += 1
-                    rejected_this_group = 0
-                    break
-                before = duplicate
-                after = update_assignment_conflict_state(
+                if resource:
+                    connection.execute("DELETE FROM assignment_details WHERE resource_uuid = ?", (resource.resource_uuid,))
+                    connection.execute("DELETE FROM ip_resources WHERE resource_uuid = ?", (resource.resource_uuid,))
+                connection.execute("DELETE FROM assignments WHERE id = ?", (duplicate.id,))
+                record_audit(
                     connection,
-                    before,
-                    status="Retiring",
-                    conflict_status="REJECTED",
-                    conflict_reason="Auto rejected duplicate: exact same CIDR and customer name",
-                    validation_status="REJECTED",
-                    validation_errors=["Auto rejected duplicate: exact same CIDR and customer name"],
-                    cst_ready=False,
-                    cst_sync_status="NOT_REQUIRED",
-                    action_flag="D",
+                    "Bulk Assignment Conflict Auto-Removed Duplicate",
+                    "assignment",
+                    duplicate.id,
+                    before_json,
+                    json.dumps({"reason": "Removed duplicate: exact same CIDR and customer name", "keptAssignmentId": keeper.id, "cidr": cidr}),
                 )
-                record_audit(connection, "Bulk Assignment Conflict Auto-Rejected", "assignment", duplicate.id, before.model_dump_json(), after.model_dump_json())
-                rejected_this_group += 1
-            if rejected_this_group != len(ordered) - 1:
-                continue
+                removed_count += 1
             candidate = keeper.model_copy(update={
                 "status": "Active",
                 "migration_conflict_status": "ACCEPTED",
@@ -9282,6 +9274,7 @@ def auto_resolve_exact_duplicate_conflicts() -> ConflictAutoResolveResult:
                 "migration_conflict_group": "",
             })
             ready, validation_status, validation_errors, validation_warnings = cst_bulk_readiness_for_assignment(connection, candidate, cst_warning_list(candidate.cst_validation_warnings))
+            candidate.cst_validation_warnings = "; ".join(validation_warnings)
             after = update_assignment_conflict_state(
                 connection,
                 candidate,
@@ -9291,23 +9284,22 @@ def auto_resolve_exact_duplicate_conflicts() -> ConflictAutoResolveResult:
                 validation_status=validation_status,
                 validation_errors=validation_errors,
                 cst_ready=ready,
-                cst_sync_status="PENDING" if ready else keeper.cst_sync_status or "PENDING",
+                cst_sync_status="PENDING" if ready and not reported else keeper.cst_sync_status or "PENDING",
                 action_flag=keeper.action_flag or "N",
             )
             connection.execute("UPDATE assignments SET migration_conflict_group = '' WHERE id = ?", (keeper.id,))
             sync_assignment_resource(connection, after)
-            record_audit(connection, "Bulk Assignment Conflict Auto-Accepted", "assignment", keeper.id, keeper.model_dump_json(), after.model_dump_json())
+            record_audit(connection, "Bulk Assignment Conflict Auto-Accepted", "assignment", keeper.id, before_keeper.model_dump_json(), after.model_dump_json())
             resolved_groups += 1
             accepted_count += 1
-            rejected_count += rejected_this_group
         if resolved_groups:
             materialize_bulk_unassigned_fragments(connection)
     return ConflictAutoResolveResult(
         resolved_groups=resolved_groups,
         accepted_assignments=accepted_count,
-        rejected_assignments=rejected_count,
+        rejected_assignments=removed_count,
         skipped_groups=skipped_groups,
-        message=f"Auto-resolved {resolved_groups} exact duplicate group(s); accepted {accepted_count}, rejected {rejected_count}, skipped {skipped_groups}.",
+        message=f"Auto-resolved {resolved_groups} exact duplicate group(s); accepted {accepted_count}, removed {removed_count}, skipped {skipped_groups}.",
     )
 
 def init_db_with_retry(max_attempts: int = 6) -> None:
