@@ -66,6 +66,7 @@ import {
   getConflicts,
   acceptConflictAssignment,
   rejectConflictAssignment,
+  autoResolveExactDuplicateConflicts,
   getCstBatches,
   getCstConfig,
   getCstJobs,
@@ -1704,7 +1705,7 @@ ${errorMessage(error)}`
                 })}
               />
             ) : null}
-            {view === "integrity" ? <IntegrityManagement conflicts={conflicts} resources={resources} onOpen={openResource} onAcceptAssignment={(assignmentId) => run(async () => { await acceptConflictAssignment(assignmentId); })} onRejectAssignment={(assignmentId) => run(async () => { await rejectConflictAssignment(assignmentId); })} /> : null}
+            {view === "integrity" ? <IntegrityManagement conflicts={conflicts} resources={resources} onOpen={openResource} onAcceptAssignment={(assignmentId) => run(async () => { await acceptConflictAssignment(assignmentId); })} onRejectAssignment={(assignmentId) => run(async () => { await rejectConflictAssignment(assignmentId); })} onAutoResolveExactDuplicates={() => run(async () => { const result = await autoResolveExactDuplicateConflicts(); setNotice({ title: "Integrity Auto-Resolve Complete", detail: result.message }); void assignmentsQuery.refetch(); void conflictsQuery.refetch(); void cstSummaryQuery.refetch(); })} /> : null}
             {view === "bulk" ? (
               <BulkOperations
                 poolCsv={bulkPoolCsv}
@@ -3553,7 +3554,7 @@ function SubnetOperations(props: {
   );
 }
 
-function IntegrityManagement({ conflicts, resources, onOpen, onAcceptAssignment, onRejectAssignment }: { conflicts: Conflict[]; resources: ManagedResource[]; onOpen: (resource: ManagedResource) => void; onAcceptAssignment: (assignmentId: string) => void; onRejectAssignment: (assignmentId: string) => void }) {
+function IntegrityManagement({ conflicts, resources, onOpen, onAcceptAssignment, onRejectAssignment, onAutoResolveExactDuplicates }: { conflicts: Conflict[]; resources: ManagedResource[]; onOpen: (resource: ManagedResource) => void; onAcceptAssignment: (assignmentId: string) => void; onRejectAssignment: (assignmentId: string) => void; onAutoResolveExactDuplicates: () => void }) {
   const derivedIssues = detectIntegrityIssues(resources);
   const [selectedConflictKey, setSelectedConflictKey] = useState("");
   const conflictItems = conflicts.map((conflict, index) => ({ conflict, key: conflictKey(conflict, index), sides: conflictSides(conflict, resources) }));
@@ -3561,6 +3562,20 @@ function IntegrityManagement({ conflicts, resources, onOpen, onAcceptAssignment,
   return (
     <div className="grid gap-5">
       <PageTitle title="Integrity & Conflict Management" description="Operational module for overlaps, duplicates, invalid CIDR structures, orphan resources, and registry inconsistencies." />
+      <Card className="border-primary/30 bg-primary/5">
+        <CardHeader>
+          <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+            <div>
+              <CardTitle>Auto Resolve Pending Discrepancies</CardTitle>
+              <CardDescription>Accepts the first assignment only when the IP subnet and customer name are exactly the same; duplicate rows are rejected locally.</CardDescription>
+            </div>
+            <Button onClick={onAutoResolveExactDuplicates} disabled={!conflicts.length}>
+              <CheckCircle2 className="h-4 w-4" />
+              Auto Resolve Exact Duplicates
+            </Button>
+          </div>
+        </CardHeader>
+      </Card>
       <div className="grid gap-4 md:grid-cols-3">
         <Metric label="Critical" value={String(conflicts.filter((item) => item.severity === "critical").length)} detail="Must be resolved" />
         <Metric label="Major" value={String(conflicts.filter((item) => item.severity === "warning").length + derivedIssues.filter((item) => item.severity === "Major").length)} detail="Operational risk" />

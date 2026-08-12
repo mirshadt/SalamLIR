@@ -1024,6 +1024,9 @@ video {
 .border-violet-400\/50 {
   border-color: rgb(167 139 250 / 0.5);
 }
+.border-primary\/30 {
+  border-color: hsl(var(--primary) / 0.3);
+}
 .bg-accent\/20 {
   background-color: hsl(var(--accent) / 0.2);
 }
@@ -1143,6 +1146,9 @@ video {
 .bg-zinc-400 {
   --tw-bg-opacity: 1;
   background-color: rgb(161 161 170 / var(--tw-bg-opacity, 1));
+}
+.bg-primary\/5 {
+  background-color: hsl(var(--primary) / 0.05);
 }
 .object-contain {
   -o-object-fit: contain;

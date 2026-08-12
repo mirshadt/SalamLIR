@@ -243,6 +243,14 @@ export type Conflict = {
   resolution_status?: string;
 };
 
+export type ConflictAutoResolveResult = {
+  resolved_groups: number;
+  accepted_assignments: number;
+  rejected_assignments: number;
+  skipped_groups: number;
+  message: string;
+};
+
 export type BulkResult = {
   imported: number;
   blocked: number;
@@ -995,6 +1003,11 @@ export async function acceptConflictAssignment(assignmentId: string) {
 
 export async function rejectConflictAssignment(assignmentId: string) {
   const { data } = await api.post<Assignment>(`/conflicts/assignments/${assignmentId}/reject`);
+  return data;
+}
+
+export async function autoResolveExactDuplicateConflicts() {
+  const { data } = await api.post<ConflictAutoResolveResult>("/conflicts/auto-resolve/exact-duplicates");
   return data;
 }
 

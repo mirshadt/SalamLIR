@@ -304,6 +304,13 @@ class Conflict(BaseModel):
     resolution_status: str = ""
 
 
+class ConflictAutoResolveResult(BaseModel):
+    resolved_groups: int = 0
+    accepted_assignments: int = 0
+    rejected_assignments: int = 0
+    skipped_groups: int = 0
+    message: str = ""
+
 class StatusUpdate(BaseModel):
     status: str = Field(..., examples=["Quarantined"])
 
@@ -5563,6 +5570,9 @@ def assignment_active_for_conflict(assignment: Assignment) -> bool:
     return str(assignment.status or "").strip().lower() not in {"retiring", "retired"}
 
 
+def assignment_conflict_customer_key(assignment: Assignment) -> str:
+    return normalized_header(assignment.customer_name or assignment.organization_name or assignment.full_name or assignment.contact_name)
+
 def assignment_overlap_candidates(candidate: IPv4Network, excluded_assignment_ids: set[str] | None = None) -> list[Assignment]:
     excluded_assignment_ids = excluded_assignment_ids or set()
     overlaps: list[Assignment] = []
@@ -9210,6 +9220,95 @@ def accept_conflicting_assignment(assignment_id: str) -> Assignment:
         materialize_bulk_unassigned_fragments(connection)
         record_audit(connection, "Bulk Assignment Conflict Accepted", "assignment", assignment_id, before.model_dump_json(), after.model_dump_json())
     return after
+
+@app.post("/conflicts/auto-resolve/exact-duplicates", response_model=ConflictAutoResolveResult)
+def auto_resolve_exact_duplicate_conflicts() -> ConflictAutoResolveResult:
+    assignments = [assignment for assignment in list_assignments_from_db() if assignment_active_for_conflict(assignment)]
+    groups: dict[tuple[str, str], list[Assignment]] = defaultdict(list)
+    for assignment in assignments:
+        customer_key = assignment_conflict_customer_key(assignment)
+        if not customer_key:
+            continue
+        groups[(str(network_of(assignment)), customer_key)].append(assignment)
+
+    resolved_groups = 0
+    accepted_count = 0
+    rejected_count = 0
+    skipped_groups = 0
+    with connect() as connection:
+        for (cidr, _customer_key), group in groups.items():
+            if len(group) < 2:
+                continue
+            resource_rows = connection.execute(
+                "SELECT source_entity_id FROM ip_resources WHERE source_entity_type = 'assignment' AND cidr = ?",
+                (cidr,),
+            ).fetchall()
+            existing_resource_ids = {str(row["source_entity_id"] or "") for row in resource_rows}
+            if len(existing_resource_ids) > 1:
+                skipped_groups += 1
+                continue
+            ordered = sorted(group, key=lambda item: (item.created_at, item.id))
+            keeper = next((item for item in ordered if item.id in existing_resource_ids), ordered[0])
+            rejected_this_group = 0
+            for duplicate in ordered:
+                if duplicate.id == keeper.id:
+                    continue
+                resource = find_resource_by_source(connection, "assignment", duplicate.id)
+                if resource and cst_resource_reported_to_cst(connection, resource):
+                    skipped_groups += 1
+                    rejected_this_group = 0
+                    break
+                before = duplicate
+                after = update_assignment_conflict_state(
+                    connection,
+                    before,
+                    status="Retiring",
+                    conflict_status="REJECTED",
+                    conflict_reason="Auto rejected duplicate: exact same CIDR and customer name",
+                    validation_status="REJECTED",
+                    validation_errors=["Auto rejected duplicate: exact same CIDR and customer name"],
+                    cst_ready=False,
+                    cst_sync_status="NOT_REQUIRED",
+                    action_flag="D",
+                )
+                record_audit(connection, "Bulk Assignment Conflict Auto-Rejected", "assignment", duplicate.id, before.model_dump_json(), after.model_dump_json())
+                rejected_this_group += 1
+            if rejected_this_group != len(ordered) - 1:
+                continue
+            candidate = keeper.model_copy(update={
+                "status": "Active",
+                "migration_conflict_status": "ACCEPTED",
+                "migration_conflict_reason": "",
+                "migration_conflict_group": "",
+            })
+            ready, validation_status, validation_errors, validation_warnings = cst_bulk_readiness_for_assignment(connection, candidate, cst_warning_list(candidate.cst_validation_warnings))
+            after = update_assignment_conflict_state(
+                connection,
+                candidate,
+                status="Active",
+                conflict_status="ACCEPTED",
+                conflict_reason="",
+                validation_status=validation_status,
+                validation_errors=validation_errors,
+                cst_ready=ready,
+                cst_sync_status="PENDING" if ready else keeper.cst_sync_status or "PENDING",
+                action_flag=keeper.action_flag or "N",
+            )
+            connection.execute("UPDATE assignments SET migration_conflict_group = '' WHERE id = ?", (keeper.id,))
+            sync_assignment_resource(connection, after)
+            record_audit(connection, "Bulk Assignment Conflict Auto-Accepted", "assignment", keeper.id, keeper.model_dump_json(), after.model_dump_json())
+            resolved_groups += 1
+            accepted_count += 1
+            rejected_count += rejected_this_group
+        if resolved_groups:
+            materialize_bulk_unassigned_fragments(connection)
+    return ConflictAutoResolveResult(
+        resolved_groups=resolved_groups,
+        accepted_assignments=accepted_count,
+        rejected_assignments=rejected_count,
+        skipped_groups=skipped_groups,
+        message=f"Auto-resolved {resolved_groups} exact duplicate group(s); accepted {accepted_count}, rejected {rejected_count}, skipped {skipped_groups}.",
+    )
 
 def init_db_with_retry(max_attempts: int = 6) -> None:
     for attempt in range(1, max_attempts + 1):
