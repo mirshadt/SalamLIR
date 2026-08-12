@@ -1228,7 +1228,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
         {registryUnavailable ? (
           <Card className="border-destructive/60 bg-destructive/10">
             <CardContent className="pt-5 text-sm text-red-200">
-              FastAPI is not reachable at {process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:3001"}. Start the backend with <code>npm.cmd run api:py</code>.
+              FastAPI is not reachable at {process.env.NEXT_PUBLIC_API_URL ?? "/api"}. Confirm the backend service is running on port 3001 and the Next.js API proxy is rebuilt.
             </CardContent>
           </Card>
         ) : null}
@@ -1313,6 +1313,10 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                 })}
                 onRetryCstBatch={(batch) => run(async () => {
                   const jobs = await retryFailedCstBatch(batch.id);
+                  void cstSummaryQuery.refetch();
+                  void cstJobsQuery.refetch();
+                  void cstBatchesQuery.refetch();
+                  void cstTransactionsQuery.refetch();
                   setNotice({ title: "CST Batch Retry", detail: `${jobs.length} pending/failed job(s) retried against the real CST API.` });
                 })}
                 onPushPendingCstJobs={(limit) => run(async () => {
@@ -5182,7 +5186,6 @@ function CstIntegrationMonitor(props: CstMonitorProps) {
           <div className="grid gap-2">
             <div className="flex items-center justify-between gap-2">
               <h3 className="text-sm font-semibold">Recent Batches</h3>
-              {props.cstBatches[0] ? <Button size="sm" variant="outline" onClick={() => props.onRetryCstBatch(props.cstBatches[0])}>Retry Latest</Button> : null}
             </div>
             <div className="max-h-[300px] overflow-auto rounded-md border">
               <Table>
@@ -5192,6 +5195,7 @@ function CstIntegrationMonitor(props: CstMonitorProps) {
                     <TableHead>Workflow</TableHead>
                     <TableHead>Status</TableHead>
                     <TableHead>Jobs</TableHead>
+                    <TableHead />
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -5201,9 +5205,10 @@ function CstIntegrationMonitor(props: CstMonitorProps) {
                       <TableCell>{batch.workflow_type}</TableCell>
                       <TableCell><Badge variant={batch.status === "SUCCESS" ? "success" : batch.status === "FAILED" || batch.status === "BLOCKED" ? "danger" : "warning"}>{batch.status}</Badge></TableCell>
                       <TableCell>{batch.completed_jobs}/{batch.total_jobs}</TableCell>
+                      <TableCell>{batch.failed_jobs > 0 || batch.blocked_jobs > 0 || batch.completed_jobs < batch.total_jobs ? <Button size="sm" variant="outline" onClick={() => props.onRetryCstBatch(batch)}>Retry Batch</Button> : null}</TableCell>
                     </TableRow>
                   ))}
-                  {!props.cstBatches.length ? <TableRow><TableCell colSpan={4} className="py-6 text-center text-muted-foreground">No CST batches yet.</TableCell></TableRow> : null}
+                  {!props.cstBatches.length ? <TableRow><TableCell colSpan={5} className="py-6 text-center text-muted-foreground">No CST batches yet.</TableCell></TableRow> : null}
                 </TableBody>
               </Table>
             </div>

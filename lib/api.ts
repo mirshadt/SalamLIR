@@ -1,7 +1,7 @@
 import axios from "axios";
 
 export const api = axios.create({
-  baseURL: process.env.NEXT_PUBLIC_API_URL ?? "http://127.0.0.1:3001",
+  baseURL: process.env.NEXT_PUBLIC_API_URL ?? "/api",
   timeout: 20000
 });
 
