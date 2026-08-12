@@ -329,6 +329,11 @@ const CST_BULK_ASSIGNMENT_TEMPLATE = [
   "BUSINESS,5.42.224.0/30,,,4,3,2026-06-03,Example Enterprise,Example Enterprise LLC,1010112916,1010112916,,2,CORP,LAN1,14,41,Primary Contact,+966501234567,1234567890,contact@example.com,Primary Contact,+966501234567,contact@example.com,CUST-10001,SVC-10001,Enterprise L3 service,1,Business Customer,Customer L3 service,Riyadh HQ,Riyadh,Riyadh,Ready business example",
   "INTERNAL,5.42.224.4/30,,,4,2,2026-06-03,,,,,,,,,,,,,,,,,,,,Internal firewall management,,,,,,,Ready internal example"
 ].join("\n");
+const BULK_SUBNET_TEMPLATE = [
+  "cidr,StartIP,EndIP,Total,name,region,maintainer,description",
+  "5.42.226.0/24,,,,Orbit unassigned subnet,Riyadh,ORBIT-MNT,Unassigned subnet owned by Orbit maintainer",
+  ",5.42.227.0,5.42.227.255,256,ITC unassigned range,Riyadh,ITC-NOC-MNT,Range import example"
+].join("\n");
 const navigation: Array<{ id: ViewKey; label: string; icon: React.ReactNode }> = [
   { id: "executive", label: "Home", icon: <Gauge className="h-4 w-4" /> },
   { id: "registry", label: "Resource Registry", icon: <Database className="h-4 w-4" /> },
@@ -858,7 +863,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   const [reservationForm, setReservationForm] = useState({ cidr: "5.42.225.0/24", purpose: "Enterprise Expansion", requestedBy: "", expiryDate: "", notes: "" });
   const [splitForm, setSplitForm] = useState({ poolId: "", search: "", prefix: "24", direction: "start" as PartitionDirection });
   const [mergeForm, setMergeForm] = useState({ leftPoolId: "", rightPoolId: "", leftSearch: "", rightSearch: "" });
-  const [bulkPoolCsv, setBulkPoolCsv] = useState("StartIP,EndIP,Total\n10.24.0.0,10.24.255.255,65536");
+  const [bulkPoolCsv, setBulkPoolCsv] = useState(BULK_SUBNET_TEMPLATE);
   const [bulkAssignmentCsv, setBulkAssignmentCsv] = useState(CST_BULK_ASSIGNMENT_TEMPLATE);
   const [ripeConfigForm, setRipeConfigForm] = useState<RipeConfigPayload>({ base_url: "https://rest.db.ripe.net", auth_type: "Basic Authentication", username: "", password: "", connection_timeout: 10, read_timeout: 30, default_maintainer: "ITC-NOC-MNT" });
   const [siebelConfigForm, setSiebelConfigForm] = useState<SiebelConfigPayload>({ username: "LIR_USER", password: "", dsn: "172.31.23.101:1525/SIDB", connection_timeout: 10, query_sql: DEFAULT_SIEBEL_QUERY });
@@ -3745,6 +3750,23 @@ function BulkOperations(props: {
             <p className="text-sm text-muted-foreground">
               {props.poolCsv ? `${props.poolCsv.split(/\r?\n/).filter(Boolean).length - 1} data rows loaded${props.poolFileName ? ` from ${props.poolFileName}` : ""}` : "No file loaded"}
             </p>
+            <div className="rounded-md border bg-muted/20 p-3">
+              <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                <div>
+                  <p className="text-sm font-semibold">Subnet import template</p>
+                  <p className="text-xs text-muted-foreground">Use CIDR, or StartIP/EndIP/Total ranges. The maintainer column defaults to ITC-NOC-MNT when blank.</p>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <Button size="sm" variant="outline" onClick={() => { props.onPoolCsv(BULK_SUBNET_TEMPLATE); props.onPoolFileName("bulk-subnet-template.csv"); }}>
+                    Load Template
+                  </Button>
+                  <Button size="sm" variant="outline" onClick={() => downloadBlob(`bulk-subnet-template-${today()}.csv`, "text/csv;charset=utf-8", BULK_SUBNET_TEMPLATE)}>
+                    <FileDown className="h-4 w-4" />
+                    Download Template
+                  </Button>
+                </div>
+              </div>
+            </div>
             <Button className="w-fit" onClick={props.onImportPools} disabled={!props.poolCsv.trim()}>
               <Upload className="h-4 w-4" />
               Start Resource Batch
@@ -6279,7 +6301,7 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
       netname: pool.name,
       description: pool.description || pool.name,
       country: "SA",
-      maintainer: pool.owner || "Salam-LIR-MNT",
+      maintainer: pool.owner || "ITC-NOC-MNT",
       previousUuid: "",
       sourceUuid: "",
       successorUuid: "",
@@ -6344,7 +6366,7 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
         netname: assignment.customer_name || assignment.internal_application_name || assignment.assignment_name,
         description: assignment.service || assignment.assignment_description || assignment.assignment_name,
         country: "SA",
-        maintainer: assignment.owner || "Salam-LIR-MNT",
+        maintainer: assignment.owner || "ITC-NOC-MNT",
         previousUuid: "",
         sourceUuid: "",
         successorUuid: "",
@@ -6411,7 +6433,7 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
             netname: `${pool.name}-FREE`,
             description: "Calculated available free block",
             country: "SA",
-            maintainer: "Salam-LIR-MNT",
+            maintainer: pool.owner || "ITC-NOC-MNT",
             previousUuid: "",
             sourceUuid: resourceUuid("pool", pool.id, pool.cidr),
             successorUuid: "",
@@ -6999,6 +7021,8 @@ function normalizePoolImportCsv(csvText: string) {
     const startIp = normalized.startip || normalized.start_ip || normalized.start;
     const endIp = normalized.endip || normalized.end_ip || normalized.end;
     const totalText = normalized.total;
+    const maintainer = normalized.maintainer || normalized.ripe_maintainer || normalized["mnt-by"] || normalized.mnt_by || normalized.owner || "ITC-NOC-MNT";
+    const description = normalized.description || normalized.descr || "";
     if (!startIp || !endIp || !totalText) {
       throw new Error(`row ${index + 2}: StartIP, EndIP, and Total are required.`);
     }
@@ -7019,14 +7043,16 @@ function normalizePoolImportCsv(csvText: string) {
       converted.push({
         cidr: block.cidr,
         name: normalized.name || `Bulk range ${startIp}-${endIp}`,
-        region: normalized.region || "Unassigned region"
+        region: normalized.region || "Unassigned region",
+        maintainer,
+        description
       });
     }
   });
 
   return buildSimpleCsv(
-    ["cidr", "name", "region"],
-    converted.map((row) => [row.cidr, row.name, row.region])
+    ["cidr", "name", "region", "maintainer", "description"],
+    converted.map((row) => [row.cidr, row.name, row.region, row.maintainer, row.description])
   );
 }
 

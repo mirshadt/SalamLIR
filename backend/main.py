@@ -48,6 +48,7 @@ CST_SCHEDULER_STARTED = False
 DEFAULT_SERVICE_PROVIDER_ID = "5"
 DEFAULT_SERVICE_PROVIDER_NAME = "Salam"
 DEFAULT_ASN = "AS35753"
+DEFAULT_RESOURCE_MAINTAINER = "ITC-NOC-MNT"
 LIR_CUSTOMER_TYPE_CODES = {"CORP", "RESI", "COMP", "NA"}
 LIR_SUBNET_TYPE_CODES = {"NA", *{f"LAN{index}" for index in range(1, 9)}, *{f"PTP{index}" for index in range(1, 4)}}
 CST_SEND_LIR_PATH = "/api/rest/v1.0/LIRDataService/SendLIRData"
@@ -111,7 +112,7 @@ class PoolCreate(BaseModel):
     site_id: str = ""
     site_name: str = ""
     location_name: str = ""
-    owner: str = "IPAM"
+    owner: str = DEFAULT_RESOURCE_MAINTAINER
     cost_center: str = ""
     security_zone: str = ""
     provider: str = ""
@@ -823,6 +824,16 @@ class DatabaseConnectionTestResponse(BaseModel):
     database: str = ""
     username: str = ""
     tested_at: str
+
+class DatabaseSyncResponse(BaseModel):
+    success: bool
+    message: str
+    pools: int
+    assignments: int
+    resources: int
+    cst_jobs: int
+    cst_batches: int
+    synced_at: str
 
 class CstSyncBatch(BaseModel):
     id: str
@@ -5006,10 +5017,18 @@ def parse_ipv4(value: str, label: str) -> IPv4Address:
         raise HTTPException(status_code=400, detail=f"Invalid {label}: {value}") from exc
 
 
-def pool_networks_from_bulk_row(row: dict[str, str]) -> tuple[list[IPv4Network], str, str]:
+def pool_maintainer_from_bulk_row(row: dict[str, str]) -> str:
+    return csv_value(row, "maintainer", "ripe_maintainer", "default_maintainer", "mnt-by", "mnt_by", "owner") or DEFAULT_RESOURCE_MAINTAINER
+
+
+def pool_networks_from_bulk_row(row: dict[str, str]) -> tuple[list[IPv4Network], str, str, str, str]:
+    name = csv_value(row, "name") or "Bulk imported pool"
+    region = csv_value(row, "region") or "Unassigned region"
+    maintainer = pool_maintainer_from_bulk_row(row)
+    description = csv_value(row, "description", "descr")
     cidr = csv_value(row, "cidr")
     if cidr:
-        return [normalize_network(cidr)], csv_value(row, "name") or "Bulk imported pool", csv_value(row, "region") or "Unassigned region"
+        return [normalize_network(cidr)], name, region, maintainer, description
 
     start_value = csv_value(row, "StartIP", "start_ip", "start")
     end_value = csv_value(row, "EndIP", "end_ip", "end")
@@ -5033,8 +5052,8 @@ def pool_networks_from_bulk_row(row: dict[str, str]) -> tuple[list[IPv4Network],
         raise HTTPException(status_code=400, detail=f"Total {expected_total} does not match StartIP-EndIP size {actual_total}")
 
     networks = list(summarize_address_range(start_ip, end_ip))
-    return networks, csv_value(row, "name") or f"Bulk range {start_ip}-{end_ip}", csv_value(row, "region") or "Unassigned region"
-
+    range_name = name if name != "Bulk imported pool" else f"Bulk range {start_ip}-{end_ip}"
+    return networks, range_name, region, maintainer, description
 
 def ripe_allocated_pool_from_payload(payload: RipeAllocatedPoolCreate) -> RipeAllocatedPool:
     network = normalize_network(payload.cidr)
@@ -5659,6 +5678,28 @@ def database_connection_status() -> DatabaseConnectionStatus:
         message="Current backend in this workspace still uses SQLite. Set DATABASE_URL only after PostgreSQL runtime support is merged and restart the API service.",
     )
 
+
+
+@app.post("/database/sync", response_model=DatabaseSyncResponse)
+def sync_database_now() -> DatabaseSyncResponse:
+    init_db()
+    with connect() as connection:
+        connection.execute("PRAGMA optimize")
+        pool_count = connection.execute("SELECT COUNT(*) FROM pools").fetchone()[0]
+        assignment_count = connection.execute("SELECT COUNT(*) FROM assignments").fetchone()[0]
+        resource_count = connection.execute("SELECT COUNT(*) FROM ip_resources").fetchone()[0]
+        cst_job_count = connection.execute("SELECT COUNT(*) FROM cst_sync_jobs").fetchone()[0]
+        cst_batch_count = connection.execute("SELECT COUNT(*) FROM cst_sync_batches").fetchone()[0]
+    return DatabaseSyncResponse(
+        success=True,
+        message="Database schema, indexes, CST tables, and normalized inventory sync completed.",
+        pools=int(pool_count or 0),
+        assignments=int(assignment_count or 0),
+        resources=int(resource_count or 0),
+        cst_jobs=int(cst_job_count or 0),
+        cst_batches=int(cst_batch_count or 0),
+        synced_at=now_iso(),
+    )
 
 @app.post("/database/test-postgres", response_model=DatabaseConnectionTestResponse)
 def test_postgres_connection(payload: DatabaseConnectionTestRequest) -> DatabaseConnectionTestResponse:
@@ -7520,13 +7561,18 @@ def process_pool_bulk(csv_text: object) -> BulkImportResult:
     output_rows: list[BulkOutputRow] = []
     for index, row in enumerate(csv_rows(csv_text), start=2):
         try:
-            networks, name, region = pool_networks_from_bulk_row(row)
+            networks, name, region, maintainer, description = pool_networks_from_bulk_row(row)
             for network in networks:
                 validate_private_pool_registration(network)
                 validate_parent_pool(network)
             with connect() as connection:
                 for network in networks:
                     pool = pool_from_network(network, name if len(networks) == 1 else f"{name} {network}", region, "CSV bulk import")
+                    pool_data = pool.model_dump()
+                    pool_data["owner"] = maintainer
+                    pool_data["description"] = description
+                    pool_data["source_system"] = csv_value(row, "source_system", "sourceSystem", "source system") or "CSV bulk import"
+                    pool = Pool(**pool_data)
                     insert_pool(connection, pool)
                     resource = sync_pool_resource(connection, pool)
                     if resource_requires_cst(resource):
