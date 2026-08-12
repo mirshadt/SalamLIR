@@ -864,6 +864,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   const [splitForm, setSplitForm] = useState({ poolId: "", search: "", prefix: "24", direction: "start" as PartitionDirection });
   const [mergeForm, setMergeForm] = useState({ leftPoolId: "", rightPoolId: "", leftSearch: "", rightSearch: "" });
   const [bulkPoolCsv, setBulkPoolCsv] = useState(BULK_SUBNET_TEMPLATE);
+  const [bulkPoolAllocated, setBulkPoolAllocated] = useState(false);
   const [bulkAssignmentCsv, setBulkAssignmentCsv] = useState(CST_BULK_ASSIGNMENT_TEMPLATE);
   const [ripeConfigForm, setRipeConfigForm] = useState<RipeConfigPayload>({ base_url: "https://rest.db.ripe.net", auth_type: "Basic Authentication", username: "", password: "", connection_timeout: 10, read_timeout: 30, default_maintainer: "ITC-NOC-MNT" });
   const [siebelConfigForm, setSiebelConfigForm] = useState<SiebelConfigPayload>({ username: "LIR_USER", password: "", dsn: "172.31.23.101:1525/SIDB", connection_timeout: 10, query_sql: DEFAULT_SIEBEL_QUERY });
@@ -1692,15 +1693,17 @@ ${errorMessage(error)}`
                 assignmentCsv={bulkAssignmentCsv}
                 poolFileName={bulkPoolFileName}
                 assignmentFileName={bulkAssignmentFileName}
+                poolAllocated={bulkPoolAllocated}
                 batches={bulkBatches}
                 isRefreshing={bulkBatchesQuery.isFetching}
                 onPoolCsv={setBulkPoolCsv}
                 onAssignmentCsv={setBulkAssignmentCsv}
                 onPoolFileName={setBulkPoolFileName}
                 onAssignmentFileName={setBulkAssignmentFileName}
+                onPoolAllocated={setBulkPoolAllocated}
                 onRefresh={() => void bulkBatchesQuery.refetch()}
                 onImportPools={() => run(async () => {
-                  const { data } = await api.post<BulkBatch>("/pools/bulk", { csv_text: bulkPoolCsv, file_name: bulkPoolFileName });
+                  const { data } = await api.post<BulkBatch>("/pools/bulk", { csv_text: bulkPoolCsv, file_name: bulkPoolFileName, allocated_pool: bulkPoolAllocated });
                   setNotice({ title: "Bulk transaction started", detail: `${data.id} is processing ${data.total_rows} subnet rows. Track status in Bulk Transaction History.` });
                 })}
                 onImportAssignments={() => run(async () => {
@@ -3705,12 +3708,14 @@ function BulkOperations(props: {
   assignmentCsv: string;
   poolFileName: string;
   assignmentFileName: string;
+  poolAllocated: boolean;
   batches: BulkBatch[];
   isRefreshing: boolean;
   onPoolCsv: (value: string) => void;
   onAssignmentCsv: (value: string) => void;
   onPoolFileName: (value: string) => void;
   onAssignmentFileName: (value: string) => void;
+  onPoolAllocated: (value: boolean) => void;
   onRefresh: () => void;
   onImportPools: () => void;
   onImportAssignments: () => void;
@@ -3750,6 +3755,7 @@ function BulkOperations(props: {
             <p className="text-sm text-muted-foreground">
               {props.poolCsv ? `${props.poolCsv.split(/\r?\n/).filter(Boolean).length - 1} data rows loaded${props.poolFileName ? ` from ${props.poolFileName}` : ""}` : "No file loaded"}
             </p>
+            <ToggleSwitch label="Allocated pool" description="When enabled, imported subnets are treated as allocated/root pools for Navigator and reports." checked={props.poolAllocated} onChange={props.onPoolAllocated} />
             <div className="rounded-md border bg-muted/20 p-3">
               <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
                 <div>
@@ -5807,14 +5813,29 @@ function resourceKey(resource: ManagedResource, index: number, scope: string) {
   ].join("|");
 }
 
+function tagValue(tags: string | undefined, key: string) {
+  const normalizedKey = key.trim().toLowerCase();
+  for (const part of String(tags || "").split(";")) {
+    const [tagKey, ...tagValueParts] = part.split("=");
+    if (tagKey?.trim().toLowerCase() === normalizedKey) {
+      return tagValueParts.join("=").trim();
+    }
+  }
+  return "";
+}
+
+function isAllocatedPool(pool: Pool) {
+  const sourceSystem = String(pool.source_system || "").trim();
+  return sourceSystem === "RIPE IP Pools Discovery" || sourceSystem === "Local Allocated Pool Bulk Import" || tagValue(pool.tags, "pool_type").toLowerCase() === "allocated pool";
+}
+
 function isRipeDiscoveryPool(pool: Pool) {
-  return String(pool.source_system || "").trim() === "RIPE IP Pools Discovery";
+  return isAllocatedPool(pool);
 }
 
 function isRipeAllocatedPoolResource(resource: ManagedResource) {
-  return resource.allocatedPool || String(resource.sourceRegistry || "").trim() === "RIPE IP Pools Discovery";
+  return resource.allocatedPool || ["RIPE IP Pools Discovery", "Local Allocated Pool Bulk Import"].includes(String(resource.sourceRegistry || "").trim());
 }
-
 function resourceTypeLabel(resource: ManagedResource) {
   return isRipeAllocatedPoolResource(resource) ? "Allocated Pool" : resource.type;
 }

@@ -385,6 +385,7 @@ class AuditEvent(BaseModel):
 class BulkCsvRequest(BaseModel):
     csv_text: str
     file_name: str = ""
+    allocated_pool: bool = False
 
 
 class BulkOutputRow(BaseModel):
@@ -1094,6 +1095,7 @@ SUPPORTED_OWNERSHIP_TYPES = {"BUSINESS", "INDIVIDUAL", "INTERNAL", "INFRASTRUCTU
 CST_SYNC_STATUSES = {"NOT_CONFIGURED", "NOT_REQUIRED", "PENDING", "RUNNING", "SUCCESS", "FAILED", "BLOCKED"}
 RIPE_SYNC_STATUSES = {"PENDING", "SUCCESS", "FAILED", "NOT_REQUIRED"}
 RIPE_DISCOVERY_SOURCE_SYSTEM = "RIPE IP Pools Discovery"
+LOCAL_ALLOCATED_POOL_SOURCE_SYSTEM = "Local Allocated Pool Bulk Import"
 ACTION_FLAGS = {"N", "U", "D", "S", "F"}
 
 
@@ -1216,6 +1218,12 @@ def assignment_from_network(network: IPv4Network, payload: AssignmentCreate) -> 
 
 def network_of(item: Pool | Assignment) -> IPv4Network:
     return normalize_network(item.cidr)
+
+
+
+def csv_truthy(value: object) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on", "allocated", "allocated pool"}
+
 
 
 def is_ripe_discovered_pool(pool: Pool) -> bool:
@@ -7540,12 +7548,12 @@ def fail_bulk_batch(batch_id: str, error: Exception, started: float) -> None:
         record_audit(connection, "Bulk Transaction Failed", "bulk_batch", batch_id, "", str(error))
 
 
-def run_bulk_batch(batch_id: str, operation_type: str, csv_text: str) -> None:
+def run_bulk_batch(batch_id: str, operation_type: str, csv_text: str, allocated_pool: bool = False) -> None:
     started = time.perf_counter()
     try:
         with DB_WRITE_LOCK:
             if operation_type == "POOL_IMPORT":
-                result = process_pool_bulk(csv_text)
+                result = process_pool_bulk(csv_text, allocated_pool=allocated_pool)
             elif operation_type == "ASSIGNMENT_IMPORT":
                 result = process_assignment_bulk(csv_text)
             else:
@@ -7555,15 +7563,17 @@ def run_bulk_batch(batch_id: str, operation_type: str, csv_text: str) -> None:
         fail_bulk_batch(batch_id, exc, started)
 
 
-def process_pool_bulk(csv_text: object) -> BulkImportResult:
+def process_pool_bulk(csv_text: object, allocated_pool: bool = False) -> BulkImportResult:
     imported = 0
     errors: list[str] = []
     output_rows: list[BulkOutputRow] = []
     for index, row in enumerate(csv_rows(csv_text), start=2):
         try:
             networks, name, region, maintainer, description = pool_networks_from_bulk_row(row)
+            row_allocated_pool = allocated_pool or csv_truthy(csv_value(row, "allocated_pool", "allocatedPool", "is_allocated_pool", "Allocated Pool"))
             for network in networks:
-                validate_private_pool_registration(network)
+                if not row_allocated_pool:
+                    validate_private_pool_registration(network)
                 validate_parent_pool(network)
             with connect() as connection:
                 for network in networks:
@@ -7571,7 +7581,11 @@ def process_pool_bulk(csv_text: object) -> BulkImportResult:
                     pool_data = pool.model_dump()
                     pool_data["owner"] = maintainer
                     pool_data["description"] = description
-                    pool_data["source_system"] = csv_value(row, "source_system", "sourceSystem", "source system") or "CSV bulk import"
+                    source_system = csv_value(row, "source_system", "sourceSystem", "source system")
+                    pool_data["source_system"] = source_system or (LOCAL_ALLOCATED_POOL_SOURCE_SYSTEM if row_allocated_pool else "CSV bulk import")
+                    if row_allocated_pool:
+                        pool_data["resource_role"] = "ParentPool"
+                        pool_data["tags"] = update_tag_string(pool_data.get("tags", ""), {"source": "Bulk Import", "pool_type": "Allocated Pool", "ripe_maintainer": maintainer})
                     pool = Pool(**pool_data)
                     insert_pool(connection, pool)
                     resource = sync_pool_resource(connection, pool)
@@ -7624,7 +7638,7 @@ def process_pool_bulk(csv_text: object) -> BulkImportResult:
 @app.post("/pools/bulk", response_model=BulkBatch, status_code=202)
 def bulk_add_pools(payload: BulkCsvRequest, background_tasks: BackgroundTasks) -> BulkBatch:
     batch = create_bulk_batch("POOL_IMPORT", payload)
-    background_tasks.add_task(run_bulk_batch, batch.id, batch.operation_type, payload.csv_text)
+    background_tasks.add_task(run_bulk_batch, batch.id, batch.operation_type, payload.csv_text, payload.allocated_pool)
     return batch
 
 
