@@ -139,6 +139,7 @@ export type Assignment = {
   service_characteristics: string;
   product_specification_id: string;
   product_specification_name: string;
+  product_class: string;
   product_offering_id: string;
   product_offering_name: string;
   product_instance_id: string;
@@ -882,6 +883,7 @@ export type AssignmentPayload = {
   service_characteristics: string;
   product_specification_id: string;
   product_specification_name: string;
+  product_class: string;
   product_offering_id: string;
   product_offering_name: string;
   product_instance_id: string;

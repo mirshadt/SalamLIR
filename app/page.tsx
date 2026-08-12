@@ -194,6 +194,7 @@ type ManagedResource = {
   customerTypeId: string;
   customerType: string;
   subnetType: string;
+  productClass: string;
   regionId: string;
   cityId: string;
   fullName: string;
@@ -325,7 +326,7 @@ const SEARCH_FILTER_FIELDS: Array<{ value: SearchFilterField; label: string; mod
 
 
 const CST_BULK_ASSIGNMENT_TEMPLATE = [
-  "assignmentType,cidr,startIp,endIp,size,status,assignmentDate,customerName,organizationName,organizationId,commercialRegId,unifiedNumber,customerTypeId,customerType,subnetType,regionId,cityId,fullName,mobileNumber,idNumber,email,contactName,contactNumber,contactEmail,customerId,serviceId,serviceDescription,accessTechnologyId,owner,assignmentPurpose,site,city,region,notes",
+  "assignmentType,cidr,startIp,endIp,size,status,assignmentDate,customerName,organizationName,organizationId,commercialRegId,unifiedNumber,customerTypeId,customerType,subnetType,productClass,regionId,cityId,fullName,mobileNumber,idNumber,email,contactName,contactNumber,contactEmail,customerId,serviceId,serviceDescription,accessTechnologyId,owner,assignmentPurpose,site,city,region,notes",
   "BUSINESS,5.42.224.0/30,,,4,3,2026-06-03,Example Enterprise,Example Enterprise LLC,1010112916,1010112916,,2,CORP,LAN1,14,41,Primary Contact,+966501234567,1234567890,contact@example.com,Primary Contact,+966501234567,contact@example.com,CUST-10001,SVC-10001,Enterprise L3 service,1,Business Customer,Customer L3 service,Riyadh HQ,Riyadh,Riyadh,Ready business example",
   "INTERNAL,5.42.224.4/30,,,4,2,2026-06-03,,,,,,,,,,,,,,,,,,,,Internal firewall management,,,,,,,Ready internal example"
 ].join("\n");
@@ -500,6 +501,7 @@ const businessBssFields: AssignmentFieldDefinition[] = [
   { key: "customer_type_id", label: "customerTypeId", placeholder: "Select CST customer type", required: true, options: customerTypeOptions },
   { key: "customer_type", label: "customerType", placeholder: "Select LIR customer type", options: lirCustomerTypeOptions },
   { key: "subnet_type", label: "subnetType", placeholder: "Select subnet type", options: subnetTypeOptions },
+  { key: "product_class", label: "Product Class", placeholder: "Product class from Siebel/IP Tool" },
   { key: "service_description", label: "serviceDescription", placeholder: "Auto-populated based on Assigned to" },
   { key: "organization_name", label: "organizationName", placeholder: "Auto sync from BSS after assignment", disabled: true },
   { key: "organization_id", label: "organizationId", placeholder: "Auto sync from BSS after assignment", disabled: true },
@@ -578,6 +580,7 @@ const emptyAssignment: AssignmentPayload = {
   service_characteristics: "",
   product_specification_id: "",
   product_specification_name: "",
+  product_class: "",
   product_offering_id: "",
   product_offering_name: "",
   product_instance_id: "",
@@ -923,8 +926,9 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   const [passwordReset, setPasswordReset] = useState({ userId: "", password: "" });
   const [confirm, setConfirm] = useState<{ title: string; detail: string; action: () => void; destructive?: boolean } | null>(null);
   const [notice, setNotice] = useState<{ title: string; detail: string } | null>(null);
+  const [lastGoodAssignments, setLastGoodAssignments] = useState<Assignment[]>([]);
 
-  const liveQueryOptions = { staleTime: 0, refetchOnMount: "always" as const, refetchOnWindowFocus: true };
+  const liveQueryOptions = { staleTime: 30000, refetchOnMount: true as const, refetchOnWindowFocus: false, retry: 3, retryDelay: (attempt: number) => Math.min(1000 * 2 ** attempt, 8000) };
   const poolsQuery = useQuery({ queryKey: ["pools"], queryFn: getPools, ...liveQueryOptions });
   const assignmentsQuery = useQuery({ queryKey: ["assignments"], queryFn: getAssignments, ...liveQueryOptions });
   const conflictsQuery = useQuery({ queryKey: ["conflicts"], queryFn: getConflicts, ...liveQueryOptions });
@@ -953,7 +957,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   });
 
   const pools = poolsQuery.data ?? [];
-  const assignments = assignmentsQuery.data ?? [];
+  const assignments = assignmentsQuery.data ?? lastGoodAssignments;
   const conflicts = conflictsQuery.data ?? [];
   const auditEvents = auditQuery.data ?? [];
   const users = usersQuery.data ?? [];
@@ -973,6 +977,12 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
     setCstConfigFormDirty(true);
     setCstConfigForm(value);
   };
+
+  useEffect(() => {
+    if (assignmentsQuery.data) {
+      setLastGoodAssignments(assignmentsQuery.data);
+    }
+  }, [assignmentsQuery.data]);
 
   useEffect(() => {
     setSignedInUser(window.localStorage.getItem("ipam-username") ?? "admin");
@@ -1062,9 +1072,10 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   const resources = useMemo(() => buildRegistryResources(pools, assignments), [pools, assignments]);
   const stats = useMemo(() => buildRegistryStats(resources, conflicts), [resources, conflicts]);
   const selectedResource = resources.find((resource) => resource.id === selectedResourceId) ?? resources[0] ?? null;
+  const usingCachedAssignments = assignmentsQuery.isError && lastGoodAssignments.length > 0;
   const registryUnavailable =
     (poolsQuery.isError && poolsQuery.data === undefined) ||
-    (assignmentsQuery.isError && assignmentsQuery.data === undefined);
+    (assignmentsQuery.isError && assignmentsQuery.data === undefined && lastGoodAssignments.length === 0);
 
   useEffect(() => {
     if (!selectedResourceId && resources[0]) {
@@ -1239,6 +1250,13 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
           </Card>
         ) : null}
 
+        {usingCachedAssignments ? (
+          <Card className="border-amber-500/60 bg-amber-500/10">
+            <CardContent className="pt-5 text-sm text-amber-100">
+              Assignment refresh failed, so the last successfully loaded assignment list is still being shown. Use Refresh after the API recovers.
+            </CardContent>
+          </Card>
+        ) : null}
         <div className={cn("grid gap-4", view === "executive" ? "" : "lg:grid-cols-[18px_1fr]")}>
           {view !== "executive" ? <aside className="group relative z-20 h-fit w-4 overflow-hidden rounded-lg border border-transparent bg-card/60 p-1 transition-all duration-200 hover:w-16 hover:border-border hover:bg-card hover:p-2 focus-within:w-16 focus-within:border-border focus-within:bg-card focus-within:p-2 lg:sticky lg:top-4">
             <span className="pointer-events-none absolute inset-y-3 left-1.5 w-1 rounded-full bg-muted-foreground/40 transition-opacity group-hover:opacity-0 group-focus-within:opacity-0" />
@@ -2671,6 +2689,7 @@ function ResourceSummary({
           ["Customer Type ID", resource.customerTypeId],
           ["Customer Type", resource.customerType],
           ["Subnet Type", resource.subnetType],
+          ["Product Class", resource.productClass],
           ["Region ID", resource.regionId],
           ["City ID", resource.cityId],
           ["Full Name", resource.fullName],
@@ -6287,6 +6306,7 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
       customerTypeId: "",
       customerType: "NA",
       subnetType: "NA",
+      productClass: "",
       regionId: "",
       cityId: "",
       fullName: "",
@@ -6352,6 +6372,7 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
         customerTypeId: assignment.customer_type_id,
         customerType: assignment.customer_type || "NA",
         subnetType: assignment.subnet_type || "NA",
+        productClass: assignment.product_class || "",
         regionId: assignment.region_id,
         cityId: assignment.city_id,
         fullName: hideIndividualIdentity ? "" : assignment.full_name,
@@ -6419,6 +6440,7 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
             customerTypeId: "",
             customerType: "NA",
             subnetType: "NA",
+            productClass: "",
             regionId: "",
             cityId: "",
             fullName: "",
@@ -6520,6 +6542,7 @@ function filterResources(resources: ManagedResource[], query: string, filters: S
       resource.fullName,
       resource.serviceId,
       resource.serviceDescription,
+      resource.productClass,
       resource.email
     ]
       .some((value) => String(value ?? "").toLowerCase().includes(normalized))
@@ -6582,6 +6605,7 @@ const REGISTRY_EXPORT_COLUMNS: Array<{ key: string; header: string }> = [
   { key: "customerTypeId", header: "customerTypeId" },
   { key: "customerType", header: "customerType" },
   { key: "subnetType", header: "subnetType" },
+  { key: "productClass", header: "productClass" },
   { key: "regionId", header: "regionId" },
   { key: "cityId", header: "cityId" },
   { key: "fullName", header: "fullName" },
@@ -6692,6 +6716,7 @@ const RESOURCE_UTILIZATION_COLUMNS: Array<{ key: string; header: string }> = [
   { key: "customer_name", header: "Customer Name" },
   { key: "customer_type", header: "Customer Type" },
   { key: "subnet_type", header: "Subnet Type" },
+  { key: "product_class", header: "Product Class" },
   { key: "customer_account_id", header: "Customer Account ID" },
   { key: "customer_segment", header: "Customer Segment" },
   { key: "commercial_reg_id", header: "Commercial Registration ID" },
@@ -6737,6 +6762,7 @@ function registryExportRows(resources: ManagedResource[]): ResourceUtilizationRo
     customerTypeId: resource.customerTypeId,
     customerType: resource.customerType,
     subnetType: resource.subnetType,
+    productClass: resource.productClass,
     regionId: resource.regionId,
     cityId: resource.cityId,
     fullName: resource.fullName,
@@ -6944,6 +6970,7 @@ function resourceUtilizationRows(resources: ManagedResource[]): ResourceUtilizat
       customer_name: assignment?.customer_name ?? "",
       customer_type: assignment?.customer_type ?? "NA",
       subnet_type: assignment?.subnet_type ?? "NA",
+      product_class: assignment?.product_class ?? "",
       customer_account_id: assignment?.customer_account_id ?? "",
       customer_segment: assignment?.customer_segment ?? "",
       commercial_reg_id: assignment?.commercial_reg_id ?? "",

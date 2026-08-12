@@ -197,6 +197,7 @@ class AssignmentCreate(BaseModel):
     service_characteristics: str = ""
     product_specification_id: str = ""
     product_specification_name: str = ""
+    product_class: str = ""
     product_offering_id: str = ""
     product_offering_name: str = ""
     product_instance_id: str = ""
@@ -5424,6 +5425,7 @@ def assignment_payload_from_bulk_row(row: dict[str, str], network: IPv4Network, 
     customer_name = csv_value(row, "customerName", "customer_name", "organizationName", "organization_name", "fullName", "full_name")
     service_id = csv_value(row, "serviceId", "service_id", "service_instance_id")
     service_description = csv_value(row, "serviceDescription", "service_description", "service")
+    product_class = csv_value(row, "productClass", "ProductClass", "product_class", "Product Class")
     organization_id = csv_value(row, "organizationId", "organization_id")
     commercial_reg_id = csv_value(row, "commercial_reg_id", "commercialRegId", "crNumber", "cr_number")
     unified_number = csv_value(row, "unified_number", "unifiedNumber", "unifiedFacilityNumber", "unified_facility_number")
@@ -5485,6 +5487,7 @@ def assignment_payload_from_bulk_row(row: dict[str, str], network: IPv4Network, 
         service_id=service_id,
         service_instance_id=csv_value(row, "serviceInstanceId", "service_instance_id") or service_id,
         service_order_id=csv_value(row, "serviceOrderId", "service_order_id"),
+        product_class=product_class,
         siebel_order_number=csv_value(row, "siebelOrderNumber", "siebel_order_number"),
         bss_customer_id=csv_value(row, "bssCustomerId", "bss_customer_id", "customerId", "customer_id"),
         customer_id=customer_id,
