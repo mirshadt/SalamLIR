@@ -28,7 +28,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from backend.ipam_core_services.audit_service import AuditContext, AuditService
@@ -4384,6 +4384,8 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_pools_cidr ON pools (cidr);
             CREATE INDEX IF NOT EXISTS idx_assignments_cidr ON assignments (cidr);
             CREATE INDEX IF NOT EXISTS idx_assignments_customer ON assignments (customer_name);
+            CREATE INDEX IF NOT EXISTS idx_assignments_created ON assignments (created_at);
+            CREATE INDEX IF NOT EXISTS idx_assignments_status_reserved ON assignments (status, reserved_until);
 
             CREATE TABLE IF NOT EXISTS ip_resources (
               resource_uuid TEXT PRIMARY KEY,
@@ -4820,10 +4822,29 @@ def release_expired_reservations(connection: sqlite3.Connection) -> int:
 
 
 def list_assignments_from_db() -> list[Assignment]:
+    heavy_fields = {"siebel_payload_json", "service_characteristics"}
+    columns = [
+        f"'' AS {field_name}" if field_name in heavy_fields else f'"{field_name}"'
+        for field_name in Assignment.model_fields
+    ]
     with connect() as connection:
         release_expired_reservations(connection)
-        rows = connection.execute("SELECT * FROM assignments ORDER BY created_at DESC").fetchall()
+        rows = connection.execute(f"SELECT {', '.join(columns)} FROM assignments ORDER BY created_at DESC").fetchall()
     return [assignment_from_row(row) for row in rows]
+
+def list_assignment_dicts_for_response() -> list[dict]:
+    heavy_fields = {"siebel_payload_json", "service_characteristics"}
+    columns = [
+        f"'' AS {field_name}" if field_name in heavy_fields else f'"{field_name}"'
+        for field_name in Assignment.model_fields
+    ]
+    with connect() as connection:
+        release_expired_reservations(connection)
+        rows = connection.execute(f"SELECT {', '.join(columns)} FROM assignments ORDER BY created_at DESC").fetchall()
+    items = [dict(row) for row in rows]
+    for item in items:
+        item["cst_sync_ready"] = bool(item.get("cst_sync_ready"))
+    return items
 
 
 def find_pool(identifier: str | None, cidr: str | None) -> Pool:
@@ -7291,7 +7312,7 @@ def retry_failed_cst_batch(batch_id: str) -> list[CstSyncJob]:
     try:
         with connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM cst_sync_jobs WHERE batch_id = ? AND status IN ('FAILED', 'BLOCKED', 'PENDING', 'RUNNING') ORDER BY sequence_no",
+                "SELECT * FROM cst_sync_jobs WHERE batch_id = ? AND status IN ('FAILED', 'BLOCKED', 'PENDING') ORDER BY sequence_no",
                 (batch_id,),
             ).fetchall()
             if not rows:
@@ -7301,7 +7322,7 @@ def retry_failed_cst_batch(batch_id: str) -> list[CstSyncJob]:
                 """
                 UPDATE cst_sync_jobs
                 SET status = 'PENDING', last_error = '', updated_at = ?
-                WHERE batch_id = ? AND status IN ('FAILED', 'BLOCKED', 'RUNNING')
+                WHERE batch_id = ? AND status IN ('FAILED', 'BLOCKED')
                 """,
                 (now, batch_id),
             )
@@ -7309,7 +7330,7 @@ def retry_failed_cst_batch(batch_id: str) -> list[CstSyncJob]:
                 """
                 UPDATE cst_transaction_ledger
                 SET last_status = 'PENDING'
-                WHERE batch_id = ? AND last_status IN ('FAILED', 'BLOCKED', 'RUNNING')
+                WHERE batch_id = ? AND last_status IN ('FAILED', 'BLOCKED')
                 """,
                 (batch_id,),
             )
@@ -7746,9 +7767,9 @@ def join_pools(payload: JoinRequest) -> Pool:
     return joined
 
 
-@app.get("/assignments", response_model=list[Assignment])
-def list_assignments() -> list[Assignment]:
-    return list_assignments_from_db()
+@app.get("/assignments")
+def list_assignments() -> JSONResponse:
+    return JSONResponse(content=list_assignment_dicts_for_response())
 
 
 @app.get("/resources", response_model=list[ResourceWithAssignment])
