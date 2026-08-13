@@ -255,6 +255,12 @@ export type DashboardSummary = {
   assignment_records: number;
   ripe_pending: number;
   cst_pending: number;
+  salam_total_pools: number;
+  salam_total_ips: number;
+  salam_assigned_ips: number;
+  salam_assignment_records: number;
+  salam_ripe_pending: number;
+  salam_cst_pending: number;
   generated_at: string;
 };
 

@@ -2039,16 +2039,23 @@ function ExecutiveDashboard({
   currentRole: User["role"];
   onNavigate: (view: ViewKey, registryPanel?: RegistryPanelId) => void;
 }) {
-  const assignedIps = summary?.assigned_ips ?? resources
-    .filter((resource) => resource.administrativeStatus === "ASSIGNED")
-    .reduce((sum, resource) => sum + resource.totalIps, 0);
-  const totalPools = summary?.total_pools ?? stats.totalPools;
-  const totalIps = summary?.total_ips ?? stats.totalResources;
+  const [salamOnlyMetrics, setSalamOnlyMetrics] = useState(false);
+  const metricResources = salamOnlyMetrics ? resources.filter((resource) => String(resource.owner || "").trim().toLowerCase() === "salam") : resources;
+  const fallbackPools = metricResources.filter(isRegisteredSubnet);
+  const fallbackAssignments = metricResources.filter((resource) => resource.administrativeStatus === "ASSIGNED");
+  const fallbackAssignedIps = fallbackAssignments.reduce((sum, resource) => sum + resource.totalIps, 0);
+  const fallbackTotalIps = fallbackPools.reduce((sum, resource) => sum + resource.totalIps, 0);
+  const fallbackTotalPools = fallbackPools.length;
+  const assignedIps = salamOnlyMetrics ? summary?.salam_assigned_ips ?? fallbackAssignedIps : summary?.assigned_ips ?? fallbackAssignedIps;
+  const assignmentRecords = salamOnlyMetrics ? summary?.salam_assignment_records ?? fallbackAssignments.length : summary?.assignment_records ?? assignmentTotal;
+  const totalPools = salamOnlyMetrics ? summary?.salam_total_pools ?? fallbackTotalPools : summary?.total_pools ?? stats.totalPools;
+  const totalIps = salamOnlyMetrics ? summary?.salam_total_ips ?? fallbackTotalIps : summary?.total_ips ?? stats.totalResources;
   const availableIps = Math.max(totalIps - assignedIps, 0);
   const utilization = totalIps ? round1((assignedIps / totalIps) * 100) : 0;
-  const ripePending = summary?.ripe_pending ?? resources.filter((resource) => ["PENDING", "FAILED", "DECOMMISSION_PENDING"].includes(resource.ripeSyncStatus)).length;
-  const cstPending = summary?.cst_pending ?? cstSummary?.pending_jobs ?? resources.filter((resource) => resource.cstSyncStatus === "PENDING").length;
+  const ripePending = salamOnlyMetrics ? summary?.salam_ripe_pending ?? metricResources.filter((resource) => ["PENDING", "FAILED", "DECOMMISSION_PENDING"].includes(resource.ripeSyncStatus)).length : summary?.ripe_pending ?? resources.filter((resource) => ["PENDING", "FAILED", "DECOMMISSION_PENDING"].includes(resource.ripeSyncStatus)).length;
+  const cstPending = salamOnlyMetrics ? summary?.salam_cst_pending ?? metricResources.filter((resource) => resource.cstSyncStatus === "PENDING").length : summary?.cst_pending ?? cstSummary?.pending_jobs ?? resources.filter((resource) => resource.cstSyncStatus === "PENDING").length;
   const criticalConflicts = stats.integrityIssues;
+  const metricScopeLabel = salamOnlyMetrics ? "Salam only" : "All owners";
   const workflowTileDefinitions: Array<{
     title: string;
     detail: string;
@@ -2060,7 +2067,7 @@ function ExecutiveDashboard({
     adminOnly?: boolean;
   }> = [
     { title: "Resource Registry", detail: "Browse allocated pools, child pools, available blocks, assignments, and RIPE-discovered roots.", status: `${totalPools} registered subnets`, accent: "cyan", icon: <Database className="h-5 w-5" />, view: "registry", registryPanel: "subnet-navigator" },
-    { title: "Assignment Management", detail: "Assign, reserve, release, and retire customer or internal subnet resources.", status: `${assignmentTotal} active assignments`, accent: "green", icon: <Users className="h-5 w-5" />, view: "assignments" },
+    { title: "Assignment Management", detail: "Assign, reserve, release, and retire customer or internal subnet resources.", status: `${assignmentRecords} active assignments`, accent: "green", icon: <Users className="h-5 w-5" />, view: "assignments" },
     { title: "Global Search", detail: "Find resources by CIDR, UUID, transaction ID, owner, netname, or status.", status: "CIDR and transaction lookup", accent: "slate", icon: <Search className="h-5 w-5" />, view: "search" },
     { title: "RIPE Discovery", detail: "Discover RIPE root pools maintained by Salam and sync them into the local LIR registry.", status: "Maintainer discovery", accent: "blue", icon: <Radar className="h-5 w-5" />, view: "registry", registryPanel: "lir-discovery" },
     { title: "RIPE Sync Worklist", detail: "Review pending RIPE create/delete work items, failures, and retry actions.", status: `${ripePending} pending or failed`, accent: ripePending ? "amber" : "green", icon: <ListTree className="h-5 w-5" />, view: "registry", registryPanel: "ripe-worklist" },
@@ -2074,11 +2081,31 @@ function ExecutiveDashboard({
 
   return (
     <div className="grid gap-5">
-      <section className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-        <HomeMetric label="Available IPs" value={formatHosts(availableIps)} detail="Free capacity ready for assignment" tone="cyan" emphasis />
-        <HomeMetric label="Assigned IPs" value={formatHosts(assignedIps)} detail={`${assignmentTotal} active assignment records`} tone="green" emphasis />
-        <HomeMetric label="Utilization" value={`${utilization}%`} detail={`${formatHosts(assignedIps)} of ${formatHosts(totalIps)} IPs used`} tone={utilization >= 85 ? "amber" : "violet"} progress={utilization} emphasis />
-        <HomeMetric label="Total Pool Size" value={formatHosts(totalIps)} detail={`${totalPools} allocated pool${totalPools === 1 ? "" : "s"}`} tone="cyan" emphasis />
+      <section className="grid gap-3">
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border bg-card p-3">
+          <div>
+            <p className="text-sm font-semibold">Dashboard metrics scope</p>
+            <p className="text-xs text-muted-foreground">Currently showing {metricScopeLabel} capacity and sync counts.</p>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={salamOnlyMetrics}
+            className={cn("flex items-center gap-3 rounded-md border px-3 py-2 text-sm font-semibold transition", salamOnlyMetrics ? "border-primary/50 bg-primary/10 text-primary" : "bg-muted/20 text-muted-foreground hover:bg-muted/35 hover:text-foreground")}
+            onClick={() => setSalamOnlyMetrics((current) => !current)}
+          >
+            <span>Include only Salam</span>
+            <span className={cn("relative h-5 w-9 rounded-full border transition", salamOnlyMetrics ? "border-primary bg-primary" : "border-border bg-muted")}>
+              <span className={cn("absolute top-1/2 h-3.5 w-3.5 -translate-y-1/2 rounded-full bg-background shadow transition", salamOnlyMetrics ? "left-5" : "left-1")} />
+            </span>
+          </button>
+        </div>
+        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+          <HomeMetric label="Available IPs" value={formatHosts(availableIps)} detail={`${metricScopeLabel} free capacity ready for assignment`} tone="cyan" emphasis />
+          <HomeMetric label="Assigned IPs" value={formatHosts(assignedIps)} detail={`${assignmentRecords} active assignment records`} tone="green" emphasis />
+          <HomeMetric label="Utilization" value={`${utilization}%`} detail={`${formatHosts(assignedIps)} of ${formatHosts(totalIps)} IPs used`} tone={utilization >= 85 ? "amber" : "violet"} progress={utilization} emphasis />
+          <HomeMetric label="Total Pool Size" value={formatHosts(totalIps)} detail={`${totalPools} allocated pool${totalPools === 1 ? "" : "s"}`} tone="cyan" emphasis />
+        </div>
       </section>
 
       <section className="grid gap-3">

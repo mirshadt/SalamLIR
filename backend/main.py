@@ -911,6 +911,12 @@ class DashboardSummary(BaseModel):
     assignment_records: int = 0
     ripe_pending: int = 0
     cst_pending: int = 0
+    salam_total_pools: int = 0
+    salam_total_ips: int = 0
+    salam_assigned_ips: int = 0
+    salam_assignment_records: int = 0
+    salam_ripe_pending: int = 0
+    salam_cst_pending: int = 0
     generated_at: str
 
 class CstSyncBatch(BaseModel):
@@ -6014,6 +6020,7 @@ def login(payload: LoginRequest) -> LoginResponse:
 def dashboard_summary() -> DashboardSummary:
     with connect() as connection:
         release_expired_reservations(connection)
+        refresh_ip_resource_pool_owners(connection)
         pool_row = connection.execute("SELECT COUNT(*) AS count, COALESCE(SUM(size), 0) AS total_ips FROM pools").fetchone()
         assignment_records = int(connection.execute("SELECT COUNT(*) FROM assignments WHERE status NOT IN ('Retiring')").fetchone()[0] or 0)
         assigned_ips = int(connection.execute("SELECT COALESCE(SUM(size), 0) FROM assignments WHERE status NOT IN ('Reserved', 'Planned', 'Retiring')").fetchone()[0] or 0)
@@ -6030,6 +6037,46 @@ def dashboard_summary() -> DashboardSummary:
             """
         ).fetchone()[0] or 0)
         cst_pending = int(connection.execute("SELECT COUNT(*) FROM cst_sync_jobs WHERE status IN ('PENDING', 'RUNNING')").fetchone()[0] or 0)
+        salam_pool_row = connection.execute(
+            """
+            SELECT COUNT(*) AS count, COALESCE(SUM(size), 0) AS total_ips
+            FROM ip_resources
+            WHERE owner = 'Salam'
+              AND source_entity_type = 'pool'
+              AND status != 'RETIRED'
+            """
+        ).fetchone()
+        salam_assignment_row = connection.execute(
+            """
+            SELECT COUNT(*) AS count, COALESCE(SUM(size), 0) AS assigned_ips
+            FROM ip_resources
+            WHERE owner = 'Salam'
+              AND source_entity_type = 'assignment'
+              AND status NOT IN ('RESERVED', 'RETIRED')
+            """
+        ).fetchone()
+        salam_ripe_pending = int(connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM ip_resources
+            WHERE owner = 'Salam'
+              AND ip_type = 'PUBLIC'
+              AND status != 'RETIRED'
+              AND (
+                source_entity_type = 'pool'
+                OR ripe_sync_status IN ('PENDING', 'FAILED', 'DECOMMISSION_PENDING')
+              )
+            """
+        ).fetchone()[0] or 0)
+        salam_cst_pending = int(connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM cst_sync_jobs j
+            INNER JOIN ip_resources r ON r.resource_uuid = j.resource_uuid
+            WHERE r.owner = 'Salam'
+              AND j.status IN ('PENDING', 'RUNNING')
+            """
+        ).fetchone()[0] or 0)
     return DashboardSummary(
         total_pools=int(pool_row["count"] or 0),
         total_ips=int(pool_row["total_ips"] or 0),
@@ -6037,6 +6084,12 @@ def dashboard_summary() -> DashboardSummary:
         assignment_records=assignment_records,
         ripe_pending=ripe_pending,
         cst_pending=cst_pending,
+        salam_total_pools=int(salam_pool_row["count"] or 0),
+        salam_total_ips=int(salam_pool_row["total_ips"] or 0),
+        salam_assigned_ips=int(salam_assignment_row["assigned_ips"] or 0),
+        salam_assignment_records=int(salam_assignment_row["count"] or 0),
+        salam_ripe_pending=salam_ripe_pending,
+        salam_cst_pending=salam_cst_pending,
         generated_at=now_iso(),
     )
 
