@@ -403,6 +403,7 @@ class BulkCsvRequest(BaseModel):
     csv_text: str
     file_name: str = ""
     allocated_pool: bool = False
+    allow_conflicts: bool = False
 
 
 class BulkOutputRow(BaseModel):
@@ -7674,14 +7675,14 @@ def fail_bulk_batch(batch_id: str, error: Exception, started: float) -> None:
         record_audit(connection, "Bulk Transaction Failed", "bulk_batch", batch_id, "", str(error))
 
 
-def run_bulk_batch(batch_id: str, operation_type: str, csv_text: str, allocated_pool: bool = False) -> None:
+def run_bulk_batch(batch_id: str, operation_type: str, csv_text: str, allocated_pool: bool = False, allow_conflicts: bool = False) -> None:
     started = time.perf_counter()
     try:
         with DB_WRITE_LOCK:
             if operation_type == "POOL_IMPORT":
                 result = process_pool_bulk(csv_text, allocated_pool=allocated_pool)
             elif operation_type == "ASSIGNMENT_IMPORT":
-                result = process_assignment_bulk(csv_text)
+                result = process_assignment_bulk(csv_text, allow_conflicts=allow_conflicts)
             else:
                 raise ValueError(f"Unsupported bulk operation type: {operation_type}")
         complete_bulk_batch(batch_id, result, started)
@@ -8860,7 +8861,7 @@ def add_assignment(payload: AssignmentCreate) -> Assignment:
 
 
 
-def process_assignment_bulk(csv_text: object) -> BulkImportResult:
+def process_assignment_bulk(csv_text: object, allow_conflicts: bool = False) -> BulkImportResult:
     imported = 0
     errors: list[str] = []
     output_rows: list[BulkOutputRow] = []
@@ -8888,7 +8889,7 @@ def process_assignment_bulk(csv_text: object) -> BulkImportResult:
                 try:
                     assignment_payload = assignment_payload_from_bulk_row(row, network, assignment_status_id, assignment_status, index)
                     validate_cst_lir_assignment(assignment_payload)
-                    overlap_assignments = validate_assignment(network, allow_overlap=True)
+                    overlap_assignments = validate_assignment(network, allow_overlap=allow_conflicts)
                     assignment = assignment_from_network(network, assignment_payload)
                     conflict_errors: list[str] = []
                     exact_overlap_conflict = False
@@ -9029,7 +9030,7 @@ def process_assignment_bulk(csv_text: object) -> BulkImportResult:
 @app.post("/assignments/bulk", response_model=BulkBatch, status_code=202)
 def bulk_add_assignments(payload: BulkCsvRequest, background_tasks: BackgroundTasks) -> BulkBatch:
     batch = create_bulk_batch("ASSIGNMENT_IMPORT", payload)
-    background_tasks.add_task(run_bulk_batch, batch.id, batch.operation_type, payload.csv_text)
+    background_tasks.add_task(run_bulk_batch, batch.id, batch.operation_type, payload.csv_text, False, payload.allow_conflicts)
     return batch
 
 

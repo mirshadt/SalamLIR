@@ -872,6 +872,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   const [mergeForm, setMergeForm] = useState({ leftPoolId: "", rightPoolId: "", leftSearch: "", rightSearch: "" });
   const [bulkPoolCsv, setBulkPoolCsv] = useState(BULK_SUBNET_TEMPLATE);
   const [bulkPoolAllocated, setBulkPoolAllocated] = useState(false);
+  const [bulkAssignmentAllowConflicts, setBulkAssignmentAllowConflicts] = useState(false);
   const [bulkAssignmentCsv, setBulkAssignmentCsv] = useState(CST_BULK_ASSIGNMENT_TEMPLATE);
   const [ripeConfigForm, setRipeConfigForm] = useState<RipeConfigPayload>({ base_url: "https://rest.db.ripe.net", auth_type: "Basic Authentication", username: "", password: "", connection_timeout: 10, read_timeout: 30, default_maintainer: "ITC-NOC-MNT" });
   const [siebelConfigForm, setSiebelConfigForm] = useState<SiebelConfigPayload>({ username: "LIR_USER", password: "", dsn: "172.31.23.101:1525/SIDB", connection_timeout: 10, query_sql: DEFAULT_SIEBEL_QUERY });
@@ -1764,6 +1765,7 @@ ${errorMessage(error)}`
                 poolFileName={bulkPoolFileName}
                 assignmentFileName={bulkAssignmentFileName}
                 poolAllocated={bulkPoolAllocated}
+                assignmentAllowConflicts={bulkAssignmentAllowConflicts}
                 batches={bulkBatches}
                 isRefreshing={bulkBatchesQuery.isFetching}
                 onPoolCsv={setBulkPoolCsv}
@@ -1771,13 +1773,14 @@ ${errorMessage(error)}`
                 onPoolFileName={setBulkPoolFileName}
                 onAssignmentFileName={setBulkAssignmentFileName}
                 onPoolAllocated={setBulkPoolAllocated}
+                onAssignmentAllowConflicts={setBulkAssignmentAllowConflicts}
                 onRefresh={() => void bulkBatchesQuery.refetch()}
                 onImportPools={() => run(async () => {
                   const { data } = await api.post<BulkBatch>("/pools/bulk", { csv_text: bulkPoolCsv, file_name: bulkPoolFileName, allocated_pool: bulkPoolAllocated });
                   setNotice({ title: "Bulk transaction started", detail: `${data.id} is processing ${data.total_rows} subnet rows. Track status in Bulk Transaction History.` });
                 })}
                 onImportAssignments={() => run(async () => {
-                  const { data } = await api.post<BulkBatch>("/assignments/bulk", { csv_text: bulkAssignmentCsv, file_name: bulkAssignmentFileName });
+                  const { data } = await api.post<BulkBatch>("/assignments/bulk", { csv_text: bulkAssignmentCsv, file_name: bulkAssignmentFileName, allow_conflicts: bulkAssignmentAllowConflicts });
                   setNotice({ title: "Bulk transaction started", detail: `${data.id} is processing ${data.total_rows} assignment rows. Track status in Bulk Transaction History.` });
                 })}
               />
@@ -3817,6 +3820,7 @@ function BulkOperations(props: {
   poolFileName: string;
   assignmentFileName: string;
   poolAllocated: boolean;
+  assignmentAllowConflicts: boolean;
   batches: BulkBatch[];
   isRefreshing: boolean;
   onPoolCsv: (value: string) => void;
@@ -3824,6 +3828,7 @@ function BulkOperations(props: {
   onPoolFileName: (value: string) => void;
   onAssignmentFileName: (value: string) => void;
   onPoolAllocated: (value: boolean) => void;
+  onAssignmentAllowConflicts: (value: boolean) => void;
   onRefresh: () => void;
   onImportPools: () => void;
   onImportAssignments: () => void;
@@ -3902,6 +3907,12 @@ function BulkOperations(props: {
             <p className="text-sm text-muted-foreground">
               {props.assignmentCsv ? `${props.assignmentCsv.split(/\r?\n/).filter(Boolean).length - 1} data rows loaded${props.assignmentFileName ? ` from ${props.assignmentFileName}` : ""}` : "No file loaded"}
             </p>
+            <ToggleSwitch
+              label="Conflict / Overlap Handling: Reject Conflicts / Allow Conflicts"
+              description={props.assignmentAllowConflicts ? "Allow Conflicts: overlapping records are imported, flagged in results, and kept blocked from CST until resolved." : "Reject Conflicts: overlapping records are blocked and listed in the error report with the existing resource."}
+              checked={props.assignmentAllowConflicts}
+              onChange={props.onAssignmentAllowConflicts}
+            />
             <div className="rounded-md border bg-muted/20 p-3">
               <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
                 <div>
