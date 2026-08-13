@@ -1012,6 +1012,11 @@ export async function getAssignments() {
   return data;
 }
 
+export async function getRegistryCoverageAssignments() {
+  const { data } = await api.get<Assignment[]>("/assignments", { timeout: 15 * 60 * 1000 });
+  return data;
+}
+
 
 export async function getAssignmentsPage(params: AssignmentPageParams = {}) {
   const { data } = await api.get<AssignmentPage>("/assignments/page", { params });

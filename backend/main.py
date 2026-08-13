@@ -2353,6 +2353,21 @@ def ensure_cst_config(connection: sqlite3.Connection) -> CstConfig:
 def resource_requires_cst(resource: ResourceRecord) -> bool:
     return resource.ip_type == "PUBLIC" and resource.status != "RETIRED"
 
+def repair_public_unassigned_cst_status(connection: sqlite3.Connection) -> int:
+    cursor = connection.execute(
+        """
+        UPDATE ip_resources
+        SET cst_sync_status = 'PENDING',
+            action_flag = CASE WHEN COALESCE(action_flag, '') = '' THEN 'N' ELSE action_flag END,
+            updated_at = ?
+        WHERE ip_type = 'PUBLIC'
+          AND assignment_status_id = 1
+          AND status != 'RETIRED'
+          AND COALESCE(cst_sync_status, '') IN ('', 'NOT_REQUIRED', 'NOT_CONFIGURED')
+        """,
+        (now_iso(),),
+    )
+    return int(cursor.rowcount or 0)
 
 def cst_integrity_conflict_blocks_push(status: object) -> bool:
     normalized = str(status or "").strip().upper()
@@ -4822,7 +4837,7 @@ def init_db() -> None:
         connection.execute("UPDATE assignments SET cst_sync_status = 'PENDING', action_flag = 'U' WHERE cst_sync_status = 'BLOCKED'")
         connection.execute("UPDATE cst_sync_batches SET status = 'PENDING', blocked_jobs = 0 WHERE status = 'BLOCKED' OR blocked_jobs > 0")
         connection.execute("UPDATE ip_resources SET cst_sync_status = 'NOT_REQUIRED', ripe_sync_status = 'NOT_REQUIRED', action_flag = 'N' WHERE ip_type = 'PRIVATE'")
-        connection.execute("UPDATE ip_resources SET cst_sync_status = 'PENDING', action_flag = CASE WHEN COALESCE(action_flag, '') = '' THEN 'N' ELSE action_flag END WHERE ip_type = 'PUBLIC' AND assignment_status_id = 1 AND status != 'RETIRED' AND cst_sync_status = 'NOT_REQUIRED'")
+        repair_public_unassigned_cst_status(connection)
         connection.execute("UPDATE assignments SET cst_sync_status = 'NOT_REQUIRED', ripe_sync_status = 'NOT_REQUIRED', action_flag = 'N' WHERE id IN (SELECT source_entity_id FROM ip_resources WHERE source_entity_type = 'assignment' AND ip_type = 'PRIVATE')")
         connection.execute("UPDATE cst_sync_jobs SET status = 'NOT_REQUIRED', last_error = '', response_json = ? WHERE status IN ('PENDING', 'RUNNING') AND resource_uuid IN (SELECT resource_uuid FROM ip_resources WHERE ip_type = 'PRIVATE')", (json.dumps({"externalApiCalled": False, "accepted": True, "message": "Private IP range is excluded from CST synchronization"}, sort_keys=True),))
 
@@ -6978,6 +6993,7 @@ def cst_migration_review_items(connection: sqlite3.Connection, request: CstMigra
 
 def cst_migration_resource_rows(connection: sqlite3.Connection, payload: CstManualMigrationRequest) -> tuple[list[ResourceRecord], int]:
     materialize_bulk_unassigned_fragments(connection)
+    repair_public_unassigned_cst_status(connection)
     resource_scope = normalize_cst_resource_scope(payload.resource_scope)
     filters = [
         "r.ip_type = 'PUBLIC'",
@@ -6985,6 +7001,7 @@ def cst_migration_resource_rows(connection: sqlite3.Connection, payload: CstManu
         """
         (
           r.source_entity_type != 'pool'
+          OR r.cidr_role != 'ROOT_POOL'
           OR NOT EXISTS (
             SELECT 1
             FROM ip_resources child

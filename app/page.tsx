@@ -61,8 +61,8 @@ import {
   DatabaseConnectionPayload,
   DatabaseConnectionStatus,
   DashboardSummary,
-  getAssignments,
   getAssignmentsPage,
+  getRegistryCoverageAssignments,
   getAuditEvents,
   getBulkBatches,
   getConflicts,
@@ -948,7 +948,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
     enabled: assignmentPageNeeded,
     ...liveQueryOptions
   });
-  const registryAssignmentsQuery = useQuery({ queryKey: ["assignments", "registry-coverage"], queryFn: getAssignments, enabled: registryCoverageNeeded, ...liveQueryOptions });
+  const registryAssignmentsQuery = useQuery({ queryKey: ["assignments", "registry-coverage"], queryFn: getRegistryCoverageAssignments, enabled: registryCoverageNeeded, ...liveQueryOptions });
   const dashboardSummaryQuery = useQuery({ queryKey: ["dashboard-summary"], queryFn: getDashboardSummary, ...liveQueryOptions });
   const conflictsQuery = useQuery({ queryKey: ["conflicts"], queryFn: getConflicts, ...liveQueryOptions });
   const auditQuery = useQuery({ queryKey: ["audit"], queryFn: getAuditEvents, ...liveQueryOptions });
@@ -1343,6 +1343,9 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                   void conflictsQuery.refetch();
                 }}
                 navigatorRefreshing={poolsQuery.isFetching || registryAssignmentsQuery.isFetching}
+                assignmentCoverageCount={registryAssignments.length}
+                assignmentCoverageLoading={registryAssignmentsQuery.isFetching}
+                assignmentCoverageError={registryAssignmentsQuery.isError && registryAssignmentsQuery.data === undefined}
                 ripeDiscoveryResult={ripeDiscoveryResult}
                 ripeDiscoveryStatus={ripeDiscoveryStatus}
                 ripeDiscoveryActionKey={ripeDiscoveryActionKey}
@@ -2188,6 +2191,9 @@ function ResourceRegistry(props: {
   onRefresh: () => void;
   onRefreshNavigator: () => void;
   navigatorRefreshing: boolean;
+  assignmentCoverageCount: number;
+  assignmentCoverageLoading: boolean;
+  assignmentCoverageError: boolean;
   onDiscoverRipePools: () => void;
   onSyncRipePool: (pool: RipeDiscoveredRootPool) => void;
   onSyncCstLir: (pool: RipeDiscoveredRootPool) => void;
@@ -2254,7 +2260,7 @@ function ResourceRegistry(props: {
 
       {activeRegistryPanel === "cst-sync-monitor" ? <CstIntegrationMonitor {...props} /> : null}
 
-      {activeRegistryPanel === "subnet-navigator" ? <SubnetNavigator resources={visible} query={props.globalSearch} isRefreshing={props.navigatorRefreshing} onQuery={props.onGlobalSearch} onRefresh={props.onRefreshNavigator} onOpen={props.onOpen} /> : null}
+      {activeRegistryPanel === "subnet-navigator" ? <SubnetNavigator resources={visible} query={props.globalSearch} isRefreshing={props.navigatorRefreshing} assignmentCoverageCount={props.assignmentCoverageCount} assignmentCoverageLoading={props.assignmentCoverageLoading} assignmentCoverageError={props.assignmentCoverageError} onQuery={props.onGlobalSearch} onRefresh={props.onRefreshNavigator} onOpen={props.onOpen} /> : null}
     </div>
   );
 }
@@ -2521,6 +2527,9 @@ function SubnetNavigator({
   resources,
   query,
   isRefreshing = false,
+  assignmentCoverageCount = 0,
+  assignmentCoverageLoading = false,
+  assignmentCoverageError = false,
   onQuery,
   onRefresh,
   onOpen
@@ -2528,6 +2537,9 @@ function SubnetNavigator({
   resources: ManagedResource[];
   query?: string;
   isRefreshing?: boolean;
+  assignmentCoverageCount?: number;
+  assignmentCoverageLoading?: boolean;
+  assignmentCoverageError?: boolean;
   onQuery?: (value: string) => void;
   onRefresh: () => void;
   onOpen: (resource: ManagedResource) => void;
@@ -2540,7 +2552,12 @@ function SubnetNavigator({
       <CardHeader>
         <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <div>
-            <CardTitle>Subnet Navigator</CardTitle>
+            <div className="flex flex-wrap items-center gap-2">
+              <CardTitle>Subnet Navigator</CardTitle>
+              <Badge variant={assignmentCoverageError ? "danger" : assignmentCoverageLoading ? "warning" : "success"}>
+                {assignmentCoverageError ? "Assignment coverage failed" : assignmentCoverageLoading ? "Loading assignment coverage" : `${assignmentCoverageCount} assignments loaded`}
+              </Badge>
+            </div>
             <CardDescription>Only allocated pools are shown here. Select a row to drill into the common Resource Summary page.</CardDescription>
           </div>
           <div className="flex flex-col gap-2 md:flex-row md:items-center">
@@ -2940,6 +2957,7 @@ function AssignmentManagement(props: {
   const [workflow, setWorkflow] = useState<AssignmentWorkflow>("assign");
   const [partialAssignmentId, setPartialAssignmentId] = useState("");
   const [partialCidr, setPartialCidr] = useState("");
+  const [resourceSearch, setResourceSearch] = useState("");
   const available = presentationResources(props.resources).filter((resource) => resource.administrativeStatus === "AVAILABLE" && resource.type === "Subnet");
   const parentPoolMatches = filterResources(available, props.poolDraft.poolSearch);
   const assignmentSummary = assignmentDraftSummary(props.form, props.poolDraft, props.resources);
@@ -2959,11 +2977,43 @@ function AssignmentManagement(props: {
   const filteredAssignments = props.assignments;
   const resourceByAssignmentId = new Map(props.resources.map((resource) => [resource.source && "customer_name" in resource.source ? resource.source.id : "", resource]));
   const resourceByCidr = new Map(props.resources.map((resource) => [resource.cidr, resource]));
+  const resourceSearchResults = filterResources(presentationResources(props.resources), resourceSearch).sort((left, right) => left.startNumber - right.startNumber || left.prefix - right.prefix || resourceTypeLabel(left).localeCompare(resourceTypeLabel(right)));
+  const visibleResourceSearchResults = resourceSearchResults.slice(0, 100);
   const openAssignmentSummary = (assignment: Assignment) => {
     const resource = resourceByAssignmentId.get(assignment.id) ?? resourceByCidr.get(assignment.cidr);
     if (resource) {
       props.onOpen(resource);
     }
+  };
+
+  const assignmentForSearchResource = (resource: ManagedResource) => {
+    if (resource.source && "customer_name" in resource.source) {
+      return resource.source;
+    }
+    return props.assignments.find((assignment) => assignment.id === resource.sourceUuid || assignment.cidr === resource.cidr) ?? null;
+  };
+
+  const selectResourceForAssignment = (resource: ManagedResource) => {
+    setWorkflow("assign");
+    if (resource.source && !("customer_name" in resource.source)) {
+      updatePoolDraft({ selectionMode: "subnet", parentPoolId: resource.id, poolSearch: resource.cidr, startIp: resource.startIp, endIp: resource.endIp, prefix: String(resource.prefix) });
+    } else {
+      updatePoolDraft({ selectionMode: "range", parentPoolId: "", poolSearch: resource.cidr, startIp: resource.startIp, endIp: resource.endIp, prefix: String(resource.prefix) });
+    }
+    props.onForm({ ...props.form, cidr: "", assignment_date: props.form.assignment_date || today() });
+  };
+
+  const renderResourceSearchActions = (resource: ManagedResource) => {
+    const assignment = assignmentForSearchResource(resource);
+    const canAssignResource = (resource.administrativeStatus === "AVAILABLE" || resource.administrativeStatus === "RESERVED") && resource.type === "Subnet";
+    return (
+      <div className="flex min-w-[220px] flex-wrap justify-end gap-2">
+        {canAssignResource ? <Button size="sm" variant="secondary" onClick={() => selectResourceForAssignment(resource)}>Use for Assign</Button> : null}
+        {assignment ? <Button size="sm" variant="secondary" onClick={() => selectPartialAssignment(assignment)}>Partial</Button> : null}
+        {assignment ? <Button size="sm" variant="destructive" onClick={() => props.onRelease(assignment)}>Unassign</Button> : null}
+        {!canAssignResource && !assignment ? <span className="text-xs text-muted-foreground">Open summary</span> : null}
+      </div>
+    );
   };
 
   const openWorkflow = (nextWorkflow: AssignmentWorkflow) => {
@@ -3073,6 +3123,37 @@ function AssignmentManagement(props: {
         <Textarea value={props.form.notes} onChange={(event) => update("notes", event.target.value)} placeholder="Assignment notes" />
       </div>
     </div>
+  );
+
+  const renderEmbeddedGlobalSearch = () => (
+    <Card>
+      <CardHeader>
+        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+          <div>
+            <CardTitle>Global IP Search</CardTitle>
+            <CardDescription>Search all registry IP resources before choosing Assign, Unassign, or Partial Reassign.</CardDescription>
+          </div>
+          <Button variant="outline" onClick={() => exportGlobalSearchResults(resourceSearchResults)} disabled={!resourceSearchResults.length}>
+            <FileDown className="h-4 w-4" />
+            Export CSV
+          </Button>
+        </div>
+      </CardHeader>
+      <CardContent className="grid gap-3">
+        <div className="grid gap-3 rounded-md border bg-muted/20 p-3 md:grid-cols-[minmax(0,1fr)_auto] md:items-end">
+          <label className="grid gap-1">
+            <span className="text-xs font-medium text-muted-foreground">Search IP resources</span>
+            <Input value={resourceSearch} onChange={(event) => setResourceSearch(event.target.value)} placeholder="Search IP, CIDR, resource ID, transaction, customer, service, owner, status" />
+          </label>
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge variant="muted">{resourceSearchResults.length} match{resourceSearchResults.length === 1 ? "" : "es"}</Badge>
+            {resourceSearch ? <Button type="button" variant="outline" onClick={() => setResourceSearch("")}>Clear</Button> : null}
+          </div>
+        </div>
+        <GlobalSearchResultsTable resources={visibleResourceSearchResults} onOpen={props.onOpen} scope="assignment-global-search" actions={renderResourceSearchActions} />
+        {resourceSearchResults.length > visibleResourceSearchResults.length ? <p className="text-xs text-muted-foreground">Showing first {visibleResourceSearchResults.length} of {resourceSearchResults.length} matching resources. Narrow the search for more precise actions.</p> : null}
+      </CardContent>
+    </Card>
   );
 
   const renderAssignmentForm = () => (
@@ -3248,7 +3329,8 @@ function AssignmentManagement(props: {
 
   return (
     <div className="grid gap-5">
-      <PageTitle title="Assignment Management" description="Choose one assignment workflow, then complete it in a focused page." />
+      <PageTitle title="Assignment Management" description="Search IP resources first, then choose Assign, Unassign, or Partial Reassign." />
+      {renderEmbeddedGlobalSearch()}
       <div className="grid gap-3 lg:grid-cols-3">
         {workflowTiles.map((tile) => {
           const Icon = tile.icon;
@@ -4326,39 +4408,93 @@ function GlobalSearch({
           <CardDescription>{results.length} matching resources. Select any result to open the Resource Summary page.</CardDescription>
         </CardHeader>
         <CardContent>
-          <div className="grid max-h-[560px] gap-2 overflow-auto rounded-md border p-2">
-            {results.map((resource, resourceIndex) => {
-              const assignedCustomer = assignedResourceCustomerLabel(resource);
-              const assignedService = assignedResourceServiceLabel(resource);
-              return (
-                <button key={resourceKey(resource, resourceIndex, "global-search")} className="flex flex-wrap items-start justify-between gap-3 rounded-md border bg-muted/20 p-3 text-left hover:border-primary/70" onClick={() => onOpen(resource)}>
-                  <span className="min-w-0 flex-1">
-                    <span className="block font-semibold">{resource.cidr}</span>
-                    <span className="text-sm text-muted-foreground">{resource.uuid} / {resource.transactionId} / {resource.netname}</span>
-                    {isAssignedSearchResource(resource) ? (
-                      <span className="mt-2 grid gap-1 text-xs text-muted-foreground sm:grid-cols-2">
-                        <span className="min-w-0">
-                          <span className="font-semibold text-foreground">Customer: </span>
-                          <span className="break-words">{assignedCustomer || "-"}</span>
-                        </span>
-                        <span className="min-w-0">
-                          <span className="font-semibold text-foreground">Service: </span>
-                          <span className="break-words">{assignedService || "-"}</span>
-                        </span>
-                      </span>
-                    ) : null}
-                  </span>
-                  <span className="flex flex-wrap items-center justify-end gap-2">
-                    <Badge variant={badgeForResource(resource)}>{resource.status}</Badge>
-                    <Badge variant={resource.cstSyncStatus === "SUCCESS" || resource.cstSyncStatus === "SYNCHRONIZED" ? "success" : resource.cstSyncStatus === "FAILED" ? "danger" : resource.cstSyncStatus === "PENDING" || resource.cstSyncStatus === "RUNNING" ? "warning" : "muted"}>CST {resource.cstSyncStatus || "-"}</Badge>
-                  </span>
-                </button>
-              );
-            })}
-            {!results.length ? <p className="p-3 text-sm text-muted-foreground">No matching resources.</p> : null}
-          </div>
+          <GlobalSearchResultsTable resources={results} onOpen={onOpen} scope="global-search" />
         </CardContent>
       </Card>
+    </div>
+  );
+}
+
+function GlobalSearchResultsTable({
+  resources,
+  onOpen,
+  scope,
+  actions,
+  empty = "No matching resources."
+}: {
+  resources: ManagedResource[];
+  onOpen: (resource: ManagedResource) => void;
+  scope: string;
+  actions?: (resource: ManagedResource) => React.ReactNode;
+  empty?: string;
+}) {
+  return (
+    <div className="max-h-[560px] overflow-auto rounded-md border">
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead>CIDR</TableHead>
+            <TableHead>Range</TableHead>
+            <TableHead>Type</TableHead>
+            <TableHead>Owner / Customer</TableHead>
+            <TableHead>Status</TableHead>
+            <TableHead>Sync</TableHead>
+            <TableHead>Service / Transaction</TableHead>
+            <TableHead>Location</TableHead>
+            <TableHead>Updated</TableHead>
+            {actions ? <TableHead /> : null}
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {resources.map((resource, resourceIndex) => {
+            const owner = assignedResourceCustomerLabel(resource) || resource.organizationName || resource.fullName || resource.owner || "-";
+            const service = assignedResourceServiceLabel(resource) || resource.serviceId || resource.serviceDescription || "-";
+            const location = [resource.regionId ? `Region ${resource.regionId}` : "", resource.cityId ? `City ${resource.cityId}` : ""].filter(Boolean).join(" / ") || resource.country || resource.maintainer || "-";
+            const rowActions = actions?.(resource);
+            return (
+              <TableRow key={resourceKey(resource, resourceIndex, scope)}>
+                <TableCell className="min-w-[180px]">
+                  <button type="button" className="text-left font-semibold text-sky-300 underline-offset-2 hover:underline" onClick={() => onOpen(resource)} title="Open Resource Summary">
+                    {resource.cidr}
+                  </button>
+                  <p className="break-all text-xs text-muted-foreground">{resource.uuid}</p>
+                </TableCell>
+                <TableCell className="min-w-[190px] text-xs text-muted-foreground">{resource.startIp} - {resource.endIp}</TableCell>
+                <TableCell>
+                  <ResourceTypeBadge resource={resource} />
+                  <p className="mt-1 text-xs text-muted-foreground">{resource.classification}</p>
+                </TableCell>
+                <TableCell className="min-w-[200px]">
+                  <p className="font-medium">{owner}</p>
+                  <p className="text-xs text-muted-foreground">{resource.netname || resource.description || "-"}</p>
+                </TableCell>
+                <TableCell>
+                  <Badge variant={badgeForResource(resource)}>{resource.administrativeStatus}</Badge>
+                  <p className="mt-1 text-xs text-muted-foreground">{resource.operationType || resource.status}</p>
+                </TableCell>
+                <TableCell className="min-w-[150px]">
+                  <div className="flex flex-wrap gap-1">
+                    <Badge variant={resource.ripeSyncStatus === "FAILED" ? "danger" : resource.ripeSyncStatus === "PENDING" || resource.ripeSyncStatus === "SUBMITTED" ? "warning" : resource.ripeSyncStatus === "SUCCESS" || resource.ripeSyncStatus === "SYNCHRONIZED" ? "success" : "muted"}>RIPE {resource.ripeSyncStatus || "-"}</Badge>
+                    <Badge variant={resource.cstSyncStatus === "FAILED" ? "danger" : resource.cstSyncStatus === "PENDING" || resource.cstSyncStatus === "RUNNING" ? "warning" : resource.cstSyncStatus === "SUCCESS" || resource.cstSyncStatus === "SYNCHRONIZED" ? "success" : "muted"}>CST {resource.cstSyncStatus || "-"}</Badge>
+                  </div>
+                </TableCell>
+                <TableCell className="min-w-[190px]">
+                  <p>{service}</p>
+                  <p className="break-all text-xs text-muted-foreground">{resource.transactionId || "-"}</p>
+                </TableCell>
+                <TableCell className="min-w-[120px] text-xs text-muted-foreground">{location}</TableCell>
+                <TableCell className="min-w-[120px] text-xs text-muted-foreground">{resource.lastUpdated || "-"}</TableCell>
+                {actions ? <TableCell>{rowActions}</TableCell> : null}
+              </TableRow>
+            );
+          })}
+          {!resources.length ? (
+            <TableRow>
+              <TableCell colSpan={actions ? 10 : 9} className="py-8 text-center text-sm text-muted-foreground">{empty}</TableCell>
+            </TableRow>
+          ) : null}
+        </TableBody>
+      </Table>
     </div>
   );
 }
@@ -4384,10 +4520,12 @@ function Reporting({
   onRunRipeReport: () => void;
   onClearRipeReport: () => void;
 }) {
-  const [activeReport, setActiveReport] = useState<"pool-summary" | "local-allocated-pool-utilization" | "cst-lir" | "resource-utilization" | "ripe-allocation" | null>(null);
+  const [activeReport, setActiveReport] = useState<"pool-summary" | "local-allocated-pool-utilization" | "active-assignments" | "cst-lir" | "resource-utilization" | "ripe-allocation" | null>(null);
   const [poolSummaryFilters, setPoolSummaryFilters] = useState<Record<string, string>>({});
+  const [activeAssignmentFilters, setActiveAssignmentFilters] = useState<Record<string, string>>({});
   const [poolSummaryVisibleRows, setPoolSummaryVisibleRows] = useState(REPORT_BATCH_SIZE);
   const [localAllocatedPoolVisibleRows, setLocalAllocatedPoolVisibleRows] = useState(REPORT_BATCH_SIZE);
+  const [activeAssignmentVisibleRows, setActiveAssignmentVisibleRows] = useState(REPORT_BATCH_SIZE);
   const [registryVisibleRows, setRegistryVisibleRows] = useState(REPORT_BATCH_SIZE);
   const [utilizationVisibleRows, setUtilizationVisibleRows] = useState(REPORT_BATCH_SIZE);
   const [ripeVisibleRows, setRipeVisibleRows] = useState(REPORT_BATCH_SIZE);
@@ -4395,10 +4533,13 @@ function Reporting({
   const localAllocatedPoolRows = localAllocatedPoolUtilizationRows(resources);
   const filteredPoolSummaryRows = filterReportRows(poolSummaryRows, poolSummaryFilters, POOL_SUMMARY_COLUMNS);
   const reportingResources = presentationResources(resources);
+  const activeAssignmentRows = activeAssignmentReportRows(resources);
+  const filteredActiveAssignmentRows = filterReportRows(activeAssignmentRows, activeAssignmentFilters, ACTIVE_ASSIGNMENT_COLUMNS);
   const utilizationRows = resourceUtilizationRows(reportingResources);
   const registryRows = registryExportRows(reportingResources);
   const visiblePoolSummaryRows = filteredPoolSummaryRows.slice(0, poolSummaryVisibleRows);
   const visibleLocalAllocatedPoolRows = localAllocatedPoolRows.slice(0, localAllocatedPoolVisibleRows);
+  const visibleActiveAssignmentRows = filteredActiveAssignmentRows.slice(0, activeAssignmentVisibleRows);
   const visibleRegistryRows = registryRows.slice(0, registryVisibleRows);
   const visibleUtilizationRows = utilizationRows.slice(0, utilizationVisibleRows);
   const ripeRows = ripeReportResult?.rows ?? [];
@@ -4408,6 +4549,9 @@ function Reporting({
     setPoolSummaryVisibleRows(REPORT_BATCH_SIZE);
     setLocalAllocatedPoolVisibleRows(REPORT_BATCH_SIZE);
   }, [poolSummaryFilters, resources.length]);
+  useEffect(() => {
+    setActiveAssignmentVisibleRows(REPORT_BATCH_SIZE);
+  }, [activeAssignmentFilters, resources.length]);
   useEffect(() => {
     setRegistryVisibleRows(REPORT_BATCH_SIZE);
     setUtilizationVisibleRows(REPORT_BATCH_SIZE);
@@ -4423,6 +4567,11 @@ function Reporting({
   const loadMoreLocalAllocatedPoolRows = (event: UIEvent<HTMLDivElement>) => {
     if (shouldLoadNextReportBatch(event, localAllocatedPoolVisibleRows, localAllocatedPoolRows.length)) {
       setLocalAllocatedPoolVisibleRows((current) => Math.min(current + REPORT_BATCH_SIZE, localAllocatedPoolRows.length));
+    }
+  };
+  const loadMoreActiveAssignmentRows = (event: UIEvent<HTMLDivElement>) => {
+    if (shouldLoadNextReportBatch(event, activeAssignmentVisibleRows, filteredActiveAssignmentRows.length)) {
+      setActiveAssignmentVisibleRows((current) => Math.min(current + REPORT_BATCH_SIZE, filteredActiveAssignmentRows.length));
     }
   };
   const loadMoreRegistryRows = (event: UIEvent<HTMLDivElement>) => {
@@ -4449,10 +4598,10 @@ function Reporting({
   const reportRows = [
     { id: "pool-summary", activeId: "pool-summary" as const, name: "Subnet Summary Report", scope: `${filteredPoolSummaryRows.length} of ${poolSummaryRows.length} registered subnets`, status: "Available" },
     { id: "local-allocated-pool-utilization", activeId: "local-allocated-pool-utilization" as const, name: "Local Allocated Pool Utilization Report", scope: `${localAllocatedPoolRows.length} allocated pools`, status: "Available" },
+    { id: "active-assignments", activeId: "active-assignments" as const, name: "All Active Assignments Report", scope: `${filteredActiveAssignmentRows.length} of ${activeAssignmentRows.length} active assignments`, status: "Available" },
     { id: "resource-utilization", activeId: "resource-utilization" as const, name: "Resource Utilization Report", scope: `${reportingResources.length} resources`, status: "Available" },
     { id: "cst-lir", activeId: "cst-lir" as const, name: "CST/LIR Registry Report", scope: `${registryRows.length} CIDRs`, status: "Available" },
     { id: "ripe-assignment", activeId: "ripe-allocation" as const, name: "RIPE Assignment Report", scope: "Maintainer ITC-NOC-MNT inetnum assignments", status: "Available" },
-    { id: "assignments", name: "Assignment Report", scope: `${resources.filter((item) => item.administrativeStatus === "ASSIGNED").length} assignments`, status: "Planned" },
     { id: "reservations", name: "Reservation Report", scope: `${resources.filter((item) => item.administrativeStatus === "RESERVED").length} reservations`, status: "Planned" },
     { id: "fragmentation", name: "Fragmentation Report", scope: `${resources.filter((item) => item.administrativeStatus === "AVAILABLE").length} available subnets`, status: "Planned" },
     { id: "integrity", name: "Integrity Violation Report", scope: `${conflicts.length} issues`, status: "Planned" },
@@ -4722,6 +4871,76 @@ function Reporting({
           </div>
           <p className="mt-3 text-xs text-muted-foreground">
             Showing {Math.min(localAllocatedPoolVisibleRows, localAllocatedPoolRows.length)} of {localAllocatedPoolRows.length} allocated pools. Export includes all rows and all report columns.
+          </p>
+        </CardContent>
+      </Card>
+      ) : null}
+      {activeReport === "active-assignments" ? (
+        <Card>
+        <CardHeader>
+          <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+            <div>
+              <CardTitle>All Active Assignments Report</CardTitle>
+              <CardDescription>Current assigned resources with customer, service, contact, location, RIPE, and CST status columns. Use the header filters to query active assignments.</CardDescription>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <Button variant="outline" onClick={() => setActiveReport(null)}>
+                Back to Reports
+              </Button>
+              <Button variant="outline" onClick={() => exportActiveAssignmentRows(filteredActiveAssignmentRows, "csv")}>
+                <FileDown className="h-4 w-4" />
+                Export CSV
+              </Button>
+              <Button onClick={() => exportActiveAssignmentRows(filteredActiveAssignmentRows, "xlsx")}>
+                <FileDown className="h-4 w-4" />
+                Export XLSX
+              </Button>
+              <Button variant="ghost" onClick={() => setActiveAssignmentFilters({})} disabled={!Object.values(activeAssignmentFilters).some(Boolean)}>
+                Clear Search
+              </Button>
+            </div>
+          </div>
+        </CardHeader>
+        <CardContent>
+          <div className="max-h-[620px] overflow-auto rounded-md border" onScroll={loadMoreActiveAssignmentRows}>
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  {ACTIVE_ASSIGNMENT_COLUMNS.map((column) => (
+                    <TableHead key={column.key}>{column.header}</TableHead>
+                  ))}
+                </TableRow>
+                <TableRow>
+                  {ACTIVE_ASSIGNMENT_COLUMNS.map((column) => (
+                    <TableHead key={column.key}>
+                      <Input
+                        className="h-8 min-w-[120px] bg-background text-xs"
+                        value={activeAssignmentFilters[column.key] ?? ""}
+                        onChange={(event) => setActiveAssignmentFilters((current) => ({ ...current, [column.key]: event.target.value }))}
+                        placeholder={`Search ${column.header}`}
+                      />
+                    </TableHead>
+                  ))}
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {visibleActiveAssignmentRows.map((row, rowIndex) => (
+                  <TableRow key={reportRowKey(row, rowIndex, "active-assignments")}>
+                    {ACTIVE_ASSIGNMENT_COLUMNS.map((column) => (
+                      <TableCell key={column.key} className={column.key === "cidr" ? "font-semibold" : ""}>{String(row[column.key] ?? "")}</TableCell>
+                    ))}
+                  </TableRow>
+                ))}
+                {!filteredActiveAssignmentRows.length ? (
+                  <TableRow>
+                    <TableCell colSpan={ACTIVE_ASSIGNMENT_COLUMNS.length} className="py-6 text-center text-muted-foreground">{activeAssignmentRows.length ? "No active assignments match the current filters." : "No active assignments available."}</TableCell>
+                  </TableRow>
+                ) : null}
+              </TableBody>
+            </Table>
+          </div>
+          <p className="mt-3 text-xs text-muted-foreground">
+            Showing {Math.min(activeAssignmentVisibleRows, filteredActiveAssignmentRows.length)} of {filteredActiveAssignmentRows.length} matching active assignments. Scroll down to load the next {REPORT_BATCH_SIZE}. Export includes all matching rows.
           </p>
         </CardContent>
       </Card>
@@ -6780,6 +6999,34 @@ const LOCAL_ALLOCATED_POOL_UTILIZATION_COLUMNS: Array<{ key: string; header: str
   { key: "transaction_id", header: "Transaction ID" },
   { key: "last_updated", header: "Last Updated" }
 ];
+const ACTIVE_ASSIGNMENT_COLUMNS: Array<{ key: string; header: string }> = [
+  { key: "cidr", header: "CIDR" },
+  { key: "start_ip", header: "Start IP" },
+  { key: "end_ip", header: "End IP" },
+  { key: "total_ips", header: "Total IPs" },
+  { key: "assignment_status", header: "Assignment Status" },
+  { key: "assignment_target_type", header: "Assignment Target Type" },
+  { key: "customer_name", header: "Customer Name" },
+  { key: "organization_name", header: "Organization Name" },
+  { key: "customer_id", header: "Customer ID" },
+  { key: "service_id", header: "Service ID" },
+  { key: "service_instance_id", header: "Service Instance ID" },
+  { key: "service_description", header: "Service Description" },
+  { key: "customer_type", header: "Customer Type" },
+  { key: "subnet_type", header: "Subnet Type" },
+  { key: "product_class", header: "Product Class" },
+  { key: "region_id", header: "Region ID" },
+  { key: "city_id", header: "City ID" },
+  { key: "contact_name", header: "Contact Name" },
+  { key: "contact_number", header: "Contact Number" },
+  { key: "contact_email", header: "Contact Email" },
+  { key: "transaction_id", header: "Transaction ID" },
+  { key: "cst_sync_status", header: "CST Sync Status" },
+  { key: "ripe_sync_status", header: "RIPE Sync Status" },
+  { key: "assignment_date", header: "Assignment Date" },
+  { key: "last_updated", header: "Last Updated" }
+];
+
 const RESOURCE_UTILIZATION_COLUMNS: Array<{ key: string; header: string }> = [
   { key: "resource_id", header: "Resource ID" },
   { key: "resource_uuid", header: "Resource UUID" },
@@ -6872,6 +7119,54 @@ const RESOURCE_UTILIZATION_COLUMNS: Array<{ key: string; header: string }> = [
   { key: "qos_profile", header: "QoS Profile" },
   { key: "notes", header: "Notes" }
 ];
+
+function activeAssignmentReportRows(resources: ManagedResource[]): ResourceUtilizationRow[] {
+  return resources
+    .filter((resource) => resource.administrativeStatus === "ASSIGNED" && resource.type === "Subnet")
+    .map((resource) => {
+      const assignment = resource.source && "customer_name" in resource.source ? resource.source : null;
+      return {
+        cidr: resource.cidr,
+        start_ip: resource.startIp,
+        end_ip: resource.endIp,
+        total_ips: resource.totalIps,
+        assignment_status: assignment?.status || resource.administrativeStatus,
+        assignment_target_type: assignment?.assignment_target_type || "",
+        customer_name: assignment?.customer_name || resource.organizationName || resource.fullName || resource.owner,
+        organization_name: assignment?.organization_name || resource.organizationName,
+        customer_id: assignment?.customer_id || "",
+        service_id: assignment?.service_id || resource.serviceId,
+        service_instance_id: assignment?.service_instance_id || "",
+        service_description: assignment?.service_description || resource.serviceDescription,
+        customer_type: assignment?.customer_type || resource.customerType,
+        subnet_type: assignment?.subnet_type || resource.subnetType,
+        product_class: assignment?.product_class || resource.productClass,
+        region_id: assignment?.region_id || resource.regionId,
+        city_id: assignment?.city_id || resource.cityId,
+        contact_name: assignment?.contact_name || resource.fullName,
+        contact_number: assignment?.contact_number || resource.mobileNumber,
+        contact_email: assignment?.contact_email || resource.email,
+        transaction_id: resource.transactionId,
+        cst_sync_status: resource.cstSyncStatus,
+        ripe_sync_status: resource.ripeSyncStatus,
+        assignment_date: assignment?.assignment_date || "",
+        last_updated: resource.lastUpdated
+      };
+    });
+}
+
+function exportActiveAssignmentRows(rows: ResourceUtilizationRow[], format: "csv" | "xlsx") {
+  const values = rows.map((row) => ACTIVE_ASSIGNMENT_COLUMNS.map((column) => row[column.key] ?? ""));
+  if (format === "csv") {
+    downloadBlob(`active-assignments-${today()}.csv`, "text/csv;charset=utf-8", buildColumnCsv(ACTIVE_ASSIGNMENT_COLUMNS, rows));
+    return;
+  }
+  downloadBlob(
+    `active-assignments-${today()}.xlsx`,
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    buildXlsx("Active Assignments", ACTIVE_ASSIGNMENT_COLUMNS.map((column) => column.header), values)
+  );
+}
 
 function registryExportRows(resources: ManagedResource[]): ResourceUtilizationRow[] {
   return resources.map((resource) => ({
