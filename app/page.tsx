@@ -890,6 +890,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
     update_enabled: true,
     delete_enabled: true,
     get_enabled: true,
+    resource_scope: "all",
     integration_mode: "Real API",
     host: "cst-oa-unified-gw-stg-fop.apps.apldev-sit-opshift.itc.local",
     port: 443,
@@ -1040,6 +1041,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
       update_enabled: cstConfig.update_enabled,
       delete_enabled: cstConfig.delete_enabled,
       get_enabled: cstConfig.get_enabled,
+      resource_scope: cstConfig.resource_scope ?? "all",
       integration_mode: cstConfig.integration_mode,
       host: cstConfig.host,
       port: cstConfig.port,
@@ -1062,6 +1064,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
       send_payload_batch_size: cstConfig.send_payload_batch_size,
       hourly_request_limit: cstConfig.hourly_request_limit
     });
+    setCstResourceScope(cstConfig.resource_scope ?? "all");
   }, [cstConfig, cstConfigFormDirty]);
 
   useEffect(() => {
@@ -1290,7 +1293,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
 
           <section className="min-w-0">
             {view !== "executive" ? <BreadcrumbNavigation view={view} resource={selectedResource} onNavigate={navigateTo} /> : null}
-            {view === "executive" ? <ExecutiveDashboard stats={stats} resources={resources} cstSummary={cstSummary} currentRole={signedInRole} onNavigate={navigateTo} /> : null}
+            {view === "executive" ? <ExecutiveDashboard stats={stats} resources={resources} assignmentTotal={assignmentTotal} cstSummary={cstSummary} currentRole={signedInRole} onNavigate={navigateTo} /> : null}
             {view === "registry" ? (
               <ResourceRegistry
                 resources={resources}
@@ -1317,7 +1320,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                 cstTransactions={cstTransactions}
                 cstBusy={cstConfigQuery.isFetching || cstSummaryQuery.isFetching || cstBatchesQuery.isFetching || cstJobsQuery.isFetching || cstSchedulerRunsQuery.isFetching || cstTransactionsQuery.isFetching}
                 cstResourceScope={cstResourceScope}
-                onCstResourceScope={setCstResourceScope}
+                onCstResourceScope={(scope) => { setCstResourceScope(scope); updateCstConfigForm({ ...cstConfigForm, resource_scope: scope }); }}
                 onRefreshCst={() => {
                   void cstConfigQuery.refetch();
                   void cstSummaryQuery.refetch();
@@ -1607,6 +1610,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                 onAssignmentPage={setAssignmentPage}
                 onAssignmentPageSize={(value) => { setAssignmentPageSize(value); setAssignmentPage(1); }}
                 onAssignmentSearch={(value) => { setAssignmentSearch(value); setAssignmentPage(1); }}
+                onOpen={openResource}
                 form={assignmentForm}
                 poolDraft={poolAssignmentDraft}
                 onForm={setAssignmentForm}
@@ -1820,7 +1824,7 @@ ${errorMessage(error)}`
                 onSiebelConfigForm={setSiebelConfigForm}
                 onDatabaseConnectionForm={setDatabaseConnectionForm}
                 onCstConfigForm={updateCstConfigForm}
-                onCstResourceScope={setCstResourceScope}
+                onCstResourceScope={(scope) => { setCstResourceScope(scope); updateCstConfigForm({ ...cstConfigForm, resource_scope: scope }); }}
                 onRipePoolCsv={setRipePoolCsv}
                 onAddUser={() => run(async () => { await api.post("/users", newUser); setNewUser({ username: "", password: "", role: "operator" }); })}
                 onSetPassword={() => run(async () => { await api.patch(`/users/${passwordReset.userId}/password`, { password: passwordReset.password }); setPasswordReset((current) => ({ ...current, password: "" })); })}
@@ -1976,12 +1980,14 @@ function ThemeSelector({ theme, onTheme }: { theme: AppTheme; onTheme: (theme: A
 function ExecutiveDashboard({
   stats,
   resources,
+  assignmentTotal,
   cstSummary,
   currentRole,
   onNavigate
 }: {
   stats: RegistryStats;
   resources: ManagedResource[];
+  assignmentTotal: number;
   cstSummary: CstSyncSummary | null;
   currentRole: User["role"];
   onNavigate: (view: ViewKey, registryPanel?: RegistryPanelId) => void;
@@ -2003,7 +2009,7 @@ function ExecutiveDashboard({
     adminOnly?: boolean;
   }> = [
     { title: "Resource Registry", detail: "Browse allocated pools, child pools, available blocks, assignments, and RIPE-discovered roots.", status: `${stats.totalPools} registered subnets`, accent: "cyan", icon: <Database className="h-5 w-5" />, view: "registry", registryPanel: "subnet-navigator" },
-    { title: "Assignment Management", detail: "Assign, reserve, release, and retire customer or internal subnet resources.", status: `${stats.totalAssignments} active assignments`, accent: "green", icon: <Users className="h-5 w-5" />, view: "assignments" },
+    { title: "Assignment Management", detail: "Assign, reserve, release, and retire customer or internal subnet resources.", status: `${assignmentTotal} active assignments`, accent: "green", icon: <Users className="h-5 w-5" />, view: "assignments" },
     { title: "Global Search", detail: "Find resources by CIDR, UUID, transaction ID, owner, netname, or status.", status: "CIDR and transaction lookup", accent: "slate", icon: <Search className="h-5 w-5" />, view: "search" },
     { title: "RIPE Discovery", detail: "Discover RIPE root pools maintained by Salam and sync them into the local LIR registry.", status: "Maintainer discovery", accent: "blue", icon: <Radar className="h-5 w-5" />, view: "registry", registryPanel: "lir-discovery" },
     { title: "RIPE Sync Worklist", detail: "Review pending RIPE create/delete work items, failures, and retry actions.", status: `${ripePending} pending or failed`, accent: ripePending ? "amber" : "green", icon: <ListTree className="h-5 w-5" />, view: "registry", registryPanel: "ripe-worklist" },
@@ -2019,7 +2025,7 @@ function ExecutiveDashboard({
     <div className="grid gap-5">
       <section className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
         <HomeMetric label="Total Pools" value={String(stats.totalPools)} detail={`${formatHosts(stats.totalResources)} total IPs`} tone="cyan" />
-        <HomeMetric label="Assigned IPs" value={formatHosts(assignedIps)} detail={`${stats.totalAssignments} assignment records`} tone="green" />
+        <HomeMetric label="Assigned IPs" value={formatHosts(assignedIps)} detail={`${assignmentTotal} assignment records`} tone="green" />
         <HomeMetric label="RIPE Pending" value={String(ripePending)} detail="Push, retry, or removal worklist" tone={ripePending ? "amber" : "green"} />
         <HomeMetric label="CST Pending" value={String(cstPending)} detail="Local transaction jobs" tone={cstPending ? "violet" : "green"} />
       </section>
@@ -2865,6 +2871,7 @@ function AssignmentManagement(props: {
   onAssignmentPage: (page: number) => void;
   onAssignmentPageSize: (pageSize: number) => void;
   onAssignmentSearch: (search: string) => void;
+  onOpen: (resource: ManagedResource) => void;
   form: AssignmentPayload;
   poolDraft: PoolAssignmentDraft;
   onForm: (value: AssignmentPayload) => void;
@@ -2896,6 +2903,14 @@ function AssignmentManagement(props: {
     ? "Select the existing CST-reported block that needs to be split and partially reassigned."
     : "Release an assignment, refresh BSS details, or temporarily suspend operational use.";
   const filteredAssignments = props.assignments;
+  const resourceByAssignmentId = new Map(props.resources.map((resource) => [resource.source && "customer_name" in resource.source ? resource.source.id : "", resource]));
+  const resourceByCidr = new Map(props.resources.map((resource) => [resource.cidr, resource]));
+  const openAssignmentSummary = (assignment: Assignment) => {
+    const resource = resourceByAssignmentId.get(assignment.id) ?? resourceByCidr.get(assignment.cidr);
+    if (resource) {
+      props.onOpen(resource);
+    }
+  };
 
   const openWorkflow = (nextWorkflow: AssignmentWorkflow) => {
     setWorkflow(nextWorkflow);
@@ -3132,7 +3147,11 @@ function AssignmentManagement(props: {
                 <TableRow><TableCell colSpan={6}>Loading assignments...</TableCell></TableRow>
               ) : filteredAssignments.length ? filteredAssignments.map((assignment) => (
                 <TableRow key={assignment.id}>
-                  <TableCell className="font-semibold">{assignment.cidr}</TableCell>
+                  <TableCell className="font-semibold">
+                    <button type="button" className="text-left text-sky-300 underline-offset-2 hover:underline" onClick={() => openAssignmentSummary(assignment)} title="Open resource summary">
+                      {assignment.cidr}
+                    </button>
+                  </TableCell>
                   <TableCell>{assignment.customer_name || assignment.internal_application_name}</TableCell>
                   <TableCell><Badge variant={assignment.status === "Blocked" ? "danger" : assignment.status === "Reserved" ? "warning" : "success"}>{assignment.status}</Badge></TableCell>
                   <TableCell>{assignment.service_instance_id || assignment.id}</TableCell>
@@ -4884,7 +4903,10 @@ function CstLirApiSettings(props: CstLirApiSettingsProps) {
             <ToggleSwitch label="DeleteLIR" description="Delete CST records when required." checked={props.cstConfigForm.delete_enabled !== false} onChange={(checked) => setSwitch("delete_enabled", checked)} />
             <ToggleSwitch label="GetLIR" description="Read paged LIR data from CST." checked={props.cstConfigForm.get_enabled !== false} onChange={(checked) => setSwitch("get_enabled", checked)} />
           </div>
-          <CstResourceScopeSelector value={props.cstResourceScope} onChange={props.onCstResourceScope} />
+          <div className="grid gap-2">
+            <CstResourceScopeSelector value={props.cstResourceScope} onChange={props.onCstResourceScope} />
+            <p className="text-xs text-muted-foreground">Change this scope, then click Save Operation Switches to keep it as the default for CST migration review and pending push.</p>
+          </div>
           <div className="flex flex-wrap items-center justify-between gap-2">
             <p className="text-xs text-muted-foreground">When auto execute is disabled, new CST jobs stay PENDING and do not call CST until you retry them manually from the CST Sync Monitor.</p>
             <Button size="sm" variant="secondary" onClick={props.onSaveCstConfig}>

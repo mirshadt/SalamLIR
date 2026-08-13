@@ -743,6 +743,7 @@ class CstConfig(BaseModel):
     update_enabled: bool = True
     delete_enabled: bool = True
     get_enabled: bool = True
+    resource_scope: str = "all"
     integration_mode: str = "Real API"
     host: str = "cst-oa-unified-gw-stg-fop.apps.apldev-sit-opshift.itc.local"
     port: int = 443
@@ -790,6 +791,7 @@ class CstConfigUpdate(BaseModel):
     update_enabled: bool | None = None
     delete_enabled: bool | None = None
     get_enabled: bool | None = None
+    resource_scope: str | None = None
     integration_mode: str | None = None
     host: str | None = None
     port: int | None = None
@@ -2193,6 +2195,7 @@ def cst_config_from_row(row: sqlite3.Row) -> CstConfig:
         update_enabled=bool(values.get("update_enabled", 1)),
         delete_enabled=bool(values.get("delete_enabled", 1)),
         get_enabled=bool(values.get("get_enabled", 1)),
+        resource_scope=normalize_cst_resource_scope(str(values.get("resource_scope") or "all")),
         integration_mode="Real API",
         host=host,
         port=port,
@@ -4589,6 +4592,7 @@ def init_db() -> None:
               auto_execute INTEGER NOT NULL,
               scheduled_sync_enabled INTEGER NOT NULL DEFAULT 1,
               send_enabled INTEGER NOT NULL DEFAULT 1,
+              resource_scope TEXT NOT NULL DEFAULT 'all',
               update_enabled INTEGER NOT NULL DEFAULT 1,
               delete_enabled INTEGER NOT NULL DEFAULT 1,
               get_enabled INTEGER NOT NULL DEFAULT 1,
@@ -4746,6 +4750,8 @@ def init_db() -> None:
         cst_config_columns = {row["name"] for row in connection.execute("PRAGMA table_info(cst_config)").fetchall()}
         if "accept_language" not in cst_config_columns:
             connection.execute("ALTER TABLE cst_config ADD COLUMN accept_language TEXT NOT NULL DEFAULT 'EN'")
+        if "resource_scope" not in cst_config_columns:
+            connection.execute("ALTER TABLE cst_config ADD COLUMN resource_scope TEXT NOT NULL DEFAULT 'all'")
         connection.execute("UPDATE cst_config SET send_path = ? WHERE send_path = '/api/rest/v1.0/lir/resources'", (CST_SEND_LIR_PATH,))
         connection.execute("UPDATE cst_config SET update_path = ? WHERE update_path = '/api/rest/v1.0/lir/resources/{resourceUuid}'", (CST_UPDATE_LIR_PATH,))
         connection.execute("UPDATE cst_config SET delete_path = ? WHERE delete_path = '/api/rest/v1.0/lir/resources/{resourceUuid}'", (CST_DELETE_LIR_PATH,))
@@ -6423,7 +6429,7 @@ def update_cst_config(payload: CstConfigUpdate) -> CstConfig:
     if not updates:
         return get_cst_config()
     allowed = {
-        "enabled", "service_provider_id", "auto_execute", "scheduled_sync_enabled", "send_enabled", "update_enabled", "delete_enabled", "get_enabled", "integration_mode",
+        "enabled", "service_provider_id", "auto_execute", "scheduled_sync_enabled", "send_enabled", "update_enabled", "delete_enabled", "get_enabled", "resource_scope", "integration_mode",
         "host", "port", "base_url", "token_path", "send_path", "update_path", "delete_path", "get_path",
         "auth_username", "accept_language", "verify_ssl", "connection_timeout", "read_timeout", "token_refresh_buffer_seconds",
         "schedule_time", "schedule_timezone", "batch_size_limit", "send_payload_batch_size", "hourly_request_limit"
@@ -6455,6 +6461,8 @@ def update_cst_config(payload: CstConfigUpdate) -> CstConfig:
         raise HTTPException(status_code=400, detail="sendPayloadBatchSize must be at least 1")
     if "hourly_request_limit" in values and int(values["hourly_request_limit"]) < 1:
         raise HTTPException(status_code=400, detail="hourlyRequestLimit must be at least 1")
+    if "resource_scope" in values:
+        values["resource_scope"] = normalize_cst_resource_scope(str(values["resource_scope"]))
     if "schedule_time" in values:
         parse_cst_schedule_time(str(values["schedule_time"]))
     if "schedule_timezone" in values:

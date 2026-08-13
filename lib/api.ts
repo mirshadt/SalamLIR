@@ -437,6 +437,7 @@ export type CstConfig = {
   update_enabled: boolean;
   delete_enabled: boolean;
   get_enabled: boolean;
+  resource_scope: CstResourceScope;
   integration_mode: "Real API";
   host: string;
   port: number;
@@ -467,7 +468,7 @@ export type CstConfig = {
   updated_at: string;
 };
 
-export type CstConfigPayload = Partial<Pick<CstConfig, "enabled" | "service_provider_id" | "auto_execute" | "scheduled_sync_enabled" | "send_enabled" | "update_enabled" | "delete_enabled" | "get_enabled" | "integration_mode" | "host" | "port" | "base_url" | "token_path" | "send_path" | "update_path" | "delete_path" | "get_path" | "auth_username" | "accept_language" | "verify_ssl" | "connection_timeout" | "read_timeout" | "token_refresh_buffer_seconds" | "schedule_time" | "schedule_timezone" | "batch_size_limit" | "send_payload_batch_size" | "hourly_request_limit">> & {
+export type CstConfigPayload = Partial<Pick<CstConfig, "enabled" | "service_provider_id" | "auto_execute" | "scheduled_sync_enabled" | "send_enabled" | "update_enabled" | "delete_enabled" | "get_enabled" | "resource_scope" | "integration_mode" | "host" | "port" | "base_url" | "token_path" | "send_path" | "update_path" | "delete_path" | "get_path" | "auth_username" | "accept_language" | "verify_ssl" | "connection_timeout" | "read_timeout" | "token_refresh_buffer_seconds" | "schedule_time" | "schedule_timezone" | "batch_size_limit" | "send_payload_batch_size" | "hourly_request_limit">> & {
   auth_password?: string;
   api_access_key?: string;
   user_key?: string;
