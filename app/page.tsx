@@ -1787,7 +1787,7 @@ ${errorMessage(error)}`
                   setNotice({ title: "Bulk transaction started", detail: `${data.id} is processing ${data.total_rows} subnet rows. Track status in Bulk Transaction History.` });
                 })}
                 onImportAssignments={() => run(async () => {
-                  const { data } = await api.post<BulkBatch>("/assignments/bulk", { csv_text: bulkAssignmentCsv, file_name: bulkAssignmentFileName, allow_conflicts: bulkAssignmentAllowConflicts });
+                  const { data } = await api.post<BulkBatch>("/assignments/bulk", { csv_text: bulkAssignmentCsv, file_name: bulkAssignmentFileName, allow_conflicts: bulkAssignmentAllowConflicts }, { timeout: 15 * 60 * 1000 });
                   setNotice({ title: "Bulk transaction started", detail: `${data.id} is processing ${data.total_rows} assignment rows. Track status in Bulk Transaction History.` });
                 })}
               />
