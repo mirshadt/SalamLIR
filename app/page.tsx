@@ -1720,6 +1720,7 @@ ${errorMessage(error)}`
                   void poolsQuery.refetch();
                   setNotice({ title: "BSS Delta Sync", detail: `${data.message}: ${data.updated} updated, ${data.unchanged} unchanged, ${data.failed} failed.` });
                 })}
+                onGlobalSearch={() => navigateTo("search")}
                 onLookupSiebelService={(serviceId) => run(async () => {
                   const { data } = await api.post<SiebelLookupResponse>("/siebel/business-customer", { service_id: serviceId });
                   if (!data.found) {
@@ -2042,6 +2043,8 @@ function ExecutiveDashboard({
     .reduce((sum, resource) => sum + resource.totalIps, 0);
   const totalPools = summary?.total_pools ?? stats.totalPools;
   const totalIps = summary?.total_ips ?? stats.totalResources;
+  const availableIps = Math.max(totalIps - assignedIps, 0);
+  const utilization = totalIps ? round1((assignedIps / totalIps) * 100) : 0;
   const ripePending = summary?.ripe_pending ?? resources.filter((resource) => ["PENDING", "FAILED", "DECOMMISSION_PENDING"].includes(resource.ripeSyncStatus)).length;
   const cstPending = summary?.cst_pending ?? cstSummary?.pending_jobs ?? resources.filter((resource) => resource.cstSyncStatus === "PENDING").length;
   const criticalConflicts = stats.integrityIssues;
@@ -2071,10 +2074,10 @@ function ExecutiveDashboard({
   return (
     <div className="grid gap-5">
       <section className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-        <HomeMetric label="Total Pools" value={String(totalPools)} detail={`${formatHosts(totalIps)} total IPs`} tone="cyan" />
-        <HomeMetric label="Assigned IPs" value={formatHosts(assignedIps)} detail={`${assignmentTotal} assignment records`} tone="green" />
-        <HomeMetric label="RIPE Pending" value={String(ripePending)} detail="Push, retry, or removal worklist" tone={ripePending ? "amber" : "green"} />
-        <HomeMetric label="CST Pending" value={String(cstPending)} detail="Local transaction jobs" tone={cstPending ? "violet" : "green"} />
+        <HomeMetric label="Available IPs" value={formatHosts(availableIps)} detail="Free capacity ready for assignment" tone="cyan" emphasis />
+        <HomeMetric label="Assigned IPs" value={formatHosts(assignedIps)} detail={`${assignmentTotal} active assignment records`} tone="green" emphasis />
+        <HomeMetric label="Utilization" value={`${utilization}%`} detail={`${formatHosts(assignedIps)} of ${formatHosts(totalIps)} IPs used`} tone={utilization >= 85 ? "amber" : "violet"} progress={utilization} emphasis />
+        <HomeMetric label="Total Pool Size" value={formatHosts(totalIps)} detail={`${totalPools} allocated pool${totalPools === 1 ? "" : "s"}`} tone="cyan" emphasis />
       </section>
 
       <section className="grid gap-3">
@@ -2094,19 +2097,25 @@ function ExecutiveDashboard({
   );
 }
 
-function HomeMetric({ label, value, detail, tone }: { label: string; value: string; detail: string; tone: "cyan" | "green" | "amber" | "violet" }) {
+function HomeMetric({ label, value, detail, tone, progress, emphasis = false }: { label: string; value: string; detail: string; tone: "cyan" | "green" | "amber" | "violet"; progress?: number; emphasis?: boolean }) {
   const toneClass = {
     cyan: "border-cyan-400/50 bg-cyan-400/10 text-cyan-300",
     green: "border-emerald-400/40 bg-emerald-400/10 text-emerald-200",
     amber: "border-amber-400/40 bg-amber-400/10 text-amber-200",
     violet: "border-violet-400/40 bg-violet-400/10 text-violet-200"
   }[tone];
+  const progressValue = Math.max(0, Math.min(progress ?? 0, 100));
   return (
     <Card className={cn("border", toneClass)}>
       <CardContent className="pt-5">
-        <p className="text-sm text-muted-foreground">{label}</p>
-        <p className="mt-2 text-3xl font-semibold text-foreground">{value}</p>
-        <p className="mt-1 text-sm">{detail}</p>
+        <p className="text-sm font-medium text-muted-foreground">{label}</p>
+        <p className={cn("mt-2 font-bold tracking-normal text-foreground", emphasis ? "text-5xl leading-none" : "text-3xl")}>{value}</p>
+        <p className="mt-2 text-sm">{detail}</p>
+        {progress !== undefined ? (
+          <div className="mt-4 h-2 overflow-hidden rounded-full bg-background/60">
+            <div className="h-full rounded-full bg-current transition-all" style={{ width: `${progressValue}%` }} />
+          </div>
+        ) : null}
       </CardContent>
     </Card>
   );
@@ -2646,6 +2655,13 @@ function presentationResources(resources: ManagedResource[]) {
   return Array.from(byCidr.values()).sort((left, right) => left.startNumber - right.startNumber || left.prefix - right.prefix);
 }
 
+function isAllocatedContainerResource(resource: ManagedResource) {
+  return resource.type === "Subnet" && isRipeAllocatedPoolResource(resource) && (resource.usedIps > 0 || resource.reservedIps > 0 || resource.utilization > 0);
+}
+
+function isAssignableAvailableResource(resource: ManagedResource) {
+  return resource.type === "Subnet" && resource.administrativeStatus === "AVAILABLE" && !isAllocatedContainerResource(resource);
+}
 function presentationSubnetRank(resource: ManagedResource) {
   if (resource.operationType === "RETIRE" || resource.ripeSyncStatus === "DECOMMISSION_PENDING") {
     return 8;
@@ -2953,12 +2969,12 @@ function AssignmentManagement(props: {
   onStatus: (assignment: Assignment, status: AssignmentStatus) => void;
   onRefreshSiebelAssignment: (assignment: Assignment) => void;
   onLookupSiebelService: (serviceId: string) => void;
+  onGlobalSearch: () => void;
 }) {
   const [workflow, setWorkflow] = useState<AssignmentWorkflow>("assign");
   const [partialAssignmentId, setPartialAssignmentId] = useState("");
   const [partialCidr, setPartialCidr] = useState("");
-  const [resourceSearch, setResourceSearch] = useState("");
-  const available = presentationResources(props.resources).filter((resource) => resource.administrativeStatus === "AVAILABLE" && resource.type === "Subnet");
+  const available = presentationResources(props.resources).filter(isAssignableAvailableResource);
   const parentPoolMatches = filterResources(available, props.poolDraft.poolSearch);
   const assignmentSummary = assignmentDraftSummary(props.form, props.poolDraft, props.resources);
   const partialAssignment = props.assignments.find((assignment) => assignment.id === partialAssignmentId) ?? null;
@@ -2977,43 +2993,11 @@ function AssignmentManagement(props: {
   const filteredAssignments = props.assignments;
   const resourceByAssignmentId = new Map(props.resources.map((resource) => [resource.source && "customer_name" in resource.source ? resource.source.id : "", resource]));
   const resourceByCidr = new Map(props.resources.map((resource) => [resource.cidr, resource]));
-  const resourceSearchResults = filterResources(presentationResources(props.resources), resourceSearch).sort((left, right) => left.startNumber - right.startNumber || left.prefix - right.prefix || resourceTypeLabel(left).localeCompare(resourceTypeLabel(right)));
-  const visibleResourceSearchResults = resourceSearchResults.slice(0, 100);
   const openAssignmentSummary = (assignment: Assignment) => {
     const resource = resourceByAssignmentId.get(assignment.id) ?? resourceByCidr.get(assignment.cidr);
     if (resource) {
       props.onOpen(resource);
     }
-  };
-
-  const assignmentForSearchResource = (resource: ManagedResource) => {
-    if (resource.source && "customer_name" in resource.source) {
-      return resource.source;
-    }
-    return props.assignments.find((assignment) => assignment.id === resource.sourceUuid || assignment.cidr === resource.cidr) ?? null;
-  };
-
-  const selectResourceForAssignment = (resource: ManagedResource) => {
-    setWorkflow("assign");
-    if (resource.source && !("customer_name" in resource.source)) {
-      updatePoolDraft({ selectionMode: "subnet", parentPoolId: resource.id, poolSearch: resource.cidr, startIp: resource.startIp, endIp: resource.endIp, prefix: String(resource.prefix) });
-    } else {
-      updatePoolDraft({ selectionMode: "range", parentPoolId: "", poolSearch: resource.cidr, startIp: resource.startIp, endIp: resource.endIp, prefix: String(resource.prefix) });
-    }
-    props.onForm({ ...props.form, cidr: "", assignment_date: props.form.assignment_date || today() });
-  };
-
-  const renderResourceSearchActions = (resource: ManagedResource) => {
-    const assignment = assignmentForSearchResource(resource);
-    const canAssignResource = (resource.administrativeStatus === "AVAILABLE" || resource.administrativeStatus === "RESERVED") && resource.type === "Subnet";
-    return (
-      <div className="flex min-w-[220px] flex-wrap justify-end gap-2">
-        {canAssignResource ? <Button size="sm" variant="secondary" onClick={() => selectResourceForAssignment(resource)}>Use for Assign</Button> : null}
-        {assignment ? <Button size="sm" variant="secondary" onClick={() => selectPartialAssignment(assignment)}>Partial</Button> : null}
-        {assignment ? <Button size="sm" variant="destructive" onClick={() => props.onRelease(assignment)}>Unassign</Button> : null}
-        {!canAssignResource && !assignment ? <span className="text-xs text-muted-foreground">Open summary</span> : null}
-      </div>
-    );
   };
 
   const openWorkflow = (nextWorkflow: AssignmentWorkflow) => {
@@ -3039,35 +3023,51 @@ function AssignmentManagement(props: {
   };
 
   const workflowTiles: Array<{
-    id: AssignmentWorkflow;
+    id: string;
     title: string;
     description: string;
     metric: string;
     icon: typeof Network;
+    action: () => void;
+    active: boolean;
   }> = [
     {
       id: "assign",
       title: "Assign IP",
       description: "Create a new assignment from an available subnet or IP range.",
       metric: `${available.length} available subnet${available.length === 1 ? "" : "s"}`,
-      icon: Network
+      icon: Network,
+      action: () => openWorkflow("assign"),
+      active: workflow === "assign"
     },
     {
       id: "unassign",
       title: "Unassign IP",
       description: "Release an existing assignment without mixing it with creation steps.",
       metric: `${props.assignmentTotal} current assignment${props.assignmentTotal === 1 ? "" : "s"}`,
-      icon: ArchiveRestore
+      icon: ArchiveRestore,
+      action: () => openWorkflow("unassign"),
+      active: workflow === "unassign"
     },
     {
       id: "partial",
       title: "Partial Reassign",
       description: "Split one reported block into assigned and unassigned CST fragments.",
       metric: partialAssignment ? `Selected ${partialAssignment.cidr}` : "Select original block",
-      icon: GitBranch
+      icon: GitBranch,
+      action: () => openWorkflow("partial"),
+      active: workflow === "partial"
+    },
+    {
+      id: "global-search",
+      title: "Global Search",
+      description: "Open the full Global Search page for CIDR, resource, transaction, customer, service, and status lookup.",
+      metric: "CIDR and transaction lookup",
+      icon: Search,
+      action: props.onGlobalSearch,
+      active: false
     }
   ];
-
   const assignmentDetailsPanel = (
     <div className="grid gap-3">
       <div className="grid gap-3 rounded-md border bg-muted/20 p-3">
@@ -3123,37 +3123,6 @@ function AssignmentManagement(props: {
         <Textarea value={props.form.notes} onChange={(event) => update("notes", event.target.value)} placeholder="Assignment notes" />
       </div>
     </div>
-  );
-
-  const renderEmbeddedGlobalSearch = () => (
-    <Card>
-      <CardHeader>
-        <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
-          <div>
-            <CardTitle>Global IP Search</CardTitle>
-            <CardDescription>Search all registry IP resources before choosing Assign, Unassign, or Partial Reassign.</CardDescription>
-          </div>
-          <Button variant="outline" onClick={() => exportGlobalSearchResults(resourceSearchResults)} disabled={!resourceSearchResults.length}>
-            <FileDown className="h-4 w-4" />
-            Export CSV
-          </Button>
-        </div>
-      </CardHeader>
-      <CardContent className="grid gap-3">
-        <div className="grid gap-3 rounded-md border bg-muted/20 p-3 md:grid-cols-[minmax(0,1fr)_auto] md:items-end">
-          <label className="grid gap-1">
-            <span className="text-xs font-medium text-muted-foreground">Search IP resources</span>
-            <Input value={resourceSearch} onChange={(event) => setResourceSearch(event.target.value)} placeholder="Search IP, CIDR, resource ID, transaction, customer, service, owner, status" />
-          </label>
-          <div className="flex flex-wrap items-center gap-2">
-            <Badge variant="muted">{resourceSearchResults.length} match{resourceSearchResults.length === 1 ? "" : "es"}</Badge>
-            {resourceSearch ? <Button type="button" variant="outline" onClick={() => setResourceSearch("")}>Clear</Button> : null}
-          </div>
-        </div>
-        <GlobalSearchResultsTable resources={visibleResourceSearchResults} onOpen={props.onOpen} scope="assignment-global-search" actions={renderResourceSearchActions} />
-        {resourceSearchResults.length > visibleResourceSearchResults.length ? <p className="text-xs text-muted-foreground">Showing first {visibleResourceSearchResults.length} of {resourceSearchResults.length} matching resources. Narrow the search for more precise actions.</p> : null}
-      </CardContent>
-    </Card>
   );
 
   const renderAssignmentForm = () => (
@@ -3329,17 +3298,16 @@ function AssignmentManagement(props: {
 
   return (
     <div className="grid gap-5">
-      <PageTitle title="Assignment Management" description="Search IP resources first, then choose Assign, Unassign, or Partial Reassign." />
-      {renderEmbeddedGlobalSearch()}
-      <div className="grid gap-3 lg:grid-cols-3">
+      <PageTitle title="Assignment Management" description="Choose Assign, Unassign, Partial Reassign, or open Global Search." />
+      <div className="grid gap-3 lg:grid-cols-4">
         {workflowTiles.map((tile) => {
           const Icon = tile.icon;
-          const active = workflow === tile.id;
+          const active = tile.active;
           return (
             <button
               key={tile.id}
               type="button"
-              onClick={() => openWorkflow(tile.id)}
+              onClick={tile.action}
               className={cn(
                 "rounded-md border bg-card p-4 text-left transition hover:border-primary/70 hover:bg-muted/20",
                 active && "border-primary bg-primary/10 shadow-sm"
@@ -3863,6 +3831,11 @@ type ConflictSideInfo = {
   resource: ManagedResource | null;
 };
 
+function conflictResourceOrganization(resource: ManagedResource) {
+  const sourceCustomer = resource.source && "customer_name" in resource.source ? resource.source.customer_name : "";
+  return resource.organizationName || sourceCustomer || resource.fullName || resource.netname || "N/A";
+}
+
 function ConflictSide({ label, side, onOpen }: { label: string; side: ConflictSideInfo | null; onOpen: (resource: ManagedResource) => void }) {
   if (!side) {
     return (
@@ -3880,7 +3853,7 @@ function ConflictSide({ label, side, onOpen }: { label: string; side: ConflictSi
         <div className="mt-2 grid gap-1 text-xs text-muted-foreground">
           <span>UUID: {side.resource.uuid}</span>
           <span>Status: {side.resource.administrativeStatus}</span>
-          <span>Owner: {side.resource.owner || "N/A"}</span>
+          <span>Organization: {conflictResourceOrganization(side.resource)}</span>
           <span>Range: {side.resource.startIp} - {side.resource.endIp}</span>
           <Button className="mt-2 w-fit" size="sm" variant="outline" type="button" onClick={() => onOpen(side.resource!)}>
             Review Resource

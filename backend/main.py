@@ -3561,6 +3561,35 @@ def cst_batch_transaction_result(batch_status: str, batch_last_error: str, batch
         return "SUCCESS", "", response
     return "FAILED", message or batch_last_error or "CST transaction failed", response
 
+
+def cst_duplicate_sendlir_transaction_failure(operation: str, status: str, last_error: str, response: dict) -> bool:
+    if operation.upper() != "SEND" or status != "FAILED":
+        return False
+    parts = [last_error]
+    if isinstance(response, dict):
+        parts.extend([
+            cst_error_text(response.get("body")),
+            cst_error_text(response.get("message")),
+            cst_error_text(response.get("individualTransactionMessage")),
+        ])
+    text = " ".join(part for part in parts if part).lower()
+    compact = re.sub(r"[^a-z0-9]+", "", text)
+    duplicate = "duplicate" in text or "already exists" in text or "existing cidr" in text or "duplicate" in compact
+    transaction = "transaction" in text or "transactionid" in compact
+    send_lir = "sendlir" in compact or "sendlirdata" in compact
+    return duplicate and (transaction or send_lir)
+
+
+def cst_should_preserve_success_after_duplicate_send_failure(
+    connection: sqlite3.Connection,
+    resource: ResourceRecord,
+    operation: str,
+    status: str,
+    last_error: str,
+    response: dict,
+) -> bool:
+    return cst_duplicate_sendlir_transaction_failure(operation, status, last_error, response) and cst_resource_reported_to_cst(connection, resource)
+
 def create_cst_assignment_create_jobs(
     connection: sqlite3.Connection,
     assignment: Assignment,
@@ -3675,6 +3704,12 @@ def insert_cst_sync_job_result(
 ) -> CstSyncJob:
     updated_at = now_iso()
     last_error = cst_enriched_api_error(last_error, payload, response)
+    preserve_success_status = cst_should_preserve_success_after_duplicate_send_failure(connection, resource, operation, status, last_error, response)
+    if preserve_success_status:
+        response = dict(response)
+        response["preservedLocalCstSyncStatus"] = "SUCCESS"
+        response["preserveReason"] = "Duplicate SendLIR transaction failure; local resource was already successfully synchronized."
+        last_error = f"{last_error} | Local CST sync status retained as SUCCESS because CST reported a duplicate SendLIR transaction."
     job = CstSyncJob(
         id=f"cst-job-{uuid4().hex[:12]}",
         batch_id=batch_id,
@@ -3708,21 +3743,22 @@ def insert_cst_sync_job_result(
             retired_reason = COALESCE(NULLIF(?, ''), retired_reason), batch_id = ?, correlation_id = ?
         WHERE transaction_id = ?
         """,
-        (resource.cidr, resource.resource_uuid, resource.service_provider_id or DEFAULT_SERVICE_PROVIDER_ID, status, retired_at, retired_reason, batch_id, correlation_id, transaction_id),
+        (resource.cidr, resource.resource_uuid, resource.service_provider_id or DEFAULT_SERVICE_PROVIDER_ID, "SUCCESS" if preserve_success_status else status, retired_at, retired_reason, batch_id, correlation_id, transaction_id),
     )
-    action_flag = "D" if operation == "DELETE" and status == "SUCCESS" else "U" if operation == "UPDATE" and status == "SUCCESS" else "S" if status == "SUCCESS" else "F" if status in {"FAILED"} else "U"
+    effective_resource_status = "SUCCESS" if preserve_success_status else status
+    action_flag = "D" if operation == "DELETE" and effective_resource_status == "SUCCESS" else "U" if operation == "UPDATE" and effective_resource_status == "SUCCESS" else "S" if effective_resource_status == "SUCCESS" else "F" if effective_resource_status in {"FAILED"} else "U"
     connection.execute(
         """
         UPDATE ip_resources
         SET transaction_id = ?, cst_sync_status = ?, action_flag = ?, update_date = ?, updated_at = ?
         WHERE resource_uuid = ?
         """,
-        (transaction_id, status, action_flag, updated_at, updated_at, resource.resource_uuid),
+        (transaction_id, effective_resource_status, action_flag, updated_at, updated_at, resource.resource_uuid),
     )
     if resource.source_entity_type == "assignment":
         connection.execute(
             "UPDATE assignments SET cst_sync_status = ?, action_flag = ? WHERE id = ?",
-            (status, action_flag, resource.source_entity_id),
+            (effective_resource_status, action_flag, resource.source_entity_id),
         )
     return job
 
@@ -3902,6 +3938,12 @@ def update_existing_cst_job_result(
     updated_at: str,
 ) -> None:
     last_error = cst_enriched_api_error(last_error, payload, response)
+    preserve_success_status = cst_should_preserve_success_after_duplicate_send_failure(connection, resource, job.operation, status, last_error, response)
+    if preserve_success_status:
+        response = dict(response)
+        response["preservedLocalCstSyncStatus"] = "SUCCESS"
+        response["preserveReason"] = "Duplicate SendLIR transaction failure; local resource was already successfully synchronized."
+        last_error = f"{last_error} | Local CST sync status retained as SUCCESS because CST reported a duplicate SendLIR transaction."
     connection.execute(
         """
         UPDATE cst_sync_jobs
@@ -3912,9 +3954,10 @@ def update_existing_cst_job_result(
     )
     connection.execute(
         "UPDATE cst_transaction_ledger SET last_status = ?, batch_id = ? WHERE transaction_id = ?",
-        (status, job.batch_id, job.transaction_id),
+        ("SUCCESS" if preserve_success_status else status, job.batch_id, job.transaction_id),
     )
-    action_flag = "D" if job.operation == "DELETE" and status == "SUCCESS" else "U" if job.operation == "UPDATE" and status == "SUCCESS" else "S" if status == "SUCCESS" else "F" if status in {"FAILED"} else "U"
+    effective_resource_status = "SUCCESS" if preserve_success_status else status
+    action_flag = "D" if job.operation == "DELETE" and effective_resource_status == "SUCCESS" else "U" if job.operation == "UPDATE" and effective_resource_status == "SUCCESS" else "S" if effective_resource_status == "SUCCESS" else "F" if effective_resource_status in {"FAILED"} else "U"
     retired_at = updated_at if job.operation == "DELETE" and status == "SUCCESS" else ""
     retired_reason = "Removed from CST LIR registry" if retired_at else ""
     connection.execute(
@@ -3924,16 +3967,16 @@ def update_existing_cst_job_result(
             retired_at = COALESCE(NULLIF(?, ''), retired_at), retired_reason = COALESCE(NULLIF(?, ''), retired_reason)
         WHERE transaction_id = ?
         """,
-        (resource.cidr, resource.resource_uuid, resource.service_provider_id, status, retired_at, retired_reason, job.transaction_id),
+        (resource.cidr, resource.resource_uuid, resource.service_provider_id, effective_resource_status, retired_at, retired_reason, job.transaction_id),
     )
     connection.execute(
         "UPDATE ip_resources SET cst_sync_status = ?, transaction_id = ?, action_flag = ?, updated_at = ? WHERE resource_uuid = ?",
-        (status, job.transaction_id, action_flag, updated_at, job.resource_uuid),
+        (effective_resource_status, job.transaction_id, action_flag, updated_at, job.resource_uuid),
     )
     if resource.source_entity_type == "assignment":
         connection.execute(
             "UPDATE assignments SET cst_sync_status = ?, action_flag = ? WHERE id = ?",
-            (status, action_flag, resource.source_entity_id),
+            (effective_resource_status, action_flag, resource.source_entity_id),
         )
 
 
@@ -4088,42 +4131,41 @@ def retry_cst_jobs(connection: sqlite3.Connection, job_rows: list[sqlite3.Row], 
             last_error = ""
             message = "Local resource was removed before CST reporting; CST API call is not required"
             response = {"temporaryStorage": False, "externalApiCalled": False, "accepted": True, "message": message, "processedAt": now_iso()}
-        last_error = cst_enriched_api_error(last_error, payload, response)
-        connection.execute(
-            """
-            UPDATE cst_sync_jobs
-            SET status = ?, attempt_count = attempt_count + 1, last_error = ?, payload_json = ?, response_json = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (status, last_error, json.dumps(payload, sort_keys=True), json.dumps(response, sort_keys=True), updated_at, job.id),
-        )
-        connection.execute(
-            "UPDATE cst_transaction_ledger SET last_status = ?, batch_id = ? WHERE transaction_id = ?",
-            (status, job.batch_id, job.transaction_id),
-        )
-        action_flag = "D" if job.operation == "DELETE" and status == "SUCCESS" else "U" if job.operation == "UPDATE" and status == "SUCCESS" else "S" if status == "SUCCESS" else "F" if status in {"FAILED"} else "U"
-        retired_at = updated_at if job.operation == "DELETE" and status == "SUCCESS" else ""
-        retired_reason = "Removed from CST LIR registry" if retired_at else ""
-        ledger_resource_uuid = resource.resource_uuid if resource else job.resource_uuid
-        ledger_cidr = resource.cidr if resource else job.cidr
-        ledger_service_provider_id = resource.service_provider_id if resource else job.service_provider_id
-        connection.execute(
-            """
-            UPDATE cst_transaction_ledger
-            SET cidr = ?, resource_uuid = ?, service_provider_id = ?, last_status = ?,
-                retired_at = COALESCE(NULLIF(?, ''), retired_at), retired_reason = COALESCE(NULLIF(?, ''), retired_reason)
-            WHERE transaction_id = ?
-            """,
-            (ledger_cidr, ledger_resource_uuid, ledger_service_provider_id, status, retired_at, retired_reason, job.transaction_id),
-        )
-        connection.execute(
-            "UPDATE ip_resources SET cst_sync_status = ?, transaction_id = ?, action_flag = ?, updated_at = ? WHERE resource_uuid = ?",
-            (status, job.transaction_id, action_flag, updated_at, job.resource_uuid),
-        )
-        if resource and resource.source_entity_type == "assignment":
+        if resource:
+            update_existing_cst_job_result(
+                connection,
+                job=job,
+                resource=resource,
+                payload=payload,
+                status=status,
+                last_error=last_error,
+                response=response,
+                updated_at=updated_at,
+            )
+        else:
+            last_error = cst_enriched_api_error(last_error, payload, response)
             connection.execute(
-                "UPDATE assignments SET cst_sync_status = ?, action_flag = ? WHERE id = ?",
-                (status, action_flag, resource.source_entity_id),
+                """
+                UPDATE cst_sync_jobs
+                SET status = ?, attempt_count = attempt_count + 1, last_error = ?, payload_json = ?, response_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (status, last_error, json.dumps(payload, sort_keys=True), json.dumps(response, sort_keys=True), updated_at, job.id),
+            )
+            connection.execute(
+                "UPDATE cst_transaction_ledger SET last_status = ?, batch_id = ? WHERE transaction_id = ?",
+                (status, job.batch_id, job.transaction_id),
+            )
+            retired_at = updated_at if job.operation == "DELETE" and status == "SUCCESS" else ""
+            retired_reason = "Removed from CST LIR registry" if retired_at else ""
+            connection.execute(
+                """
+                UPDATE cst_transaction_ledger
+                SET cidr = ?, resource_uuid = ?, service_provider_id = ?, last_status = ?,
+                    retired_at = COALESCE(NULLIF(?, ''), retired_at), retired_reason = COALESCE(NULLIF(?, ''), retired_reason)
+                WHERE transaction_id = ?
+                """,
+                (job.cidr, job.resource_uuid, job.service_provider_id, status, retired_at, retired_reason, job.transaction_id),
             )
         updated = connection.execute("SELECT * FROM cst_sync_jobs WHERE id = ?", (job.id,)).fetchone()
         updated_jobs.append(cst_job_from_row(updated))
