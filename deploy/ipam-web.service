@@ -9,6 +9,7 @@ Group=ipam
 WorkingDirectory=/opt/netatlas-ipam
 Environment=NODE_ENV=production
 Environment=PORT=8082
+Environment=NODE_OPTIONS=--max-old-space-size=4096
 ExecStart=/usr/bin/npm run start
 Restart=always
 RestartSec=5

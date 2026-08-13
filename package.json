@@ -7,7 +7,7 @@
     "dev": "next dev --port 8082",
     "web": "next dev --port 8082",
     "build": "next build",
-    "start": "next start --port 8082",
+    "start": "node --max-old-space-size=4096 node_modules/next/dist/bin/next start --port 8082",
     "expo:web": "expo start --web --port 8082",
     "expo:start": "expo start",
     "typecheck": "tsc --noEmit"
