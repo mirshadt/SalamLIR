@@ -4512,6 +4512,9 @@ function Reporting({
   const filteredActiveAssignmentRows = filterReportRows(activeAssignmentRows, activeAssignmentFilters, ACTIVE_ASSIGNMENT_COLUMNS);
   const utilizationRows = resourceUtilizationRows(reportingResources);
   const filteredAllIpRows = filterReportRows(utilizationRows, allIpFilters, ALL_IP_REPORT_COLUMNS);
+  const cstSyncedAllIpRows = filteredAllIpRows.filter(isCstSyncedReportRow);
+  const allIpTotalCount = sumReportCellNumbers(filteredAllIpRows, "total_ips");
+  const cstSyncedIpCount = sumReportCellNumbers(cstSyncedAllIpRows, "total_ips");
   const registryRows = registryExportRows(reportingResources);
   const visiblePoolSummaryRows = filteredPoolSummaryRows.slice(0, poolSummaryVisibleRows);
   const visibleLocalAllocatedPoolRows = localAllocatedPoolRows.slice(0, localAllocatedPoolVisibleRows);
@@ -5006,11 +5009,13 @@ function Reporting({
           </div>
         </CardHeader>
         <CardContent className="grid gap-3">
-          <div className="grid gap-3 md:grid-cols-4">
-            <ReportMetric label="All IP Rows" value={String(filteredAllIpRows.length)} detail={`${utilizationRows.length} total rows before filters`} />
-            <ReportMetric label="Unassigned" value={String(filteredAllIpRows.filter((item) => item.administrative_status === "AVAILABLE").length)} detail="Available/free rows" />
-            <ReportMetric label="Assigned" value={String(filteredAllIpRows.filter((item) => item.administrative_status === "ASSIGNED").length)} detail="Active allocation rows" />
-            <ReportMetric label="Reserved" value={String(filteredAllIpRows.filter((item) => item.administrative_status === "RESERVED").length)} detail="Held capacity rows" />
+          <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
+            <ReportMetric label="All Subnets" value={formatReportNumber(filteredAllIpRows.length)} detail={`${formatReportNumber(allIpTotalCount)} IPs in filtered rows`} />
+            <ReportMetric label="Unassigned" value={formatReportNumber(filteredAllIpRows.filter((item) => item.administrative_status === "AVAILABLE").length)} detail="Available/free subnets" />
+            <ReportMetric label="Assigned" value={formatReportNumber(filteredAllIpRows.filter((item) => item.administrative_status === "ASSIGNED").length)} detail="Active assignment subnets" />
+            <ReportMetric label="Reserved" value={formatReportNumber(filteredAllIpRows.filter((item) => item.administrative_status === "RESERVED").length)} detail="Held capacity subnets" />
+            <ReportMetric label="CST Synced Subnets" value={formatReportNumber(cstSyncedAllIpRows.length)} detail="Rows with CST SUCCESS/SYNCHRONIZED" />
+            <ReportMetric label="CST Synced IPs" value={formatReportNumber(cstSyncedIpCount)} detail="Total IPs already synced with CST" />
           </div>
           <div className="max-h-[620px] overflow-auto rounded-md border" onScroll={loadMoreUtilizationRows}>
             <Table>
@@ -7557,6 +7562,23 @@ function resourceUtilizationRows(resources: ManagedResource[]): ResourceUtilizat
       notes: assignment?.notes ?? pool?.tags ?? ""
     };
   });
+}
+
+function isCstSyncedReportRow(row: ResourceUtilizationRow) {
+  return ["SUCCESS", "SYNCHRONIZED", "SYNCED", "CST SYNCED"].includes(String(row.cst_sync_status ?? "").trim().toUpperCase());
+}
+
+function reportCellNumber(value: ExportCell) {
+  const parsed = typeof value === "number" ? value : Number(String(value ?? "").replace(/,/g, ""));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function sumReportCellNumbers(rows: ResourceUtilizationRow[], key: string) {
+  return rows.reduce((total, row) => total + reportCellNumber(row[key]), 0);
+}
+
+function formatReportNumber(value: number) {
+  return value.toLocaleString("en-US");
 }
 
 function exportAllIpRows(rows: ResourceUtilizationRow[], format: "csv" | "xlsx") {
