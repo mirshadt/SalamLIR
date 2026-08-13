@@ -25,7 +25,7 @@ except ImportError:  # Optional until Siebel lookup is enabled on the server.
     oracledb = None
 import time
 import threading
-from uuid import NAMESPACE_URL, uuid4, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from zoneinfo import ZoneInfo
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException
@@ -1374,6 +1374,13 @@ def stable_uuid(*parts: str) -> str:
     return str(uuid5(NAMESPACE_URL, ":".join(parts)))
 
 
+def is_uuid_text(value: object) -> bool:
+    try:
+        UUID(str(value or "").strip())
+        return True
+    except (TypeError, ValueError):
+        return False
+
 def new_version_uuid() -> str:
     return str(uuid4())
 
@@ -1506,16 +1513,19 @@ def resource_record_for_pool(pool: Pool, existing: ResourceRecord | None = None)
     network = network_of(pool)
     ip_type = "PRIVATE" if network.is_private else "PUBLIC"
     updated_at = now_iso()
+    resource_uuid = existing.resource_uuid if existing else pool_resource_uuid(pool)
+    preferred_transaction_id = str((existing.transaction_id if existing else "") or pool.id or resource_uuid).strip()
+    transaction_id = preferred_transaction_id if is_uuid_text(preferred_transaction_id) else resource_uuid
     default_cst_sync_status = "PENDING" if ip_type == "PUBLIC" and status != "RETIRED" else "NOT_REQUIRED"
     default_ripe_sync_status = "PENDING" if network.is_global else "NOT_REQUIRED"
     cst_sync_status = existing.cst_sync_status if existing and ip_type == "PUBLIC" else default_cst_sync_status
     ripe_sync_status = existing.ripe_sync_status if existing and network.is_global else default_ripe_sync_status
     return ResourceRecord(
-        resource_uuid=existing.resource_uuid if existing else pool_resource_uuid(pool),
+        resource_uuid=resource_uuid,
         version_uuid=new_version_uuid() if existing else stable_uuid("version", "pool", pool.id, pool.cidr, pool.created_at),
         parent_resource_uuid="",
         parent_version_uuid="",
-        transaction_id=pool.external_id or pool.id,
+        transaction_id=transaction_id,
         cidr=pool.cidr,
         prefix=pool.prefix,
         start_ip=pool.start,
@@ -2568,9 +2578,11 @@ def cst_transaction_id_for_resource(connection: sqlite3.Connection, resource: Re
         (resource.resource_uuid, resource.cidr, resource.resource_uuid),
     ).fetchone()
     if existing and not str(existing["retired_at"] or ""):
-        return str(existing["transaction_id"])
+        existing_transaction_id = str(existing["transaction_id"] or "").strip()
+        if operation != "SEND" or is_uuid_text(existing_transaction_id):
+            return existing_transaction_id
     preferred_transaction_id = str(resource.transaction_id or "").strip()
-    if operation != "SEND" and preferred_transaction_id:
+    if operation != "SEND" and preferred_transaction_id and is_uuid_text(preferred_transaction_id):
         existing_transaction = connection.execute(
             "SELECT 1 FROM cst_transaction_ledger WHERE transaction_id = ?",
             (preferred_transaction_id,),
@@ -2599,7 +2611,7 @@ def cst_transaction_id_for_resource(connection: sqlite3.Connection, resource: Re
         return preferred_transaction_id
 
     service_provider_id = resource.service_provider_id or DEFAULT_SERVICE_PROVIDER_ID
-    if operation == "SEND" and preferred_transaction_id:
+    if operation == "SEND" and preferred_transaction_id and is_uuid_text(preferred_transaction_id):
         duplicate = connection.execute(
             "SELECT 1 FROM cst_transaction_ledger WHERE transaction_id = ?",
             (preferred_transaction_id,),
@@ -6684,10 +6696,37 @@ def run_cst_day_minus_one_now(target_date: str = "") -> CstSchedulerRun:
     return run_cst_day_minus_one_sync(target_date, "manual")
 
 @app.get("/cst/batches", response_model=list[CstSyncBatch])
-def list_cst_batches() -> list[CstSyncBatch]:
+def list_cst_batches(limit: int = 1000, search: str = "", status: str = "") -> list[CstSyncBatch]:
+    filters = []
+    params: list[object] = []
+    if search.strip():
+        filters.append("(id LIKE ? OR workflow_type LIKE ?)")
+        term = f"%{search.strip()}%"
+        params.extend([term, term])
+    if status.strip() and status.strip().upper() != "ALL":
+        filters.append("status = ?")
+        params.append(status.strip().upper())
+    where = f"WHERE {' AND '.join(filters)}" if filters else ""
+    capped_limit = min(max(int(limit or 1000), 1), 5000)
+    params.append(capped_limit)
     with connect() as connection:
-        rows = connection.execute("SELECT * FROM cst_sync_batches ORDER BY created_at DESC LIMIT 200").fetchall()
+        rows = connection.execute(f"SELECT * FROM cst_sync_batches {where} ORDER BY created_at DESC LIMIT ?", params).fetchall()
     return [cst_batch_from_row(row) for row in rows]
+
+
+@app.get("/cst/batches/{batch_id}/jobs", response_model=list[CstSyncJob])
+def list_cst_batch_jobs(batch_id: str, status: str = "") -> list[CstSyncJob]:
+    filters = ["batch_id = ?"]
+    params: list[object] = [batch_id]
+    if status.strip() and status.strip().upper() != "ALL":
+        filters.append("status = ?")
+        params.append(status.strip().upper())
+    with connect() as connection:
+        rows = connection.execute(
+            f"SELECT * FROM cst_sync_jobs WHERE {' AND '.join(filters)} ORDER BY sequence_no, updated_at DESC, created_at DESC",
+            params,
+        ).fetchall()
+    return [cst_job_from_row(row) for row in rows]
 
 
 @app.get("/cst/jobs", response_model=list[CstSyncJob])
@@ -6743,9 +6782,12 @@ def cst_resource_existing_transaction_id(connection: sqlite3.Connection, resourc
         """,
         (resource.resource_uuid, resource.cidr, resource.resource_uuid),
     ).fetchone()
-    if row:
-        return str(row["transaction_id"] or "")
-    return str(resource.transaction_id or "")
+    transaction_id = str(row["transaction_id"] or "").strip() if row else str(resource.transaction_id or "").strip()
+    if transaction_id and is_uuid_text(transaction_id):
+        return transaction_id
+    if resource.source_entity_type == "pool" and is_uuid_text(resource.resource_uuid):
+        return resource.resource_uuid
+    return transaction_id
 
 
 def cst_resource_has_existing_job(connection: sqlite3.Connection, resource_uuid: str) -> bool:

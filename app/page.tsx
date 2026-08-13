@@ -70,6 +70,7 @@ import {
   rejectConflictAssignment,
   autoResolveExactDuplicateConflicts,
   getCstBatches,
+  getCstBatchJobs,
   getCstConfig,
   getCstJobs,
   getCstSchedulerRuns,
@@ -959,7 +960,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   const databaseStatusQuery = useQuery({ queryKey: ["database-status"], queryFn: getDatabaseConnectionStatus, ...liveQueryOptions });
   const cstConfigQuery = useQuery({ queryKey: ["cst-config"], queryFn: getCstConfig, ...liveQueryOptions });
   const cstSummaryQuery = useQuery({ queryKey: ["cst-summary"], queryFn: getCstSummary, ...liveQueryOptions });
-  const cstBatchesQuery = useQuery({ queryKey: ["cst-batches"], queryFn: getCstBatches, ...liveQueryOptions });
+  const cstBatchesQuery = useQuery({ queryKey: ["cst-batches"], queryFn: () => getCstBatches({ limit: 1000 }), ...liveQueryOptions });
   const cstSchedulerRunsQuery = useQuery({ queryKey: ["cst-scheduler-runs"], queryFn: getCstSchedulerRuns, ...liveQueryOptions });
   const cstJobsQuery = useQuery({
     queryKey: ["cst-jobs"],
@@ -4496,6 +4497,7 @@ function Reporting({
   const [activeReport, setActiveReport] = useState<"pool-summary" | "local-allocated-pool-utilization" | "active-assignments" | "cst-lir" | "resource-utilization" | "ripe-allocation" | null>(null);
   const [poolSummaryFilters, setPoolSummaryFilters] = useState<Record<string, string>>({});
   const [activeAssignmentFilters, setActiveAssignmentFilters] = useState<Record<string, string>>({});
+  const [allIpFilters, setAllIpFilters] = useState<Record<string, string>>({});
   const [poolSummaryVisibleRows, setPoolSummaryVisibleRows] = useState(REPORT_BATCH_SIZE);
   const [localAllocatedPoolVisibleRows, setLocalAllocatedPoolVisibleRows] = useState(REPORT_BATCH_SIZE);
   const [activeAssignmentVisibleRows, setActiveAssignmentVisibleRows] = useState(REPORT_BATCH_SIZE);
@@ -4509,12 +4511,13 @@ function Reporting({
   const activeAssignmentRows = activeAssignmentReportRows(resources);
   const filteredActiveAssignmentRows = filterReportRows(activeAssignmentRows, activeAssignmentFilters, ACTIVE_ASSIGNMENT_COLUMNS);
   const utilizationRows = resourceUtilizationRows(reportingResources);
+  const filteredAllIpRows = filterReportRows(utilizationRows, allIpFilters, ALL_IP_REPORT_COLUMNS);
   const registryRows = registryExportRows(reportingResources);
   const visiblePoolSummaryRows = filteredPoolSummaryRows.slice(0, poolSummaryVisibleRows);
   const visibleLocalAllocatedPoolRows = localAllocatedPoolRows.slice(0, localAllocatedPoolVisibleRows);
   const visibleActiveAssignmentRows = filteredActiveAssignmentRows.slice(0, activeAssignmentVisibleRows);
   const visibleRegistryRows = registryRows.slice(0, registryVisibleRows);
-  const visibleUtilizationRows = utilizationRows.slice(0, utilizationVisibleRows);
+  const visibleUtilizationRows = filteredAllIpRows.slice(0, utilizationVisibleRows);
   const ripeRows = ripeReportResult?.rows ?? [];
   const ripeColumns = ripeRows.length ? ripeAssignmentColumns(ripeRows) : [];
   const visibleRipeRows = ripeRows.slice(0, ripeVisibleRows);
@@ -4528,7 +4531,7 @@ function Reporting({
   useEffect(() => {
     setRegistryVisibleRows(REPORT_BATCH_SIZE);
     setUtilizationVisibleRows(REPORT_BATCH_SIZE);
-  }, [resources.length]);
+  }, [allIpFilters, resources.length]);
   useEffect(() => {
     setRipeVisibleRows(REPORT_BATCH_SIZE);
   }, [ripeRows.length]);
@@ -4553,8 +4556,8 @@ function Reporting({
     }
   };
   const loadMoreUtilizationRows = (event: UIEvent<HTMLDivElement>) => {
-    if (shouldLoadNextReportBatch(event, utilizationVisibleRows, utilizationRows.length)) {
-      setUtilizationVisibleRows((current) => Math.min(current + REPORT_BATCH_SIZE, utilizationRows.length));
+    if (shouldLoadNextReportBatch(event, utilizationVisibleRows, filteredAllIpRows.length)) {
+      setUtilizationVisibleRows((current) => Math.min(current + REPORT_BATCH_SIZE, filteredAllIpRows.length));
     }
   };
   const loadMoreRipeRows = (event: UIEvent<HTMLDivElement>) => {
@@ -4572,7 +4575,7 @@ function Reporting({
     { id: "pool-summary", activeId: "pool-summary" as const, name: "Subnet Summary Report", scope: `${filteredPoolSummaryRows.length} of ${poolSummaryRows.length} registered subnets`, status: "Available" },
     { id: "local-allocated-pool-utilization", activeId: "local-allocated-pool-utilization" as const, name: "Local Allocated Pool Utilization Report", scope: `${localAllocatedPoolRows.length} allocated pools`, status: "Available" },
     { id: "active-assignments", activeId: "active-assignments" as const, name: "All Active Assignments Report", scope: `${filteredActiveAssignmentRows.length} of ${activeAssignmentRows.length} active assignments`, status: "Available" },
-    { id: "resource-utilization", activeId: "resource-utilization" as const, name: "Resource Utilization Report", scope: `${reportingResources.length} resources`, status: "Available" },
+    { id: "resource-utilization", activeId: "resource-utilization" as const, name: "All IPs Report", scope: `${filteredAllIpRows.length} of ${utilizationRows.length} assigned and unassigned IP rows`, status: "Available" },
     { id: "cst-lir", activeId: "cst-lir" as const, name: "CST/LIR Registry Report", scope: `${registryRows.length} CIDRs`, status: "Available" },
     { id: "ripe-assignment", activeId: "ripe-allocation" as const, name: "RIPE Assignment Report", scope: "Maintainer ITC-NOC-MNT inetnum assignments", status: "Available" },
     { id: "reservations", name: "Reservation Report", scope: `${resources.filter((item) => item.administrativeStatus === "RESERVED").length} reservations`, status: "Planned" },
@@ -4981,64 +4984,73 @@ function Reporting({
         <CardHeader>
           <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
             <div>
-              <CardTitle>Resource Utilization Export</CardTitle>
-              <CardDescription>Exports every CIDR in the registry, including registered, assigned, reserved, retired, and calculated available subnet CIDRs.</CardDescription>
+              <CardTitle>All IPs Report</CardTitle>
+              <CardDescription>Assigned and unassigned IP resources in one assignment-style report, including customer/service details when assigned and availability/utilization details when unassigned.</CardDescription>
             </div>
             <div className="flex flex-wrap gap-2">
               <Button variant="outline" onClick={() => setActiveReport(null)}>
                 Back to Reports
               </Button>
-              <Button variant="outline" onClick={() => exportResourceUtilization(reportingResources, "csv")}>
+              <Button variant="outline" onClick={() => exportAllIpRows(filteredAllIpRows, "csv")}>
                 <FileDown className="h-4 w-4" />
                 Export CSV
               </Button>
-              <Button onClick={() => exportResourceUtilization(reportingResources, "xlsx")}>
+              <Button onClick={() => exportAllIpRows(filteredAllIpRows, "xlsx")}>
                 <FileDown className="h-4 w-4" />
                 Export XLSX
+              </Button>
+              <Button variant="ghost" onClick={() => setAllIpFilters({})} disabled={!Object.values(allIpFilters).some(Boolean)}>
+                Clear Search
               </Button>
             </div>
           </div>
         </CardHeader>
         <CardContent className="grid gap-3">
           <div className="grid gap-3 md:grid-cols-4">
-            <ReportMetric label="CIDRs" value={String(reportingResources.length)} detail="Rows included in export" />
-            <ReportMetric label="Available" value={String(reportingResources.filter((item) => item.administrativeStatus === "AVAILABLE").length)} detail="Free CIDR blocks" />
-            <ReportMetric label="Assigned" value={String(reportingResources.filter((item) => item.administrativeStatus === "ASSIGNED").length)} detail="Active allocations" />
-            <ReportMetric label="Reserved" value={String(reportingResources.filter((item) => item.administrativeStatus === "RESERVED").length)} detail="Held capacity" />
+            <ReportMetric label="All IP Rows" value={String(filteredAllIpRows.length)} detail={`${utilizationRows.length} total rows before filters`} />
+            <ReportMetric label="Unassigned" value={String(filteredAllIpRows.filter((item) => item.administrative_status === "AVAILABLE").length)} detail="Available/free rows" />
+            <ReportMetric label="Assigned" value={String(filteredAllIpRows.filter((item) => item.administrative_status === "ASSIGNED").length)} detail="Active allocation rows" />
+            <ReportMetric label="Reserved" value={String(filteredAllIpRows.filter((item) => item.administrative_status === "RESERVED").length)} detail="Held capacity rows" />
           </div>
           <div className="max-h-[620px] overflow-auto rounded-md border" onScroll={loadMoreUtilizationRows}>
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead>CIDR</TableHead>
-                  <TableHead>Status</TableHead>
-                  <TableHead>Type</TableHead>
-                  <TableHead>Range</TableHead>
-                  <TableHead>Free IPs</TableHead>
-                  <TableHead>Utilization</TableHead>
+                  {ALL_IP_REPORT_COLUMNS.map((column) => (
+                    <TableHead key={column.key}>{column.header}</TableHead>
+                  ))}
+                </TableRow>
+                <TableRow>
+                  {ALL_IP_REPORT_COLUMNS.map((column) => (
+                    <TableHead key={column.key}>
+                      <Input
+                        className="h-8 min-w-[120px] bg-background text-xs"
+                        value={allIpFilters[column.key] ?? ""}
+                        onChange={(event) => setAllIpFilters((current) => ({ ...current, [column.key]: event.target.value }))}
+                        placeholder={`Search ${column.header}`}
+                      />
+                    </TableHead>
+                  ))}
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {visibleUtilizationRows.map((row, rowIndex) => (
-                  <TableRow key={reportRowKey(row, rowIndex, "resource-utilization")}>
-                    <TableCell className="font-semibold">{row.cidr}</TableCell>
-                    <TableCell><Badge variant={badgeForStatus(row.administrative_status)}>{row.administrative_status}</Badge></TableCell>
-                    <TableCell>{row.resource_type}</TableCell>
-                    <TableCell>{row.start_ip} - {row.end_ip}</TableCell>
-                    <TableCell>{row.free_ips}</TableCell>
-                    <TableCell>{row.utilization_percent}%</TableCell>
+                  <TableRow key={reportRowKey(row, rowIndex, "all-ips")}>
+                    {ALL_IP_REPORT_COLUMNS.map((column) => (
+                      <TableCell key={column.key} className={column.key === "cidr" ? "font-semibold" : ""}>{String(row[column.key] ?? "")}</TableCell>
+                    ))}
                   </TableRow>
                 ))}
-                {!utilizationRows.length ? (
+                {!filteredAllIpRows.length ? (
                   <TableRow>
-                    <TableCell colSpan={6} className="py-6 text-center text-muted-foreground">No CIDR records available to export.</TableCell>
+                    <TableCell colSpan={ALL_IP_REPORT_COLUMNS.length} className="py-6 text-center text-muted-foreground">{utilizationRows.length ? "No IP rows match the current filters." : "No IP records available to export."}</TableCell>
                   </TableRow>
                 ) : null}
               </TableBody>
             </Table>
           </div>
           <p className="text-xs text-muted-foreground">
-            Showing {Math.min(utilizationVisibleRows, utilizationRows.length)} of {utilizationRows.length} rows. Scroll down to load the next {REPORT_BATCH_SIZE}. The exported file includes all {RESOURCE_UTILIZATION_COLUMNS.length} columns.
+            Showing {Math.min(utilizationVisibleRows, filteredAllIpRows.length)} of {filteredAllIpRows.length} matching rows. Scroll down to load the next {REPORT_BATCH_SIZE}. Export includes all matching assigned and unassigned rows.
           </p>
         </CardContent>
       </Card>
@@ -5447,20 +5459,56 @@ function CstMigrationReviewDialog(props: {
   );
 }
 function CstIntegrationMonitor(props: CstMonitorProps) {
+  const [pendingPushLimit, setPendingPushLimit] = useState("0");
+  const [selectedBatchId, setSelectedBatchId] = useState(props.cstBatches[0]?.id ?? "");
+  const [batchSearch, setBatchSearch] = useState("");
+  const [batchStatusFilter, setBatchStatusFilter] = useState("all");
+  const [batchJobStatusFilter, setBatchJobStatusFilter] = useState("FAILED");
   const pendingCount = props.cstSummary?.pending_jobs ?? 0;
-  const configuredBatchLimit = Math.max(props.cstConfig?.batch_size_limit ?? 500, 1);
-  const [pendingPushLimit, setPendingPushLimit] = useState("");
-  const numericPendingPushLimit = Number(pendingPushLimit);
-  const pendingPushCount = Number.isFinite(numericPendingPushLimit) && numericPendingPushLimit > 0 ? Math.floor(numericPendingPushLimit) : 0;
-  const effectivePendingPushCount = pendingPushCount > 0 ? Math.min(pendingPushCount, configuredBatchLimit) : Math.min(pendingCount, configuredBatchLimit);
-  const pendingPushLabel = `Push ${effectivePendingPushCount} Pending`;
+  const pendingPushCount = Math.max(Number(pendingPushLimit) || 0, 0);
+  const pendingPushLabel = pendingPushCount > 0 ? `Push ${pendingPushCount} Pending` : "Push All Pending";
+  const selectedBatch = props.cstBatches.find((batch) => batch.id === selectedBatchId) ?? null;
+  useEffect(() => {
+    if (!selectedBatchId && props.cstBatches.length) {
+      setSelectedBatchId(props.cstBatches[0].id);
+    }
+  }, [props.cstBatches, selectedBatchId]);
+  const filteredBatches = useMemo(() => {
+    const needle = batchSearch.trim().toLowerCase();
+    return props.cstBatches.filter((batch) => {
+      const statusMatch = batchStatusFilter === "all" || batch.status === batchStatusFilter;
+      const searchMatch = !needle || batch.id.toLowerCase().includes(needle) || batch.workflow_type.toLowerCase().includes(needle);
+      return statusMatch && searchMatch;
+    });
+  }, [batchSearch, batchStatusFilter, props.cstBatches]);
+  const batchJobsQuery = useQuery({
+    queryKey: ["cst-batch-jobs", selectedBatchId, batchJobStatusFilter],
+    queryFn: () => getCstBatchJobs(selectedBatchId, batchJobStatusFilter),
+    enabled: Boolean(selectedBatchId),
+    staleTime: 5000,
+    refetchOnWindowFocus: false
+  });
+  const selectedBatchJobs = batchJobsQuery.data ?? [];
+  const retryableStatuses = new Set(["FAILED", "BLOCKED", "PENDING"]);
+  const openBatch = (batch: CstSyncBatch) => {
+    setSelectedBatchId(batch.id);
+    setBatchJobStatusFilter(batch.failed_jobs > 0 ? "FAILED" : batch.blocked_jobs > 0 ? "BLOCKED" : batch.completed_jobs < batch.total_jobs ? "PENDING" : "all");
+  };
+  const retryJobFromBatch = (job: CstSyncJob) => {
+    props.onRetryCstJob(job);
+    window.setTimeout(() => void batchJobsQuery.refetch(), 1200);
+  };
+  const retrySelectedBatch = (batch: CstSyncBatch) => {
+    props.onRetryCstBatch(batch);
+    window.setTimeout(() => void batchJobsQuery.refetch(), 1500);
+  };
   return (
     <Card>
       <CardHeader>
         <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <div>
-            <CardTitle>CST Integration Monitor</CardTitle>
-            <CardDescription>CST SEND, UPDATE, DELETE, and GET workflows execute against the real CST API using cached OAuth tokens.</CardDescription>
+            <CardTitle>CST Sync Monitor</CardTitle>
+            <CardDescription>Monitor transaction jobs, daily schedules, retry failures, and open any CST batch for job-level details.</CardDescription>
           </div>
           <div className="flex flex-wrap gap-2">
             <Button variant="outline" onClick={props.onRefreshCst} disabled={props.cstBusy}>
@@ -5471,12 +5519,12 @@ function CstIntegrationMonitor(props: CstMonitorProps) {
               <CstResourceScopeSelector value={props.cstResourceScope} onChange={props.onCstResourceScope} />
             </div>
             <Button variant="secondary" onClick={props.onBootstrapCst}>
-              <Database className="h-4 w-4" />
-              Create Migration Jobs
+              <Upload className="h-4 w-4" />
+              Create Migration Job
             </Button>
             <Button variant="outline" onClick={props.onReconcileCst}>
               <Search className="h-4 w-4" />
-              Reconcile
+              GetLIR Pull
             </Button>
             <label className="flex items-center gap-2 rounded-md border bg-muted/20 px-2 py-1">
               <span className="text-xs font-medium text-muted-foreground">Submit</span>
@@ -5544,12 +5592,20 @@ function CstIntegrationMonitor(props: CstMonitorProps) {
               </TableBody>
             </Table>
           </div>
-        </div>          <div className="grid gap-4 xl:grid-cols-2">
+        </div>
+        <div className="grid gap-4 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
           <div className="grid gap-2">
-            <div className="flex items-center justify-between gap-2">
-              <h3 className="text-sm font-semibold">Recent Batches</h3>
+            <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+              <div>
+                <h3 className="text-sm font-semibold">Recent Batches</h3>
+                <p className="text-xs text-muted-foreground">Loaded up to {props.cstBatches.length} batches. Click a batch ID to review its jobs.</p>
+              </div>
+              <div className="flex gap-2">
+                <Input className="h-9 w-56" value={batchSearch} onChange={(event) => setBatchSearch(event.target.value)} placeholder="Search batch/workflow" />
+                <Select value={batchStatusFilter} values={["all", "FAILED", "PENDING", "RUNNING", "SUCCESS", "NOT_REQUIRED"]} onChange={setBatchStatusFilter} />
+              </div>
             </div>
-            <div className="max-h-[300px] overflow-auto rounded-md border">
+            <div className="max-h-[360px] overflow-auto rounded-md border">
               <Table>
                 <TableHeader>
                   <TableRow>
@@ -5561,23 +5617,41 @@ function CstIntegrationMonitor(props: CstMonitorProps) {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {props.cstBatches.slice(0, 40).map((batch) => (
-                    <TableRow key={batch.id}>
-                      <TableCell className="font-mono text-xs">{batch.id}</TableCell>
-                      <TableCell>{batch.workflow_type}</TableCell>
+                  {filteredBatches.map((batch) => (
+                    <TableRow key={batch.id} className={batch.id === selectedBatchId ? "bg-primary/5" : undefined}>
+                      <TableCell>
+                        <button type="button" className="font-mono text-xs font-semibold text-primary underline-offset-2 hover:underline" onClick={() => openBatch(batch)}>
+                          {batch.id}
+                        </button>
+                        <p className="text-xs text-muted-foreground">{formatDateTime(batch.created_at)}</p>
+                      </TableCell>
+                      <TableCell className="max-w-[220px] truncate" title={batch.workflow_type}>{batch.workflow_type}</TableCell>
                       <TableCell><Badge variant={batch.status === "SUCCESS" ? "success" : batch.status === "FAILED" || batch.status === "BLOCKED" ? "danger" : "warning"}>{batch.status}</Badge></TableCell>
-                      <TableCell>{batch.completed_jobs}/{batch.total_jobs}</TableCell>
-                      <TableCell>{batch.failed_jobs > 0 || batch.blocked_jobs > 0 || batch.completed_jobs < batch.total_jobs ? <Button size="sm" variant="outline" onClick={() => props.onRetryCstBatch(batch)}>Retry Batch</Button> : null}</TableCell>
+                      <TableCell>{batch.completed_jobs}/{batch.total_jobs}<span className="ml-1 text-xs text-muted-foreground">failed {batch.failed_jobs}</span></TableCell>
+                      <TableCell>{batch.failed_jobs > 0 || batch.blocked_jobs > 0 || batch.completed_jobs < batch.total_jobs ? <Button size="sm" variant="outline" onClick={() => retrySelectedBatch(batch)}>Retry Batch</Button> : null}</TableCell>
                     </TableRow>
                   ))}
-                  {!props.cstBatches.length ? <TableRow><TableCell colSpan={5} className="py-6 text-center text-muted-foreground">No CST batches yet.</TableCell></TableRow> : null}
+                  {!filteredBatches.length ? <TableRow><TableCell colSpan={5} className="py-6 text-center text-muted-foreground">No CST batches match the filter.</TableCell></TableRow> : null}
                 </TableBody>
               </Table>
             </div>
           </div>
           <div className="grid gap-2">
-            <h3 className="text-sm font-semibold">Recent Jobs</h3>
-            <div className="max-h-[300px] overflow-auto rounded-md border">
+            <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+              <div>
+                <h3 className="text-sm font-semibold">Batch Details</h3>
+                <p className="font-mono text-xs text-muted-foreground">{selectedBatchId || "Select a batch"}</p>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Select value={batchJobStatusFilter} values={["FAILED", "PENDING", "BLOCKED", "RUNNING", "SUCCESS", "NOT_REQUIRED", "all"]} onChange={setBatchJobStatusFilter} />
+                <Button size="sm" variant="outline" onClick={() => void batchJobsQuery.refetch()} disabled={!selectedBatchId || batchJobsQuery.isFetching}>
+                  {batchJobsQuery.isFetching ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCcw className="h-4 w-4" />}
+                  Refresh Jobs
+                </Button>
+                {selectedBatch && (selectedBatch.failed_jobs > 0 || selectedBatch.blocked_jobs > 0 || selectedBatch.completed_jobs < selectedBatch.total_jobs) ? <Button size="sm" variant="outline" onClick={() => retrySelectedBatch(selectedBatch)}>Retry Batch</Button> : null}
+              </div>
+            </div>
+            <div className="max-h-[360px] overflow-auto rounded-md border">
               <Table>
                 <TableHeader>
                   <TableRow>
@@ -5589,25 +5663,59 @@ function CstIntegrationMonitor(props: CstMonitorProps) {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {props.cstJobs.slice(0, 60).map((job) => (
+                  {selectedBatchJobs.map((job) => (
                     <TableRow key={job.id}>
                       <TableCell>
                         <p className="font-semibold">{job.cidr}</p>
                         <p className="font-mono text-xs text-muted-foreground">{job.transaction_id}</p>
-                        <p className="font-mono text-xs text-muted-foreground">{formatDateTime(job.created_at)}</p>
+                        <p className="font-mono text-xs text-muted-foreground">{job.id}</p>
                       </TableCell>
                       <TableCell>{job.operation}</TableCell>
                       <TableCell><Badge variant={job.status === "SUCCESS" ? "success" : job.status === "FAILED" || job.status === "BLOCKED" ? "danger" : job.status === "PENDING" ? "warning" : "default"}>{job.status}</Badge></TableCell>
                       <TableCell className="max-w-[360px] text-xs text-muted-foreground">{job.last_error || "-"}</TableCell>
-                      <TableCell>
-                        {job.status === "FAILED" || job.status === "BLOCKED" || job.status === "PENDING" ? <Button size="sm" variant="outline" onClick={() => props.onRetryCstJob(job)}>Retry</Button> : null}
-                      </TableCell>
+                      <TableCell>{retryableStatuses.has(job.status) ? <Button size="sm" variant="outline" onClick={() => retryJobFromBatch(job)}>Retry</Button> : null}</TableCell>
                     </TableRow>
                   ))}
-                  {!props.cstJobs.length ? <TableRow><TableCell colSpan={5} className="py-6 text-center text-muted-foreground">No CST jobs yet.</TableCell></TableRow> : null}
+                  {selectedBatchId && batchJobsQuery.isFetching ? <TableRow><TableCell colSpan={5} className="py-6 text-center text-muted-foreground">Loading batch jobs...</TableCell></TableRow> : null}
+                  {selectedBatchId && !batchJobsQuery.isFetching && !selectedBatchJobs.length ? <TableRow><TableCell colSpan={5} className="py-6 text-center text-muted-foreground">No jobs match this batch/status filter.</TableCell></TableRow> : null}
+                  {!selectedBatchId ? <TableRow><TableCell colSpan={5} className="py-6 text-center text-muted-foreground">Select a batch to view failed jobs and retry individual transactions.</TableCell></TableRow> : null}
                 </TableBody>
               </Table>
             </div>
+          </div>
+        </div>
+        <div className="grid gap-2">
+          <h3 className="text-sm font-semibold">Recent Jobs</h3>
+          <div className="max-h-[300px] overflow-auto rounded-md border">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>CIDR</TableHead>
+                  <TableHead>Operation</TableHead>
+                  <TableHead>Status</TableHead>
+                  <TableHead>Reason</TableHead>
+                  <TableHead>Batch</TableHead>
+                  <TableHead />
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {props.cstJobs.slice(0, 60).map((job) => (
+                  <TableRow key={job.id}>
+                    <TableCell>
+                      <p className="font-semibold">{job.cidr}</p>
+                      <p className="font-mono text-xs text-muted-foreground">{job.transaction_id}</p>
+                      <p className="font-mono text-xs text-muted-foreground">{formatDateTime(job.created_at)}</p>
+                    </TableCell>
+                    <TableCell>{job.operation}</TableCell>
+                    <TableCell><Badge variant={job.status === "SUCCESS" ? "success" : job.status === "FAILED" || job.status === "BLOCKED" ? "danger" : job.status === "PENDING" ? "warning" : "default"}>{job.status}</Badge></TableCell>
+                    <TableCell className="max-w-[360px] text-xs text-muted-foreground">{job.last_error || "-"}</TableCell>
+                    <TableCell><button type="button" className="font-mono text-xs text-primary underline-offset-2 hover:underline" onClick={() => setSelectedBatchId(job.batch_id)}>{job.batch_id}</button></TableCell>
+                    <TableCell>{retryableStatuses.has(job.status) ? <Button size="sm" variant="outline" onClick={() => props.onRetryCstJob(job)}>Retry</Button> : null}</TableCell>
+                  </TableRow>
+                ))}
+                {!props.cstJobs.length ? <TableRow><TableCell colSpan={6} className="py-6 text-center text-muted-foreground">No CST jobs yet.</TableCell></TableRow> : null}
+              </TableBody>
+            </Table>
           </div>
         </div>
         <div className="grid gap-2">
@@ -5630,7 +5738,7 @@ function CstIntegrationMonitor(props: CstMonitorProps) {
                     <TableCell className="font-semibold">{item.cidr}</TableCell>
                     <TableCell><Badge variant={item.last_status === "SUCCESS" ? "success" : item.last_status === "FAILED" || item.last_status === "BLOCKED" ? "danger" : "warning"}>{item.last_status}</Badge></TableCell>
                     <TableCell>{formatDateTime(item.first_used_at)}</TableCell>
-                    <TableCell className="font-mono text-xs">{item.batch_id}</TableCell>
+                    <TableCell><button type="button" className="font-mono text-xs text-primary underline-offset-2 hover:underline" onClick={() => setSelectedBatchId(item.batch_id)}>{item.batch_id}</button></TableCell>
                   </TableRow>
                 ))}
                 {!props.cstTransactions.length ? <TableRow><TableCell colSpan={5} className="py-6 text-center text-muted-foreground">No CST transaction IDs have been generated.</TableCell></TableRow> : null}
@@ -5642,7 +5750,6 @@ function CstIntegrationMonitor(props: CstMonitorProps) {
     </Card>
   );
 }
-
 
 function DatabaseConnectionSettings(props: {
   status: DatabaseConnectionStatus | null;
@@ -7000,6 +7107,55 @@ const ACTIVE_ASSIGNMENT_COLUMNS: Array<{ key: string; header: string }> = [
   { key: "last_updated", header: "Last Updated" }
 ];
 
+const ALL_IP_REPORT_COLUMNS: Array<{ key: string; header: string }> = [
+  { key: "cidr", header: "CIDR" },
+  { key: "start_ip", header: "Start IP" },
+  { key: "end_ip", header: "End IP" },
+  { key: "total_ips", header: "Total IPs" },
+  { key: "used_ips", header: "Assigned IPs" },
+  { key: "reserved_ips", header: "Reserved IPs" },
+  { key: "free_ips", header: "Available IPs" },
+  { key: "utilization_percent", header: "Utilization %" },
+  { key: "assignment_status", header: "Assignment Status" },
+  { key: "administrative_status", header: "Resource Status" },
+  { key: "assignment_target_type", header: "Assignment Target Type" },
+  { key: "source_record_type", header: "Source Type" },
+  { key: "resource_type", header: "Resource Type" },
+  { key: "resource_role", header: "Resource Role" },
+  { key: "classification", header: "Classification" },
+  { key: "parent_cidr", header: "Parent CIDR" },
+  { key: "pool_name", header: "Parent Pool Name" },
+  { key: "customer_name", header: "Customer Name" },
+  { key: "organization_name", header: "Organization Name" },
+  { key: "customer_id", header: "Customer ID" },
+  { key: "organization_id", header: "Organization ID" },
+  { key: "service_id", header: "Service ID" },
+  { key: "service_instance_id", header: "Service Instance ID" },
+  { key: "service_description", header: "Service Description" },
+  { key: "customer_type", header: "Customer Type" },
+  { key: "subnet_type", header: "Subnet Type" },
+  { key: "product_class", header: "Product Class" },
+  { key: "region_id", header: "Region ID" },
+  { key: "city_id", header: "City ID" },
+  { key: "city", header: "City" },
+  { key: "region", header: "Region" },
+  { key: "contact_name", header: "Contact Name" },
+  { key: "contact_number", header: "Contact Number" },
+  { key: "contact_email", header: "Contact Email" },
+  { key: "transaction_id", header: "Transaction ID" },
+  { key: "cst_sync_status", header: "CST Sync Status" },
+  { key: "ripe_sync_status", header: "RIPE Sync Status" },
+  { key: "source_registry", header: "Source Registry" },
+  { key: "netname", header: "Netname" },
+  { key: "description", header: "Description" },
+  { key: "owner", header: "Owner / Maintainer" },
+  { key: "asn", header: "ASN" },
+  { key: "site", header: "Site" },
+  { key: "vrf_name", header: "VRF Name" },
+  { key: "assignment_date", header: "Assignment Date" },
+  { key: "last_updated", header: "Last Updated" },
+  { key: "resource_uuid", header: "Resource UUID" }
+];
 const RESOURCE_UTILIZATION_COLUMNS: Array<{ key: string; header: string }> = [
   { key: "resource_id", header: "Resource ID" },
   { key: "resource_uuid", header: "Resource UUID" },
@@ -7348,7 +7504,11 @@ function resourceUtilizationRows(resources: ManagedResource[]): ResourceUtilizat
       pool_site_name: pool?.site_name ?? "",
       assignment_target_type: assignment?.assignment_target_type ?? "",
       assignment_name: assignment?.assignment_name ?? "",
-      assignment_status: assignment?.status ?? "",
+      assignment_status: assignment?.status ?? resource.administrativeStatus,
+      organization_name: assignment?.organization_name ?? resource.organizationName,
+      organization_id: assignment?.organization_id ?? resource.organizationId,
+      service_id: assignment?.service_id ?? resource.serviceId,
+      service_description: assignment?.service_description ?? resource.serviceDescription,
       assignment_date: assignment?.assignment_date ?? "",
       assignment_purpose: assignment?.assignment_purpose ?? "",
       service_specification_id: assignment?.service_specification_id ?? "",
@@ -7359,19 +7519,21 @@ function resourceUtilizationRows(resources: ManagedResource[]): ResourceUtilizat
       service_category: assignment?.service_category ?? "",
       l3_service: assignment?.l3_service ?? "",
       service: assignment?.service ?? "",
-      customer_id: assignment?.customer_id ?? "",
-      customer_name: assignment?.customer_name ?? "",
-      customer_type: assignment?.customer_type ?? "NA",
-      subnet_type: assignment?.subnet_type ?? "NA",
-      product_class: assignment?.product_class ?? "",
+      customer_id: assignment?.customer_id ?? resource.organizationId,
+      customer_name: assignment?.customer_name ?? resource.organizationName ?? resource.fullName ?? "",
+      customer_type: assignment?.customer_type ?? resource.customerType ?? "NA",
+      subnet_type: assignment?.subnet_type ?? resource.subnetType ?? "NA",
+      product_class: assignment?.product_class ?? resource.productClass ?? "",
       customer_account_id: assignment?.customer_account_id ?? "",
       customer_segment: assignment?.customer_segment ?? "",
       commercial_reg_id: assignment?.commercial_reg_id ?? "",
       unified_number: assignment?.unified_number ?? "",
-      contact_name: assignment?.contact_name ?? "",
-      contact_number: assignment?.contact_number ?? "",
-      contact_email: assignment?.contact_email ?? "",
+      contact_name: assignment?.contact_name ?? resource.fullName,
+      contact_number: assignment?.contact_number ?? resource.mobileNumber,
+      contact_email: assignment?.contact_email ?? resource.email,
       city: assignment?.city ?? "",
+      region_id: assignment?.region_id ?? resource.regionId,
+      city_id: assignment?.city_id ?? resource.cityId,
       region: assignment?.region ?? "",
       internal_business_unit: assignment?.internal_business_unit ?? "",
       internal_application_id: assignment?.internal_application_id ?? "",
@@ -7397,18 +7559,21 @@ function resourceUtilizationRows(resources: ManagedResource[]): ResourceUtilizat
   });
 }
 
-function exportResourceUtilization(resources: ManagedResource[], format: "csv" | "xlsx") {
-  const rows = resourceUtilizationRows(resources);
+function exportAllIpRows(rows: ResourceUtilizationRow[], format: "csv" | "xlsx") {
   const date = today();
   if (format === "csv") {
-    downloadBlob(`resource-utilization-${date}.csv`, "text/csv;charset=utf-8", buildCsv(rows));
+    downloadBlob(`all-ips-${date}.csv`, "text/csv;charset=utf-8", buildColumnCsv(ALL_IP_REPORT_COLUMNS, rows));
     return;
   }
   downloadBlob(
-    `resource-utilization-${date}.xlsx`,
+    `all-ips-${date}.xlsx`,
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    buildXlsx("Resource Utilization", RESOURCE_UTILIZATION_COLUMNS.map((column) => column.header), rows.map((row) => RESOURCE_UTILIZATION_COLUMNS.map((column) => row[column.key] ?? "")))
+    buildXlsx("All IPs", ALL_IP_REPORT_COLUMNS.map((column) => column.header), rows.map((row) => ALL_IP_REPORT_COLUMNS.map((column) => row[column.key] ?? "")))
   );
+}
+
+function exportResourceUtilization(resources: ManagedResource[], format: "csv" | "xlsx") {
+  exportAllIpRows(resourceUtilizationRows(resources), format);
 }
 
 function exportGlobalSearchResults(resources: ManagedResource[]) {

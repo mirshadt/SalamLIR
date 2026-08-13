@@ -1110,8 +1110,8 @@ export async function getCstSummary() {
   return data;
 }
 
-export async function getCstBatches() {
-  const { data } = await api.get<CstSyncBatch[]>("/cst/batches");
+export async function getCstBatches(params: { limit?: number; search?: string; status?: string } = {}) {
+  const { data } = await api.get<CstSyncBatch[]>("/cst/batches", { params });
   return data;
 }
 
@@ -1127,6 +1127,11 @@ export async function runCstDayMinusOneSync(targetDate = "") {
 
 export async function getCstJobs() {
   const { data } = await api.get<CstSyncJob[]>("/cst/jobs");
+  return data;
+}
+
+export async function getCstBatchJobs(batchId: string, status = "all") {
+  const { data } = await api.get<CstSyncJob[]>(`/cst/batches/${batchId}/jobs`, { params: { status } });
   return data;
 }
 
