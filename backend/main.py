@@ -4,6 +4,8 @@ import csv
 import hashlib
 import hmac
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 from io import StringIO
 from urllib import error as urllib_error, parse as urllib_parse, request as urllib_request
 import ssl
@@ -68,9 +70,38 @@ CST_DEFAULT_ACCEPT_LANGUAGE = "EN"
 CST_API_TIMEZONE = timezone(timedelta(hours=3))
 CST_API_LOG_PATH = Path(os.environ.get("CST_API_LOG_FILE") or Path(__file__).with_name("logs") / "cst_api_exchange.jsonl")
 CST_API_LOG_ENABLED = os.environ.get("CST_API_FILE_LOG_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+BACKEND_LOG_PATH = Path(os.environ.get("BACKEND_LOG_FILE") or Path(__file__).with_name("logs") / "backend.log")
+BACKEND_LOG_LEVEL = os.environ.get("BACKEND_LOG_LEVEL", "INFO").strip().upper()
 CST_LOG_SENSITIVE_KEYS = {"authorization", "x-gateway-apikey", "apikey", "api_key", "access_token", "token", "refresh_token", "client_secret", "password"}
 BULK_UNASSIGNED_FRAGMENT_SOURCE = "bulk_unassigned_fragment"
 AUDIT_SERVICE = AuditService(lambda: now_iso())
+
+
+def configure_backend_logging() -> logging.Logger:
+    BACKEND_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    level = getattr(logging, BACKEND_LOG_LEVEL, logging.INFO)
+    formatter = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+    file_handler_exists = False
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers:
+        if getattr(handler, "_salam_lir_backend_file", False):
+            file_handler_exists = True
+            handler.setLevel(level)
+            handler.setFormatter(formatter)
+    if not file_handler_exists:
+        file_handler = RotatingFileHandler(BACKEND_LOG_PATH, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8")
+        file_handler.setLevel(level)
+        file_handler.setFormatter(formatter)
+        file_handler._salam_lir_backend_file = True
+        root_logger.addHandler(file_handler)
+    root_logger.setLevel(min(root_logger.level or level, level))
+    for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access", "salam_lir"):
+        logging.getLogger(logger_name).setLevel(level)
+    return logging.getLogger("salam_lir.backend")
+
+
+LOGGER = configure_backend_logging()
+LOGGER.info("Backend logging initialized at %s", BACKEND_LOG_PATH)
 
 app = FastAPI(title="NetAtlas IPAM API", version="1.0.0")
 
@@ -81,6 +112,20 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def backend_request_file_logger(request, call_next):
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        LOGGER.exception("%s %s failed after %sms", request.method, request.url.path, elapsed_ms)
+        raise
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    LOGGER.info("%s %s -> %s in %sms", request.method, request.url.path, response.status_code, elapsed_ms)
+    return response
 
 
 class PoolCreate(BaseModel):
@@ -9434,7 +9479,7 @@ def init_db_with_retry(max_attempts: int = 6) -> None:
             if attempt == max_attempts:
                 raise
             delay_seconds = min(2 * attempt, 10)
-            print(f"SQLite database is locked during startup migration; retrying in {delay_seconds}s ({attempt}/{max_attempts})")
+            LOGGER.warning("SQLite database is locked during startup migration; retrying in %ss (%s/%s)", delay_seconds, attempt, max_attempts)
             time.sleep(delay_seconds)
 
 
