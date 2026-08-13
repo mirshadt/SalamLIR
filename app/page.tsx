@@ -1336,6 +1336,13 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                 onOpen={openResource}
                 onCreatePool={() => run(async () => { await api.post("/pools", poolForm); })}
                 onRefresh={refresh}
+                onRefreshNavigator={() => {
+                  void poolsQuery.refetch();
+                  void registryAssignmentsQuery.refetch();
+                  void dashboardSummaryQuery.refetch();
+                  void conflictsQuery.refetch();
+                }}
+                navigatorRefreshing={poolsQuery.isFetching || registryAssignmentsQuery.isFetching}
                 ripeDiscoveryResult={ripeDiscoveryResult}
                 ripeDiscoveryStatus={ripeDiscoveryStatus}
                 ripeDiscoveryActionKey={ripeDiscoveryActionKey}
@@ -2179,6 +2186,8 @@ function ResourceRegistry(props: {
   onOpen: (resource: ManagedResource) => void;
   onCreatePool: () => void;
   onRefresh: () => void;
+  onRefreshNavigator: () => void;
+  navigatorRefreshing: boolean;
   onDiscoverRipePools: () => void;
   onSyncRipePool: (pool: RipeDiscoveredRootPool) => void;
   onSyncCstLir: (pool: RipeDiscoveredRootPool) => void;
@@ -2245,7 +2254,7 @@ function ResourceRegistry(props: {
 
       {activeRegistryPanel === "cst-sync-monitor" ? <CstIntegrationMonitor {...props} /> : null}
 
-      {activeRegistryPanel === "subnet-navigator" ? <SubnetNavigator resources={visible} query={props.globalSearch} onQuery={props.onGlobalSearch} onOpen={props.onOpen} /> : null}
+      {activeRegistryPanel === "subnet-navigator" ? <SubnetNavigator resources={visible} query={props.globalSearch} isRefreshing={props.navigatorRefreshing} onQuery={props.onGlobalSearch} onRefresh={props.onRefreshNavigator} onOpen={props.onOpen} /> : null}
     </div>
   );
 }
@@ -2511,12 +2520,16 @@ function RipeSyncWorklist({
 function SubnetNavigator({
   resources,
   query,
+  isRefreshing = false,
   onQuery,
+  onRefresh,
   onOpen
 }: {
   resources: ManagedResource[];
   query?: string;
+  isRefreshing?: boolean;
   onQuery?: (value: string) => void;
+  onRefresh: () => void;
   onOpen: (resource: ManagedResource) => void;
 }) {
   const displayResources = presentationSubnets(resources);
@@ -2534,6 +2547,10 @@ function SubnetNavigator({
             {onQuery ? (
               <Input className="md:max-w-sm" value={query ?? ""} onChange={(event) => onQuery(event.target.value)} placeholder="Search CIDR, resource ID, owner, status, netname" />
             ) : null}
+            <Button variant="outline" onClick={onRefresh} disabled={isRefreshing}>
+              <RefreshCcw className={cn("h-4 w-4", isRefreshing ? "animate-spin" : "")} />
+              {isRefreshing ? "Refreshing" : "Refresh"}
+            </Button>
             <Button variant="outline" onClick={() => exportLocalAllocatedPoolUtilizationRows(localAllocatedPoolUtilizationRows(displayResources), "csv")} disabled={!displayResources.length}>
               <FileDown className="h-4 w-4" />
               Export CSV
