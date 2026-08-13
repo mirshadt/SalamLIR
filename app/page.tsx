@@ -873,7 +873,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   const [ripeConfigForm, setRipeConfigForm] = useState<RipeConfigPayload>({ base_url: "https://rest.db.ripe.net", auth_type: "Basic Authentication", username: "", password: "", connection_timeout: 10, read_timeout: 30, default_maintainer: "ITC-NOC-MNT" });
   const [siebelConfigForm, setSiebelConfigForm] = useState<SiebelConfigPayload>({ username: "LIR_USER", password: "", dsn: "172.31.23.101:1525/SIDB", connection_timeout: 10, query_sql: DEFAULT_SIEBEL_QUERY });
   const [databaseConnectionForm, setDatabaseConnectionForm] = useState<DatabaseConnectionPayload>({ host: "localhost", port: 5432, database: "lir", username: "lir_app", password: "", ssl_mode: "prefer", connect_timeout: 10 });
-  const [cstResourceScope, setCstResourceScope] = useState<CstResourceScope>("assigned");
+  const [cstResourceScope, setCstResourceScope] = useState<CstResourceScope>("all");
   const [cstMigrationReviewOpen, setCstMigrationReviewOpen] = useState(false);
   const [cstMigrationReview, setCstMigrationReview] = useState<CstMigrationReviewResponse | null>(null);
   const [cstMigrationReviewLoading, setCstMigrationReviewLoading] = useState(false);
@@ -4762,7 +4762,7 @@ function shouldLoadNextReportBatch(event: UIEvent<HTMLDivElement>, visibleRows: 
 }
 
 
-const CST_RESOURCE_SCOPE_OPTIONS: CstResourceScope[] = ["assigned", "all", "unassigned"];
+const CST_RESOURCE_SCOPE_OPTIONS: CstResourceScope[] = ["all", "assigned", "unassigned"];
 const CST_RESOURCE_SCOPE_LABELS: Record<CstResourceScope, string> = {
   assigned: "Assignments only",
   all: "All LIR data",
@@ -4848,7 +4848,7 @@ function CstLirApiSettings(props: CstLirApiSettingsProps) {
           <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
             <div>
               <p className="font-semibold">CST LIR operation switches</p>
-              <p className="text-xs text-muted-foreground">Control whether CST jobs call the real API immediately, queue locally, or block selected operation types.</p>
+              <p className="text-xs text-muted-foreground">Control whether CST jobs call the real API immediately, queue locally, or block selected operation types. Default scope includes assigned and unassigned LIR resources.</p>
             </div>
             <div className="flex flex-wrap gap-2">
               <Badge variant={props.cstConfigForm.enabled === false ? "warning" : "success"}>{props.cstConfigForm.enabled === false ? "CST disabled" : "CST enabled"}</Badge>
@@ -5041,7 +5041,7 @@ function CstMigrationReviewDialog(props: {
       <DialogContent className="max-w-6xl">
         <DialogHeader>
           <DialogTitle>Review Pending CST Transactions</DialogTitle>
-          <DialogDescription>Review, filter, exclude, and confirm CST LIR records before creating a migration job. Scope: {cstScopeLabel(props.resourceScope)}.</DialogDescription>
+          <DialogDescription>Review, filter, exclude, and confirm assigned and unassigned CST LIR records before creating a migration job. Scope: {cstScopeLabel(props.resourceScope)}.</DialogDescription>
         </DialogHeader>
         <div className="grid gap-4">
           <div className="grid gap-3 md:grid-cols-6">
