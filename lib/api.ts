@@ -1131,7 +1131,7 @@ export async function getCstTransactions() {
 }
 
 export async function reviewCstMigrationJobs(payload: CstMigrationReviewRequest = {}) {
-  const { data } = await api.post<CstMigrationReviewResponse>("/cst/migration-jobs/review", payload);
+  const { data } = await api.post<CstMigrationReviewResponse>("/cst/migration-jobs/review", payload, { timeout: 15 * 60 * 1000 });
   return data;
 }
 

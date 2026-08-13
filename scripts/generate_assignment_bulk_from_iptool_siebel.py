@@ -2,6 +2,10 @@
 """
 Generate Salam LIR bulk-assignment import CSV by joining IP Tool data with Siebel data.
 
+Legacy IP Tool-only mode:
+  Use --legacy-iptool-only with --city-map to generate the same final bulk assignment CSV
+  from IP Tool rows only, using defaults for contact/ID fields that normally come from Siebel.
+
 Default join:
   1. IP Tool "Order Number" -> Siebel "SERIAL_NUM", when SERIAL_NUM exists
   2. IP Tool "CustomerNumber" -> Siebel "ACCOUNT_NUMBER", for the simplified Siebel template
@@ -161,9 +165,53 @@ def normalize_sa_phone(value: str, fallback: str = "0000000000") -> tuple[str, s
     return fallback, f"invalid phone {raw!r} normalized to fallback"
 
 
+EMAIL_PATTERN = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+PHONE_TOKEN_PATTERN = re.compile(r"(?:\+?966|00966|0)?(?:5\d{8}|1\d{8})")
+LABELED_ID_PATTERN = re.compile(r"(?i)(?:iqama|national\s*id|identity|id\s*(?:no|num|number)?|idnumber)\D{0,20}(\d[\d\s-]{8,18}\d)")
+
+
 def normalized_email(value: str) -> str:
-    text = str(value or "").strip()
-    return text if "@" in text else ""
+    text = str(value or "").strip().strip(";,<>()[]{}")
+    return text if EMAIL_PATTERN.fullmatch(text) else ""
+
+
+def extract_email_from_text(*values: str) -> str:
+    for value in values:
+        match = EMAIL_PATTERN.search(str(value or ""))
+        if match:
+            return match.group(0).strip(";,<>()[]{}")
+    return ""
+
+
+def extract_phone_from_text(*values: str) -> str:
+    for value in values:
+        compact = re.sub(r"[\s().-]+", "", str(value or ""))
+        for match in PHONE_TOKEN_PATTERN.finditer(compact):
+            candidate, _warning = normalize_sa_phone(match.group(0), "")
+            if candidate:
+                return candidate
+    return ""
+
+
+def extract_id_from_text(*values: str) -> str:
+    for value in values:
+        for match in LABELED_ID_PATTERN.finditer(str(value or "")):
+            valid = valid_10_digit(match.group(1))
+            if valid:
+                return valid
+    return ""
+
+
+def iptool_contact_text(row: dict[str, str]) -> str:
+    return " ".join(
+        value
+        for value in (
+            row_get(row, "ShipToAddress", "Ship To Address", "ship_to_address"),
+            row_get(row, "Remark", "Remarks", "Notes", "notes"),
+            row_get(row, "Contact", "Contact Details", "ContactInfo", "Contact Info"),
+        )
+        if value
+    )
 
 
 def cidr_from_iptool(row: dict[str, str]) -> str:
@@ -236,15 +284,44 @@ def customer_type_id_from_iptool(row: dict[str, str], default_customer_type_id: 
 
 
 
+def map_name_variants(value: str) -> list[str]:
+    key = normalized_header(value)
+    if not key:
+        return []
+    variants = [key]
+    if key.startswith("al") and len(key) > 2:
+        variants.append(key[2:])
+    return list(dict.fromkeys(variants))
+
+
 def load_simple_map(path: Path | None) -> dict[str, str]:
     if not path:
         return {}
     mapping: dict[str, str] = {}
     for row in read_table(path):
+        city_id = row_get(row, "city_id", "CityId", "cityId")
+        if city_id:
+            for source in (row_get(row, "city_name_en", "CityNameEn", "cityNameEn"), row_get(row, "city_name_ar", "CityNameAr", "cityNameAr")):
+                for key in map_name_variants(source):
+                    mapping[key] = city_id
+            continue
         source = row_get(row, "source", "name", "value", "text", "region", "city")
         target = row_get(row, "id", "target", "cstId", "cst_id")
         if source and target:
-            mapping[normalized_header(source)] = target
+            for key in map_name_variants(source):
+                mapping[key] = target
+    return mapping
+
+
+def load_city_region_map(path: Path | None) -> dict[str, str]:
+    if not path:
+        return {}
+    mapping: dict[str, str] = {}
+    for row in read_table(path):
+        city_id = row_get(row, "city_id", "CityId", "cityId")
+        region_id = row_get(row, "region_id", "RegionId", "regionId")
+        if city_id and region_id:
+            mapping[city_id] = region_id
     return mapping
 
 
@@ -362,11 +439,12 @@ def lookup_builtin(mapping: dict[str, str], value: str) -> str:
     return mapping.get(key, "")
 
 
-def resolve_region_id(region_text: str, city_id: str, region_map: dict[str, str], default_region_id: str) -> str:
+def resolve_region_id(region_text: str, city_id: str, region_map: dict[str, str], city_region_map: dict[str, str], default_region_id: str) -> str:
     return (
         map_lookup(region_map, region_text)
-        or lookup_builtin(CST_REGION_BY_NAME, region_text)
+        or city_region_map.get(city_id, "")
         or CST_CITY_REGION_BY_ID.get(city_id, "")
+        or lookup_builtin(CST_REGION_BY_NAME, region_text)
         or default_region_id
     )
 
@@ -427,12 +505,14 @@ def make_bulk_row(
     args: argparse.Namespace,
     region_map: dict[str, str],
     city_map: dict[str, str],
+    city_region_map: dict[str, str],
 ) -> dict[str, str]:
     cidr = cidr_from_iptool(iptool)
     iptool_city, iptool_region, iptool_site = location_from_iptool(iptool)
+    contact_text = iptool_contact_text(iptool)
 
     customer_name = row_get(siebel, "ACCOUNT_NAME") or row_get(iptool, "CustomerName", "Customer Name") or "Business Customer"
-    customer_id = row_get(siebel, "ACCOUNT_NUMBER") or row_get(iptool, "CustomerNumber", "Customer Number")
+    customer_id = row_get(siebel, "ACCOUNT_NUMBER") or row_get(iptool, "CustomerNumber", "Customer Number") or "0"
     org_id = organization_identifier(siebel, iptool) or customer_id
     commercial_reg = valid_10_digit(row_get(siebel, "X_ITC_B2B_COMMERCIAL_REGIS_NUM"))
     unified = valid_10_digit(row_get(siebel, "X_ITC_B2B_UNIFIED_NUMBER"))
@@ -440,18 +520,25 @@ def make_bulk_row(
     region_text = row_get(siebel, "ACCOUNT_REGION", "REGION", "Region") or iptool_region
     city_text = row_get(siebel, "CITY", "ACCOUNT_CITY", "City") or iptool_city
     city_id = resolve_city_id(city_text, city_map, args.city_id)
-    region_id = resolve_region_id(region_text, city_id, region_map, args.region_id)
+    region_id = resolve_region_id(region_text, city_id, region_map, city_region_map, args.region_id)
 
-    phone_source = row_get(siebel, "CON_PHONE_NUM", "MAIN_PH_NUM") or row_get(iptool, "MobileNumber", "Mobile Number", "ContactNumber", "Contact Number")
+    phone_source = row_get(siebel, "CON_PHONE_NUM", "MAIN_PH_NUM") or row_get(iptool, "MobileNumber", "Mobile Number", "ContactNumber", "Contact Number") or extract_phone_from_text(contact_text)
     phone, _phone_warning = normalize_sa_phone(phone_source, args.invalid_phone_fallback)
-    main_phone_source = row_get(siebel, "MAIN_PH_NUM", "CON_PHONE_NUM") or row_get(iptool, "ContactNumber", "Contact Number", "MobileNumber", "Mobile Number")
+    main_phone_source = row_get(siebel, "MAIN_PH_NUM", "CON_PHONE_NUM") or row_get(iptool, "ContactNumber", "Contact Number", "MobileNumber", "Mobile Number") or extract_phone_from_text(contact_text)
     main_phone, _main_phone_warning = normalize_sa_phone(main_phone_source, args.invalid_phone_fallback)
 
     email = (
         normalized_email(row_get(siebel, "CON_EMAIL"))
         or normalized_email(row_get(siebel, "MAIN_EMAIL_ADDR"))
         or normalized_email(row_get(iptool, "Email", "ContactEmail", "Contact Email"))
+        or extract_email_from_text(contact_text)
         or args.default_email
+    )
+    id_number = (
+        valid_10_digit(row_get(siebel, "CONTACT_ID_NUM"))
+        or valid_10_digit(row_get(iptool, "IdNumber", "ID Number", "Iqama", "IqamaId", "Iqama ID", "National ID"))
+        or extract_id_from_text(contact_text)
+        or args.default_id_number
     )
     name = (
         contact_name(siebel)
@@ -461,7 +548,7 @@ def make_bulk_row(
         or "Business Contact"
     )
 
-    service_id = row_get(siebel, "SERIAL_NUM") or normalize_join_key(row_get(iptool, args.iptool_join_column))
+    service_id = row_get(siebel, "SERIAL_NUM") or normalize_join_key(row_get(iptool, args.iptool_join_column)) or "0"
     product_type = row_get(iptool, "Product Type", "ProductType", "product_type")
     product_class = row_get(iptool, "ProductClass", "Product Class", "product_class")
     service_description = row_get(siebel, "PRODUCT_NAME") or product_type or product_class
@@ -488,7 +575,7 @@ def make_bulk_row(
         "cityId": city_id,
         "fullName": name,
         "mobileNumber": phone,
-        "idNumber": digits_only(row_get(siebel, "CONTACT_ID_NUM")) or args.default_id_number,
+        "idNumber": id_number,
         "email": email,
         "contactName": name,
         "contactNumber": main_phone or phone,
@@ -514,14 +601,25 @@ def write_csv(path: Path, rows: Iterable[dict[str, str]], fieldnames: list[str])
             writer.writerow(row)
 
 
+def read_iptool_tables(paths: list[Path]) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for path in paths:
+        for row_number, row in enumerate(read_table(path), start=2):
+            row["_source_file"] = str(path)
+            row["_source_row_number"] = str(row_number)
+            rows.append(row)
+    return rows
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Join IP Tool and Siebel exports into Salam LIR bulk assignment CSV.")
-    parser.add_argument("--iptool", required=True, type=Path, help="IP Tool CSV/TSV export path")
-    parser.add_argument("--siebel", required=True, type=Path, help="Siebel CSV/TSV export path")
+    parser.add_argument("--iptool", required=True, type=Path, nargs="+", help="One or more IP Tool CSV/TSV export paths")
+    parser.add_argument("--siebel", type=Path, help="Siebel CSV/TSV export path. Not required with --legacy-iptool-only.")
     parser.add_argument("--output", type=Path, default=Path("bulk_assignments_from_iptool_siebel.csv"))
     parser.add_argument("--missing-output", type=Path, default=Path("missing_siebel_records.csv"))
     parser.add_argument("--duplicates-output", type=Path, default=Path("duplicate_siebel_join_keys.csv"))
     parser.add_argument("--join-mode", choices=["auto", "service", "account", "customer"], default="auto", help="auto tries service join first, then account, then customer name. customer supports reduced IP Tool templates without IDs.")
+    parser.add_argument("--legacy-iptool-only", action="store_true", help="Generate final assignment bulk CSV from IP Tool only, using city mapping/defaults instead of Siebel.")
     parser.add_argument("--iptool-join-column", default="Order Number", help="IP Tool service/order join column used for service join")
     parser.add_argument("--siebel-join-column", default="SERIAL_NUM", help="Siebel service join column used when available")
     parser.add_argument("--iptool-account-column", default="CustomerNumber", help="IP Tool account/customer join column used for simplified Siebel exports")
@@ -534,11 +632,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--region-id", default="", help="Default CST regionId if no region map match")
     parser.add_argument("--city-id", default="1", help="Default CST cityId if no city map match. Default 1.")
     parser.add_argument("--region-map", type=Path, help="Optional CSV map with source,id columns")
-    parser.add_argument("--city-map", type=Path, help="Optional CSV map with source,id columns")
+    parser.add_argument("--city-map", type=Path, help="Optional CSV map with source,id columns, or city_id/city_name_en/city_name_ar/region_id columns")
     parser.add_argument("--access-technology-id", default="1")
     parser.add_argument("--default-id-number", default="0000000000")
     parser.add_argument("--default-contact-name", default="Business Contact", help="Fallback contact name when neither Siebel nor IP Tool has a contact name")
-    parser.add_argument("--default-email", default="", help="Fallback contact email when neither Siebel nor IP Tool has an email")
+    parser.add_argument("--default-email", default="NA@NA.com", help="Fallback contact email when neither Siebel nor IP Tool has an email")
     parser.add_argument("--invalid-phone-fallback", default="0000000000")
     parser.add_argument("--include-non-public", action="store_true", help="Include IP Tool rows where PublicIP is not Yes")
     return parser.parse_args()
@@ -546,10 +644,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    iptool_rows = read_table(args.iptool)
-    siebel_rows = read_table(args.siebel)
+    if not args.legacy_iptool_only and not args.siebel:
+        raise SystemExit("--siebel is required unless --legacy-iptool-only is used")
+
+    iptool_rows = read_iptool_tables(args.iptool)
+    siebel_rows = [] if args.legacy_iptool_only else read_table(args.siebel)
     region_map = load_simple_map(args.region_map)
     city_map = load_simple_map(args.city_map)
+    city_region_map = load_city_region_map(args.city_map)
     service_by_key, duplicate_service = build_siebel_index(siebel_rows, args.siebel_join_column)
     account_by_key, duplicate_account = build_siebel_index(siebel_rows, args.siebel_account_column)
     customer_by_key, duplicate_customer = build_siebel_index(siebel_rows, args.siebel_customer_column)
@@ -565,6 +667,24 @@ def main() -> int:
         service_key = normalize_join_key(row_get(iptool, args.iptool_join_column))
         account_key = normalize_join_key(row_get(iptool, args.iptool_account_column, "Customer Number", "CustomerNumber"))
         customer_key = normalize_join_key(row_get(iptool, args.iptool_customer_column, "Customer Name", "CustomerName"))
+
+        if args.legacy_iptool_only:
+            try:
+                output = make_bulk_row(iptool, {}, args, region_map, city_map, city_region_map)
+                output["notes"] = row_get(iptool, "Remark", "Remarks", "Notes") or "Legacy assignment generated from IP Tool only; assigned to Business"
+                output_rows.append(output)
+            except Exception as exc:
+                missing = dict(iptool)
+                missing["normalizedServiceJoinKey"] = service_key
+                missing["normalizedAccountJoinKey"] = account_key
+                missing["normalizedCustomerJoinKey"] = customer_key
+                missing["sourceFile"] = row_get(iptool, "_source_file")
+                missing["sourceRowNumber"] = row_get(iptool, "_source_row_number")
+                missing["missingReason"] = f"IP Tool-only row failed to build output row: {exc}"
+                missing_rows.append(missing)
+                errors.append(f"IP Tool row {index}: {exc}")
+            continue
+
         siebel = None
         join_type = ""
         join_key = ""
@@ -588,6 +708,8 @@ def main() -> int:
             missing["normalizedServiceJoinKey"] = service_key
             missing["normalizedAccountJoinKey"] = account_key
             missing["normalizedCustomerJoinKey"] = customer_key
+            missing["sourceFile"] = row_get(iptool, "_source_file")
+            missing["sourceRowNumber"] = row_get(iptool, "_source_row_number")
             missing["missingReason"] = (
                 f"No Siebel row found. Tried {args.iptool_join_column}->{args.siebel_join_column}={service_key or '<blank>'}, "
                 f"{args.iptool_account_column}->{args.siebel_account_column}={account_key or '<blank>'}, "
@@ -596,7 +718,7 @@ def main() -> int:
             missing_rows.append(missing)
             continue
         try:
-            output = make_bulk_row(iptool, siebel, args, region_map, city_map)
+            output = make_bulk_row(iptool, siebel, args, region_map, city_map, city_region_map)
             output_rows.append(output)
         except Exception as exc:
             missing = dict(iptool)
@@ -605,6 +727,8 @@ def main() -> int:
             missing["normalizedCustomerJoinKey"] = customer_key
             missing["matchedJoinType"] = join_type
             missing["matchedJoinKey"] = join_key
+            missing["sourceFile"] = row_get(iptool, "_source_file")
+            missing["sourceRowNumber"] = row_get(iptool, "_source_row_number")
             missing["missingReason"] = f"Matched Siebel but failed to build output row: {exc}"
             missing_rows.append(missing)
             errors.append(f"IP Tool row {index}, {join_type} key {join_key}: {exc}")
@@ -614,33 +738,38 @@ def main() -> int:
     write_csv(args.missing_output, missing_rows, missing_headers)
 
     duplicate_rows: list[dict[str, str]] = []
-    for join_type, duplicates, selected_index in (
-        ("service", duplicate_service, service_by_key),
-        ("account", duplicate_account, account_by_key),
-        ("customer", duplicate_customer, customer_by_key),
-    ):
-        for key, rows in duplicates.items():
-            selected = selected_index[key]
-            selected_row_id = row_get(selected, "ROW_ID")
-            for row_number, row in enumerate(rows, start=1):
-                selected_marker = "yes" if selected_row_id and row_get(row, "ROW_ID") == selected_row_id else "yes" if not selected_row_id and row is selected else "no"
-                duplicate_rows.append({
-                    "joinType": join_type,
-                    "normalizedJoinKey": key,
-                    "selected": selected_marker,
-                    "score": str(siebel_score(row)),
-                    "duplicateRowNumber": str(row_number),
-                    "SERIAL_NUM": row_get(row, "SERIAL_NUM"),
-                    "ROW_ID": row_get(row, "ROW_ID"),
-                    "PRODUCT_NAME": row_get(row, "PRODUCT_NAME"),
-                    "SID_STATUS": row_get(row, "SID_STATUS", "STATUS_CD"),
-                    "ACCOUNT_NAME": row_get(row, "ACCOUNT_NAME"),
-                    "ACCOUNT_NUMBER": row_get(row, "ACCOUNT_NUMBER"),
-                })
+    if not args.legacy_iptool_only:
+        for join_type, duplicates, selected_index in (
+            ("service", duplicate_service, service_by_key),
+            ("account", duplicate_account, account_by_key),
+            ("customer", duplicate_customer, customer_by_key),
+        ):
+            for key, rows in duplicates.items():
+                selected = selected_index[key]
+                selected_row_id = row_get(selected, "ROW_ID")
+                for row_number, row in enumerate(rows, start=1):
+                    selected_marker = "yes" if selected_row_id and row_get(row, "ROW_ID") == selected_row_id else "yes" if not selected_row_id and row is selected else "no"
+                    duplicate_rows.append({
+                        "joinType": join_type,
+                        "normalizedJoinKey": key,
+                        "selected": selected_marker,
+                        "score": str(siebel_score(row)),
+                        "duplicateRowNumber": str(row_number),
+                        "SERIAL_NUM": row_get(row, "SERIAL_NUM"),
+                        "ROW_ID": row_get(row, "ROW_ID"),
+                        "PRODUCT_NAME": row_get(row, "PRODUCT_NAME"),
+                        "SID_STATUS": row_get(row, "SID_STATUS", "STATUS_CD"),
+                        "ACCOUNT_NAME": row_get(row, "ACCOUNT_NAME"),
+                        "ACCOUNT_NUMBER": row_get(row, "ACCOUNT_NUMBER"),
+                    })
     write_csv(args.duplicates_output, duplicate_rows, [
         "joinType", "normalizedJoinKey", "selected", "score", "duplicateRowNumber", "SERIAL_NUM", "ROW_ID", "PRODUCT_NAME", "SID_STATUS", "ACCOUNT_NAME", "ACCOUNT_NUMBER"
     ])
 
+    print(f"Mode: {'legacy IP Tool only' if args.legacy_iptool_only else 'IP Tool + Siebel join'}")
+    print(f"IP Tool files read: {len(args.iptool)}")
+    for path in args.iptool:
+        print(f"- {path}: {len(read_table(path))} rows")
     print(f"IP Tool rows read: {len(iptool_rows)}")
     print(f"Siebel rows read: {len(siebel_rows)}")
     print(f"Bulk assignment rows written: {len(output_rows)} -> {args.output}")
