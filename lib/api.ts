@@ -786,6 +786,8 @@ export type ResourceRecord = {
   id_number: string;
   email: string;
   customer_name: string;
+  owner: string;
+  maintainer: string;
   assignment_date: string;
   update_date: string;
   access_technology_id: string;

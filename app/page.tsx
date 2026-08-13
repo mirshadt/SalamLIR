@@ -6671,6 +6671,21 @@ function poolHierarchyEntries(pools: Pool[]) {
   return pools.map((pool) => ({ pool, range: toRange(pool) }));
 }
 
+function ipResourceOwnerFromMaintainer(maintainer: string | null | undefined) {
+  const normalized = String(maintainer || "").toUpperCase().replace(/[^A-Z0-9]+/g, "");
+  if (normalized.includes("ORBIT")) {
+    return "OrbitNet";
+  }
+  if (normalized.includes("SALAM") || normalized.includes("ITCNOC") || ["ITCNOCMNT", "ITCMNT"].includes(normalized)) {
+    return "Salam";
+  }
+  return String(maintainer || "").trim() || "Salam";
+}
+
+function resourceMaintainerFromPool(pool: Pool | null | undefined) {
+  return String(pool?.owner || "ITC-NOC-MNT").trim() || "ITC-NOC-MNT";
+}
+
 function nearestParentPoolIdForPool(pool: Pool, range: Range, entries: Array<{ pool: Pool; range: Range }>) {
   const candidates = entries.filter(({ pool: candidate, range: candidateRange }) => {
     if (candidate.id === pool.id || !contains(candidateRange, range)) {
@@ -6705,6 +6720,7 @@ function nearestParentPoolIdForAssignment(range: Range, entries: Array<{ pool: P
 function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
   const resources: ManagedResource[] = [];
   const poolEntries = poolHierarchyEntries(pools);
+  const poolById = new Map(pools.map((pool) => [pool.id, pool]));
   const occupyingAssignments = assignments.filter((assignment) => !assignmentReleasedAfterRipeRemoval(assignment));
   const poolParentById = new Map(poolEntries.map(({ pool, range }) => [pool.id, nearestParentPoolIdForPool(pool, range, poolEntries)]));
   const assignmentParentById = new Map(occupyingAssignments.map((assignment) => [assignment.id, nearestParentPoolIdForAssignment(toRange(assignment), poolEntries)]));
@@ -6718,6 +6734,8 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
     const poolStatus = poolAdministrativeStatus(pool);
     const poolClassification = classifyCidr(pool.cidr);
     const poolIsPublic = poolClassification === "PUBLIC";
+    const poolMaintainer = resourceMaintainerFromPool(pool);
+    const poolOwner = ipResourceOwnerFromMaintainer(poolMaintainer);
     resources.push({
       id: pool.id,
       uuid: resourceUuid("pool", pool.id, pool.cidr),
@@ -6753,7 +6771,7 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
       type: "Subnet",
       role: "Subnet",
       classification: poolClassification,
-      owner: "Salam LIR",
+      owner: poolOwner,
       status: poolStatus,
       administrativeStatus: poolStatus,
       ripeSyncRequired: poolIsPublic,
@@ -6769,7 +6787,7 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
       netname: pool.name,
       description: pool.description || pool.name,
       country: "SA",
-      maintainer: pool.owner || "ITC-NOC-MNT",
+      maintainer: poolMaintainer,
       previousUuid: "",
       sourceUuid: "",
       successorUuid: "",
@@ -6784,6 +6802,9 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
       const hideIndividualIdentity = assignmentIsIndividual(assignment);
       const assignmentClassification = classifyCidr(assignment.cidr);
       const assignmentIsPublic = assignmentClassification === "PUBLIC";
+      const assignmentParentPool = poolById.get(assignmentParentById.get(assignment.id) || "") ?? null;
+      const assignmentMaintainer = resourceMaintainerFromPool(assignmentParentPool);
+      const ipResourceOwner = ipResourceOwnerFromMaintainer(assignmentMaintainer);
       resources.push({
         id: assignment.id,
         uuid: resourceUuid("assignment", assignment.id, assignment.cidr),
@@ -6819,7 +6840,7 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
         type: "Subnet",
         role: "Subnet",
         classification: assignmentClassification,
-        owner: assignmentOwner(assignment),
+        owner: ipResourceOwner,
         status: assignmentToAdministrativeStatus(assignment),
         administrativeStatus: assignmentToAdministrativeStatus(assignment),
         ripeSyncRequired: assignmentIsPublic,
@@ -6835,7 +6856,7 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
         netname: assignment.customer_name || assignment.internal_application_name || assignment.assignment_name,
         description: assignment.service || assignment.assignment_description || assignment.assignment_name,
         country: "SA",
-        maintainer: assignment.owner || "ITC-NOC-MNT",
+        maintainer: assignmentMaintainer,
         previousUuid: "",
         sourceUuid: "",
         successorUuid: "",
@@ -6889,7 +6910,7 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
             type: "Subnet",
             role: "Subnet",
             classification: blockClassification,
-            owner: "Salam LIR",
+            owner: poolOwner,
             status: "AVAILABLE",
             administrativeStatus: "AVAILABLE",
             ripeSyncRequired: false,
@@ -6905,7 +6926,7 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
             netname: `${pool.name}-FREE`,
             description: "Calculated available free block",
             country: "SA",
-            maintainer: pool.owner || "ITC-NOC-MNT",
+            maintainer: poolMaintainer,
             previousUuid: "",
             sourceUuid: resourceUuid("pool", pool.id, pool.cidr),
             successorUuid: "",

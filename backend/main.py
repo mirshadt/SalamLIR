@@ -700,6 +700,8 @@ class ResourceRecord(BaseModel):
     id_number: str = ""
     email: str = ""
     customer_name: str = ""
+    owner: str = ""
+    maintainer: str = DEFAULT_RESOURCE_MAINTAINER
     assignment_date: str = ""
     update_date: str = ""
     access_technology_id: str = ""
@@ -1479,9 +1481,21 @@ def ownership_from_assignment(assignment: Assignment) -> str:
     return "BUSINESS"
 
 
+def ip_resource_owner_from_maintainer(maintainer: str | None) -> str:
+    normalized = re.sub(r"[^A-Z0-9]+", "", str(maintainer or "").upper())
+    if "ORBIT" in normalized:
+        return "OrbitNet"
+    if "SALAM" in normalized or "ITCNOC" in normalized or normalized in {"ITCNOCMNT", "ITCMNT"}:
+        return "Salam"
+    return str(maintainer or "").strip() or "Salam"
+
+
+def pool_resource_maintainer(pool: Pool | None) -> str:
+    return str(pool.owner or DEFAULT_RESOURCE_MAINTAINER).strip() if pool else DEFAULT_RESOURCE_MAINTAINER
+
+
 def individual_assignment(assignment: Assignment) -> bool:
     return assignment.assignment_status_id == 4 or (assignment.assignment_target_type or "").lower() == "individual"
-
 
 def assignment_released_after_ripe_removal(assignment: Assignment) -> bool:
     return (
@@ -1497,7 +1511,7 @@ def root_pool_for_network(network: IPv4Network, connection: sqlite3.Connection |
     else:
         pools = list_pools_from_db()
     candidates = [pool for pool in pools if network.subnet_of(network_of(pool))]
-    return min(candidates, key=lambda pool: network_of(pool).prefixlen, default=None)
+    return max(candidates, key=lambda pool: network_of(pool).prefixlen, default=None)
 
 
 def pool_resource_uuid(pool: Pool) -> str:
@@ -1520,6 +1534,8 @@ def resource_record_for_pool(pool: Pool, existing: ResourceRecord | None = None)
     default_ripe_sync_status = "PENDING" if network.is_global else "NOT_REQUIRED"
     cst_sync_status = existing.cst_sync_status if existing and ip_type == "PUBLIC" else default_cst_sync_status
     ripe_sync_status = existing.ripe_sync_status if existing and network.is_global else default_ripe_sync_status
+    maintainer = pool_resource_maintainer(pool)
+    owner = ip_resource_owner_from_maintainer(maintainer)
     return ResourceRecord(
         resource_uuid=resource_uuid,
         version_uuid=new_version_uuid() if existing else stable_uuid("version", "pool", pool.id, pool.cidr, pool.created_at),
@@ -1540,6 +1556,8 @@ def resource_record_for_pool(pool: Pool, existing: ResourceRecord | None = None)
         asn=pool.asn or DEFAULT_ASN,
         assignment_status_id=1,
         customer_name="",
+        owner=owner,
+        maintainer=maintainer,
         assignment_date="",
         update_date=updated_at,
         description=pool.description or pool.name,
@@ -1560,6 +1578,8 @@ def resource_record_for_assignment(assignment: Assignment, existing: ResourceRec
     ip_type = "PRIVATE" if network.is_private else "PUBLIC"
     root_pool = root_pool_for_network(network, connection)
     root_pool_uuid = pool_resource_uuid(root_pool) if root_pool else ""
+    maintainer = pool_resource_maintainer(root_pool)
+    owner = ip_resource_owner_from_maintainer(maintainer)
     parent_resource_uuid = "" if existing and existing.resource_uuid == root_pool_uuid else root_pool_uuid
     updated_at = now_iso()
     status_id = normalize_assignment_status_id(assignment.assignment_status_id, assignment)
@@ -1599,6 +1619,8 @@ def resource_record_for_assignment(assignment: Assignment, existing: ResourceRec
         id_number="" if hide_individual_identity else assignment.id_number,
         email="" if hide_individual_identity else assignment.email or assignment.contact_email,
         customer_name=assignment.customer_name,
+        owner=owner,
+        maintainer=maintainer,
         assignment_date=assignment.assignment_date,
         update_date=updated_at,
         access_technology_id=assignment.access_technology_id,
@@ -1752,6 +1774,32 @@ def sync_normalized_inventory(connection: sqlite3.Connection) -> None:
     for row in connection.execute("SELECT * FROM assignments").fetchall():
         sync_assignment_resource(connection, assignment_from_row(row))
 
+def refresh_ip_resource_pool_owners(connection: sqlite3.Connection) -> int:
+    pools = [pool_from_row(row) for row in connection.execute("SELECT * FROM pools").fetchall()]
+    pools_by_id = {pool.id: pool for pool in pools}
+    updated_at = now_iso()
+    updated = 0
+    rows = connection.execute("SELECT resource_uuid, cidr, source_entity_type, source_entity_id, owner, maintainer FROM ip_resources").fetchall()
+    for row in rows:
+        pool = pools_by_id.get(str(row["source_entity_id"] or "")) if str(row["source_entity_type"] or "") == "pool" else None
+        if pool is None:
+            try:
+                network = normalize_network(str(row["cidr"] or ""))
+            except HTTPException:
+                network = None
+            if network is not None:
+                candidates = [candidate for candidate in pools if network.subnet_of(network_of(candidate))]
+                pool = max(candidates, key=lambda candidate: network_of(candidate).prefixlen, default=None)
+        maintainer = pool_resource_maintainer(pool)
+        owner = ip_resource_owner_from_maintainer(maintainer)
+        if str(row["owner"] or "") == owner and str(row["maintainer"] or "") == maintainer:
+            continue
+        connection.execute(
+            "UPDATE ip_resources SET owner = ?, maintainer = ?, updated_at = ? WHERE resource_uuid = ?",
+            (owner, maintainer, updated_at, row["resource_uuid"]),
+        )
+        updated += 1
+    return updated
 
 def normalized_inventory_needs_sync(connection: sqlite3.Connection) -> bool:
     source_count = connection.execute("SELECT COUNT(*) FROM pools").fetchone()[0]
@@ -2557,6 +2605,8 @@ def cst_get_lir_page_resource(config: CstConfig, page_number: int = 1) -> Resour
         service_provider_name=DEFAULT_SERVICE_PROVIDER_NAME,
         asn=DEFAULT_ASN,
         assignment_status_id=1,
+        owner=DEFAULT_SERVICE_PROVIDER_NAME,
+        maintainer=DEFAULT_RESOURCE_MAINTAINER,
         ip_type="PUBLIC",
         source_entity_type="cst_reconciliation",
         source_entity_id=f"page-{page_number}",
@@ -3042,6 +3092,8 @@ def cst_resource_from_network(
         service_provider_name=DEFAULT_SERVICE_PROVIDER_NAME,
         asn=DEFAULT_ASN,
         assignment_status_id=1,
+        owner=ip_resource_owner_from_maintainer(DEFAULT_RESOURCE_MAINTAINER),
+        maintainer=DEFAULT_RESOURCE_MAINTAINER,
         description=description,
         action_flag="N",
         cst_sync_status="PENDING" if ip_type == "PUBLIC" else "NOT_REQUIRED",
@@ -4564,6 +4616,8 @@ def init_db() -> None:
               ownership_type TEXT NOT NULL,
               status TEXT NOT NULL,
               customer_name TEXT NOT NULL,
+              owner TEXT NOT NULL,
+              maintainer TEXT NOT NULL,
               assignment_date TEXT NOT NULL,
               ip_type TEXT NOT NULL,
               root_pool_uuid TEXT NOT NULL,
@@ -4577,6 +4631,8 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_ip_resources_status ON ip_resources (status);
             CREATE INDEX IF NOT EXISTS idx_ip_resources_root ON ip_resources (root_pool_uuid);
             CREATE INDEX IF NOT EXISTS idx_ip_resources_source ON ip_resources (source_entity_type, source_entity_id);
+            CREATE INDEX IF NOT EXISTS idx_ip_resources_owner ON ip_resources (owner);
+            CREATE INDEX IF NOT EXISTS idx_ip_resources_maintainer ON ip_resources (maintainer);
 
             CREATE TABLE IF NOT EXISTS assignment_details (
               id TEXT PRIMARY KEY,
@@ -4940,6 +4996,7 @@ def init_db() -> None:
 
         if normalized_inventory_needs_sync(connection):
             sync_normalized_inventory(connection)
+        refresh_ip_resource_pool_owners(connection)
 
 
 def list_pools_from_db() -> list[Pool]:
