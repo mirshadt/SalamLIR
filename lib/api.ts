@@ -211,6 +211,21 @@ export type Assignment = {
   created_at: string;
 };
 
+export type AssignmentPage = {
+  items: Assignment[];
+  total: number;
+  page: number;
+  page_size: number;
+  total_pages: number;
+  search: string;
+};
+
+export type AssignmentPageParams = {
+  page?: number;
+  page_size?: number;
+  search?: string;
+};
+
 export type AssignmentStatus = "Reserved" | "Active" | "Planned" | "Retiring" | "Quarantined" | "Blocked";
 export type AssignmentTargetType = "business_customer" | "internal" | "individual";
 
@@ -981,6 +996,11 @@ export async function getAssignments() {
   return data;
 }
 
+
+export async function getAssignmentsPage(params: AssignmentPageParams = {}) {
+  const { data } = await api.get<AssignmentPage>("/assignments/page", { params });
+  return data;
+}
 export async function getResources() {
   const { data } = await api.get<ResourceRecord[]>("/resources");
   return data;

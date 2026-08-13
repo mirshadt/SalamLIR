@@ -280,6 +280,15 @@ class Assignment(AssignmentCreate):
     created_at: str
 
 
+
+class AssignmentPage(BaseModel):
+    items: list[Assignment]
+    total: int
+    page: int
+    page_size: int
+    total_pages: int
+    search: str = ""
+
 class PartitionRequest(BaseModel):
     pool_id: str | None = None
     cidr: str | None = None
@@ -4859,20 +4868,74 @@ def list_assignments_from_db() -> list[Assignment]:
         rows = connection.execute(f"SELECT {', '.join(columns)} FROM assignments ORDER BY created_at DESC").fetchall()
     return [assignment_from_row(row) for row in rows]
 
-def list_assignment_dicts_for_response() -> list[dict]:
+def assignment_response_columns() -> list[str]:
     heavy_fields = {"siebel_payload_json", "service_characteristics"}
-    columns = [
+    return [
         f"'' AS {field_name}" if field_name in heavy_fields else f'"{field_name}"'
         for field_name in Assignment.model_fields
     ]
-    with connect() as connection:
-        release_expired_reservations(connection)
-        rows = connection.execute(f"SELECT {', '.join(columns)} FROM assignments ORDER BY created_at DESC").fetchall()
+
+
+def assignment_dicts_from_rows(rows: list[sqlite3.Row]) -> list[dict]:
     items = [dict(row) for row in rows]
     for item in items:
         item["cst_sync_ready"] = bool(item.get("cst_sync_ready"))
     return items
 
+
+def list_assignment_dicts_for_response() -> list[dict]:
+    columns = assignment_response_columns()
+    with connect() as connection:
+        release_expired_reservations(connection)
+        rows = connection.execute(f"SELECT {', '.join(columns)} FROM assignments ORDER BY created_at DESC").fetchall()
+    return assignment_dicts_from_rows(rows)
+
+
+def list_assignment_page_from_db(page: int = 1, page_size: int = 100, search: str = "") -> AssignmentPage:
+    page = max(1, int(page or 1))
+    page_size = min(max(1, int(page_size or 100)), 500)
+    offset = (page - 1) * page_size
+    columns = assignment_response_columns()
+    search_term = (search or "").strip()
+    where_sql = ""
+    params: list[str | int] = []
+    if search_term:
+        like = f"%{search_term.lower()}%"
+        search_columns = [
+            "cidr",
+            "customer_name",
+            "internal_application_name",
+            "service_id",
+            "service_instance_id",
+            "id",
+            "status",
+            "assignment_target_type",
+            "organization_id",
+            "mobile_number",
+            "email",
+            "contact_name",
+            "contact_email",
+            "customer_id",
+            "product_class",
+        ]
+        where_sql = "WHERE " + " OR ".join([f"LOWER(COALESCE({column}, '')) LIKE ?" for column in search_columns])
+        params.extend([like] * len(search_columns))
+    with connect() as connection:
+        release_expired_reservations(connection)
+        total = int(connection.execute(f"SELECT COUNT(*) FROM assignments {where_sql}", params).fetchone()[0] or 0)
+        rows = connection.execute(
+            f"SELECT {', '.join(columns)} FROM assignments {where_sql} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            [*params, page_size, offset],
+        ).fetchall()
+    total_pages = max((total + page_size - 1) // page_size, 1)
+    return AssignmentPage(
+        items=[Assignment(**item) for item in assignment_dicts_from_rows(rows)],
+        total=total,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
+        search=search_term,
+    )
 
 def find_pool(identifier: str | None, cidr: str | None) -> Pool:
     normalized_cidr = str(normalize_network(cidr)) if cidr else None
@@ -7838,6 +7901,12 @@ def join_pools(payload: JoinRequest) -> Pool:
         sync_pool_resource(connection, joined)
         record_audit(connection, "Pool Modification", "pool", joined.id, f"{left.cidr}; {right.cidr}", joined.model_dump_json())
     return joined
+
+
+@app.get("/assignments/page", response_model=AssignmentPage)
+def list_assignments_page(page: int = 1, page_size: int = 100, search: str = "") -> AssignmentPage:
+    return list_assignment_page_from_db(page=page, page_size=page_size, search=search)
+
 
 
 @app.get("/assignments")

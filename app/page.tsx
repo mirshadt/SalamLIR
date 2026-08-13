@@ -60,7 +60,7 @@ import {
   CstTransactionLedger,
   DatabaseConnectionPayload,
   DatabaseConnectionStatus,
-  getAssignments,
+  getAssignmentsPage,
   getAuditEvents,
   getBulkBatches,
   getConflicts,
@@ -928,10 +928,17 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   const [confirm, setConfirm] = useState<{ title: string; detail: string; action: () => void; destructive?: boolean } | null>(null);
   const [notice, setNotice] = useState<{ title: string; detail: string } | null>(null);
   const [lastGoodAssignments, setLastGoodAssignments] = useState<Assignment[]>([]);
+  const [assignmentPage, setAssignmentPage] = useState(1);
+  const [assignmentPageSize, setAssignmentPageSize] = useState(100);
+  const [assignmentSearch, setAssignmentSearch] = useState("");
 
   const liveQueryOptions = { staleTime: 30000, refetchOnMount: true as const, refetchOnWindowFocus: false, retry: 3, retryDelay: (attempt: number) => Math.min(1000 * 2 ** attempt, 8000) };
   const poolsQuery = useQuery({ queryKey: ["pools"], queryFn: getPools, ...liveQueryOptions });
-  const assignmentsQuery = useQuery({ queryKey: ["assignments"], queryFn: getAssignments, ...liveQueryOptions });
+  const assignmentsQuery = useQuery({
+    queryKey: ["assignments", assignmentPage, assignmentPageSize, assignmentSearch],
+    queryFn: () => getAssignmentsPage({ page: assignmentPage, page_size: assignmentPageSize, search: assignmentSearch }),
+    ...liveQueryOptions
+  });
   const conflictsQuery = useQuery({ queryKey: ["conflicts"], queryFn: getConflicts, ...liveQueryOptions });
   const auditQuery = useQuery({ queryKey: ["audit"], queryFn: getAuditEvents, ...liveQueryOptions });
   const usersQuery = useQuery({ queryKey: ["users"], queryFn: getUsers, ...liveQueryOptions });
@@ -958,7 +965,9 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   });
 
   const pools = poolsQuery.data ?? [];
-  const assignments = assignmentsQuery.data ?? lastGoodAssignments;
+  const assignmentPageData = assignmentsQuery.data ?? null;
+  const assignments = assignmentPageData?.items ?? lastGoodAssignments;
+  const assignmentTotal = assignmentPageData?.total ?? lastGoodAssignments.length;
   const conflicts = conflictsQuery.data ?? [];
   const auditEvents = auditQuery.data ?? [];
   const users = usersQuery.data ?? [];
@@ -981,7 +990,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
 
   useEffect(() => {
     if (assignmentsQuery.data) {
-      setLastGoodAssignments(assignmentsQuery.data);
+      setLastGoodAssignments(assignmentsQuery.data.items);
     }
   }, [assignmentsQuery.data]);
 
@@ -1589,6 +1598,15 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
               <AssignmentManagement
                 resources={resources}
                 assignments={assignments}
+                assignmentTotal={assignmentTotal}
+                assignmentPage={assignmentPageData?.page ?? assignmentPage}
+                assignmentPageSize={assignmentPageSize}
+                assignmentTotalPages={assignmentPageData?.total_pages ?? 1}
+                assignmentSearch={assignmentSearch}
+                assignmentsLoading={assignmentsQuery.isFetching}
+                onAssignmentPage={setAssignmentPage}
+                onAssignmentPageSize={(value) => { setAssignmentPageSize(value); setAssignmentPage(1); }}
+                onAssignmentSearch={(value) => { setAssignmentSearch(value); setAssignmentPage(1); }}
                 form={assignmentForm}
                 poolDraft={poolAssignmentDraft}
                 onForm={setAssignmentForm}
@@ -2838,6 +2856,15 @@ type AssignmentWorkflow = "assign" | "unassign" | "partial";
 function AssignmentManagement(props: {
   resources: ManagedResource[];
   assignments: Assignment[];
+  assignmentTotal: number;
+  assignmentPage: number;
+  assignmentPageSize: number;
+  assignmentTotalPages: number;
+  assignmentSearch: string;
+  assignmentsLoading: boolean;
+  onAssignmentPage: (page: number) => void;
+  onAssignmentPageSize: (pageSize: number) => void;
+  onAssignmentSearch: (search: string) => void;
   form: AssignmentPayload;
   poolDraft: PoolAssignmentDraft;
   onForm: (value: AssignmentPayload) => void;
@@ -2852,7 +2879,6 @@ function AssignmentManagement(props: {
   const [workflow, setWorkflow] = useState<AssignmentWorkflow>("assign");
   const [partialAssignmentId, setPartialAssignmentId] = useState("");
   const [partialCidr, setPartialCidr] = useState("");
-  const [assignmentSearch, setAssignmentSearch] = useState("");
   const available = presentationResources(props.resources).filter((resource) => resource.administrativeStatus === "AVAILABLE" && resource.type === "Subnet");
   const parentPoolMatches = filterResources(available, props.poolDraft.poolSearch);
   const assignmentSummary = assignmentDraftSummary(props.form, props.poolDraft, props.resources);
@@ -2869,22 +2895,7 @@ function AssignmentManagement(props: {
   const assignmentTableDescription = workflow === "partial"
     ? "Select the existing CST-reported block that needs to be split and partially reassigned."
     : "Release an assignment, refresh BSS details, or temporarily suspend operational use.";
-  const assignmentSearchTerm = assignmentSearch.trim().toLowerCase();
-  const filteredAssignments = assignmentSearchTerm
-    ? props.assignments.filter((assignment) => [
-        assignment.cidr,
-        assignment.customer_name,
-        assignment.internal_application_name,
-        assignment.service_id,
-        assignment.service_instance_id,
-        assignment.id,
-        assignment.status,
-        assignment.assignment_target_type,
-        assignment.organization_id,
-        assignment.mobile_number,
-        assignment.email
-      ].some((value) => String(value || "").toLowerCase().includes(assignmentSearchTerm)))
-    : props.assignments;
+  const filteredAssignments = props.assignments;
 
   const openWorkflow = (nextWorkflow: AssignmentWorkflow) => {
     setWorkflow(nextWorkflow);
@@ -2926,7 +2937,7 @@ function AssignmentManagement(props: {
       id: "unassign",
       title: "Unassign IP",
       description: "Release an existing assignment without mixing it with creation steps.",
-      metric: `${props.assignments.length} current assignment${props.assignments.length === 1 ? "" : "s"}`,
+      metric: `${props.assignmentTotal} current assignment${props.assignmentTotal === 1 ? "" : "s"}`,
       icon: ArchiveRestore
     },
     {
@@ -3096,11 +3107,12 @@ function AssignmentManagement(props: {
         <div className="grid gap-3 rounded-md border bg-muted/20 p-3 md:grid-cols-[minmax(0,1fr)_auto] md:items-end">
           <label className="grid gap-1">
             <span className="text-xs font-medium text-muted-foreground">Search assignments</span>
-            <Input value={assignmentSearch} onChange={(event) => setAssignmentSearch(event.target.value)} placeholder="Search CIDR, owner, service ID, status, contact" />
+            <Input value={props.assignmentSearch} onChange={(event) => props.onAssignmentSearch(event.target.value)} placeholder="Search CIDR, owner, service ID, status, contact" />
           </label>
           <div className="flex flex-wrap items-center gap-2">
-            <Badge variant="muted">{filteredAssignments.length} of {props.assignments.length}</Badge>
-            {assignmentSearch ? <Button type="button" variant="outline" onClick={() => setAssignmentSearch("")}>Clear</Button> : null}
+            <Badge variant="muted">{filteredAssignments.length} of {props.assignmentTotal}</Badge>
+            <Select value={String(props.assignmentPageSize)} values={["50", "100", "200", "500"]} labels={{ "50": "50 / page", "100": "100 / page", "200": "200 / page", "500": "500 / page" }} onChange={(value) => props.onAssignmentPageSize(Number(value))} />
+            {props.assignmentSearch ? <Button type="button" variant="outline" onClick={() => props.onAssignmentSearch("")}>Clear</Button> : null}
           </div>
         </div>
         <div className="max-h-[520px] overflow-auto rounded-md border">
@@ -3116,7 +3128,9 @@ function AssignmentManagement(props: {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {filteredAssignments.length ? filteredAssignments.map((assignment) => (
+              {props.assignmentsLoading ? (
+                <TableRow><TableCell colSpan={6}>Loading assignments...</TableCell></TableRow>
+              ) : filteredAssignments.length ? filteredAssignments.map((assignment) => (
                 <TableRow key={assignment.id}>
                   <TableCell className="font-semibold">{assignment.cidr}</TableCell>
                   <TableCell>{assignment.customer_name || assignment.internal_application_name}</TableCell>
@@ -3142,11 +3156,18 @@ function AssignmentManagement(props: {
                 </TableRow>
               )) : (
                 <TableRow>
-                  <TableCell colSpan={6} className="py-8 text-center text-sm text-muted-foreground">{props.assignments.length ? "No assignments match the search." : "No assignments found."}</TableCell>
+                  <TableCell colSpan={6} className="py-8 text-center text-sm text-muted-foreground">{props.assignmentTotal ? "No assignments match the search." : "No assignments found."}</TableCell>
                 </TableRow>
               )}
             </TableBody>
           </Table>
+        </div>
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="text-xs text-muted-foreground">Page {props.assignmentPage} of {props.assignmentTotalPages} | {props.assignmentTotal} total assignments</div>
+          <div className="flex items-center gap-2">
+            <Button variant="outline" size="sm" onClick={() => props.onAssignmentPage(Math.max(props.assignmentPage - 1, 1))} disabled={props.assignmentPage <= 1 || props.assignmentsLoading}>Previous</Button>
+            <Button variant="outline" size="sm" onClick={() => props.onAssignmentPage(Math.min(props.assignmentPage + 1, props.assignmentTotalPages))} disabled={props.assignmentPage >= props.assignmentTotalPages || props.assignmentsLoading}>Next</Button>
+          </div>
         </div>
       </CardContent>
     </Card>
