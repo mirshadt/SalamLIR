@@ -60,6 +60,8 @@ import {
   CstTransactionLedger,
   DatabaseConnectionPayload,
   DatabaseConnectionStatus,
+  DashboardSummary,
+  getAssignments,
   getAssignmentsPage,
   getAuditEvents,
   getBulkBatches,
@@ -73,6 +75,7 @@ import {
   getCstSchedulerRuns,
   getCstSummary,
   getCstTransactions,
+  getDashboardSummary,
   getDatabaseConnectionStatus,
   getPools,
   getRipeAllocatedPools,
@@ -929,17 +932,23 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   const [confirm, setConfirm] = useState<{ title: string; detail: string; action: () => void; destructive?: boolean } | null>(null);
   const [notice, setNotice] = useState<{ title: string; detail: string } | null>(null);
   const [lastGoodAssignments, setLastGoodAssignments] = useState<Assignment[]>([]);
+  const [lastGoodRegistryAssignments, setLastGoodRegistryAssignments] = useState<Assignment[]>([]);
   const [assignmentPage, setAssignmentPage] = useState(1);
   const [assignmentPageSize, setAssignmentPageSize] = useState(100);
   const [assignmentSearch, setAssignmentSearch] = useState("");
 
   const liveQueryOptions = { staleTime: 30000, refetchOnMount: true as const, refetchOnWindowFocus: false, retry: 3, retryDelay: (attempt: number) => Math.min(1000 * 2 ** attempt, 8000) };
   const poolsQuery = useQuery({ queryKey: ["pools"], queryFn: getPools, ...liveQueryOptions });
+  const assignmentPageNeeded = view === "assignments";
+  const registryCoverageNeeded = view !== "executive" && view !== "assignments" && view !== "administration";
   const assignmentsQuery = useQuery({
     queryKey: ["assignments", assignmentPage, assignmentPageSize, assignmentSearch],
     queryFn: () => getAssignmentsPage({ page: assignmentPage, page_size: assignmentPageSize, search: assignmentSearch }),
+    enabled: assignmentPageNeeded,
     ...liveQueryOptions
   });
+  const registryAssignmentsQuery = useQuery({ queryKey: ["assignments", "registry-coverage"], queryFn: getAssignments, enabled: registryCoverageNeeded, ...liveQueryOptions });
+  const dashboardSummaryQuery = useQuery({ queryKey: ["dashboard-summary"], queryFn: getDashboardSummary, ...liveQueryOptions });
   const conflictsQuery = useQuery({ queryKey: ["conflicts"], queryFn: getConflicts, ...liveQueryOptions });
   const auditQuery = useQuery({ queryKey: ["audit"], queryFn: getAuditEvents, ...liveQueryOptions });
   const usersQuery = useQuery({ queryKey: ["users"], queryFn: getUsers, ...liveQueryOptions });
@@ -968,7 +977,9 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   const pools = poolsQuery.data ?? [];
   const assignmentPageData = assignmentsQuery.data ?? null;
   const assignments = assignmentPageData?.items ?? lastGoodAssignments;
-  const assignmentTotal = assignmentPageData?.total ?? lastGoodAssignments.length;
+  const registryAssignments = registryAssignmentsQuery.data ?? lastGoodRegistryAssignments ?? assignments;
+  const dashboardSummary = dashboardSummaryQuery.data ?? null;
+  const assignmentTotal = dashboardSummary?.assignment_records ?? assignmentPageData?.total ?? registryAssignments.length ?? lastGoodAssignments.length;
   const conflicts = conflictsQuery.data ?? [];
   const auditEvents = auditQuery.data ?? [];
   const users = usersQuery.data ?? [];
@@ -994,6 +1005,12 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
       setLastGoodAssignments(assignmentsQuery.data.items);
     }
   }, [assignmentsQuery.data]);
+
+  useEffect(() => {
+    if (registryAssignmentsQuery.data) {
+      setLastGoodRegistryAssignments(registryAssignmentsQuery.data);
+    }
+  }, [registryAssignmentsQuery.data]);
 
   useEffect(() => {
     setSignedInUser(window.localStorage.getItem("ipam-username") ?? "admin");
@@ -1082,13 +1099,14 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
     return () => window.removeEventListener("popstate", applyRoute);
   }, []);
 
-  const resources = useMemo(() => buildRegistryResources(pools, assignments), [pools, assignments]);
+  const resources = useMemo(() => buildRegistryResources(pools, registryAssignments), [pools, registryAssignments]);
   const stats = useMemo(() => buildRegistryStats(resources, conflicts), [resources, conflicts]);
   const selectedResource = resources.find((resource) => resource.id === selectedResourceId) ?? resources[0] ?? null;
   const usingCachedAssignments = assignmentsQuery.isError && lastGoodAssignments.length > 0;
   const registryUnavailable =
     (poolsQuery.isError && poolsQuery.data === undefined) ||
-    (assignmentsQuery.isError && assignmentsQuery.data === undefined && lastGoodAssignments.length === 0);
+    (registryCoverageNeeded && registryAssignmentsQuery.isError && registryAssignmentsQuery.data === undefined && lastGoodRegistryAssignments.length === 0) ||
+    (assignmentPageNeeded && assignmentsQuery.isError && assignmentsQuery.data === undefined && lastGoodAssignments.length === 0);
 
   useEffect(() => {
     if (!selectedResourceId && resources[0]) {
@@ -1099,6 +1117,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   const refresh = () => {
     void queryClient.invalidateQueries({ queryKey: ["pools"] });
     void queryClient.invalidateQueries({ queryKey: ["assignments"] });
+    void queryClient.invalidateQueries({ queryKey: ["dashboard-summary"] });
     void queryClient.invalidateQueries({ queryKey: ["conflicts"] });
     void queryClient.invalidateQueries({ queryKey: ["audit"] });
     void queryClient.invalidateQueries({ queryKey: ["users"] });
@@ -1114,6 +1133,10 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
     void queryClient.invalidateQueries({ queryKey: ["cst-transactions"] });
     void poolsQuery.refetch();
     void assignmentsQuery.refetch();
+    if (registryCoverageNeeded) {
+      void registryAssignmentsQuery.refetch();
+    }
+    void dashboardSummaryQuery.refetch();
     void conflictsQuery.refetch();
     void auditQuery.refetch();
     void usersQuery.refetch();
@@ -1132,6 +1155,10 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
     if (view === "search") {
       void poolsQuery.refetch();
       void assignmentsQuery.refetch();
+      if (registryCoverageNeeded) {
+        void registryAssignmentsQuery.refetch();
+      }
+      void dashboardSummaryQuery.refetch();
       void conflictsQuery.refetch();
     }
   }, [view]);
@@ -1293,7 +1320,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
 
           <section className="min-w-0">
             {view !== "executive" ? <BreadcrumbNavigation view={view} resource={selectedResource} onNavigate={navigateTo} /> : null}
-            {view === "executive" ? <ExecutiveDashboard stats={stats} resources={resources} assignmentTotal={assignmentTotal} cstSummary={cstSummary} currentRole={signedInRole} onNavigate={navigateTo} /> : null}
+            {view === "executive" ? <ExecutiveDashboard stats={stats} resources={resources} summary={dashboardSummary} assignmentTotal={assignmentTotal} cstSummary={cstSummary} currentRole={signedInRole} onNavigate={navigateTo} /> : null}
             {view === "registry" ? (
               <ResourceRegistry
                 resources={resources}
@@ -1665,6 +1692,7 @@ ${errorMessage(error)}`
                     };
                     const result = await startPartialReassignment(assignment.id, payload);
                     void assignmentsQuery.refetch();
+                    void registryAssignmentsQuery.refetch();
                     void poolsQuery.refetch();
                     void conflictsQuery.refetch();
                     void cstJobsQuery.refetch();
@@ -1677,6 +1705,7 @@ ${errorMessage(error)}`
                 onRefreshSiebelAssignment={(assignment) => run(async () => {
                   const { data } = await api.post<BssDeltaSyncResponse>(`/assignments/${assignment.id}/siebel-refresh`);
                   void assignmentsQuery.refetch();
+                  void registryAssignmentsQuery.refetch();
                   void poolsQuery.refetch();
                   setNotice({ title: "BSS Delta Sync", detail: `${data.message}: ${data.updated} updated, ${data.unchanged} unchanged, ${data.failed} failed.` });
                 })}
@@ -1727,7 +1756,7 @@ ${errorMessage(error)}`
                 })}
               />
             ) : null}
-            {view === "integrity" ? <IntegrityManagement conflicts={conflicts} resources={resources} onOpen={openResource} onAcceptAssignment={(assignmentId) => run(async () => { await acceptConflictAssignment(assignmentId); })} onRejectAssignment={(assignmentId) => run(async () => { await rejectConflictAssignment(assignmentId); })} onAutoResolveExactDuplicates={() => run(async () => { const result = await autoResolveExactDuplicateConflicts(); setNotice({ title: "Integrity Auto-Resolve Complete", detail: result.message }); void assignmentsQuery.refetch(); void conflictsQuery.refetch(); void cstSummaryQuery.refetch(); })} /> : null}
+            {view === "integrity" ? <IntegrityManagement conflicts={conflicts} resources={resources} onOpen={openResource} onAcceptAssignment={(assignmentId) => run(async () => { await acceptConflictAssignment(assignmentId); })} onRejectAssignment={(assignmentId) => run(async () => { await rejectConflictAssignment(assignmentId); })} onAutoResolveExactDuplicates={() => run(async () => { const result = await autoResolveExactDuplicateConflicts(); setNotice({ title: "Integrity Auto-Resolve Complete", detail: result.message }); void assignmentsQuery.refetch(); void registryAssignmentsQuery.refetch(); void conflictsQuery.refetch(); void cstSummaryQuery.refetch(); })} /> : null}
             {view === "bulk" ? (
               <BulkOperations
                 poolCsv={bulkPoolCsv}
@@ -1862,6 +1891,7 @@ ${errorMessage(error)}`
                 onRunSiebelDeltaSync={() => run(async () => {
                   const { data } = await api.post<BssDeltaSyncResponse>("/siebel/delta-sync");
                   void assignmentsQuery.refetch();
+                  void registryAssignmentsQuery.refetch();
                   void poolsQuery.refetch();
                   void auditQuery.refetch();
                   setNotice({ title: "BSS Delta Sync", detail: `Checked ${data.checked}. Updated ${data.updated}, unchanged ${data.unchanged}, failed ${data.failed}.` });
@@ -1980,6 +2010,7 @@ function ThemeSelector({ theme, onTheme }: { theme: AppTheme; onTheme: (theme: A
 function ExecutiveDashboard({
   stats,
   resources,
+  summary,
   assignmentTotal,
   cstSummary,
   currentRole,
@@ -1987,16 +2018,19 @@ function ExecutiveDashboard({
 }: {
   stats: RegistryStats;
   resources: ManagedResource[];
+  summary: DashboardSummary | null;
   assignmentTotal: number;
   cstSummary: CstSyncSummary | null;
   currentRole: User["role"];
   onNavigate: (view: ViewKey, registryPanel?: RegistryPanelId) => void;
 }) {
-  const assignedIps = resources
+  const assignedIps = summary?.assigned_ips ?? resources
     .filter((resource) => resource.administrativeStatus === "ASSIGNED")
     .reduce((sum, resource) => sum + resource.totalIps, 0);
-  const ripePending = resources.filter((resource) => ["PENDING", "FAILED", "DECOMMISSION_PENDING"].includes(resource.ripeSyncStatus)).length;
-  const cstPending = cstSummary?.pending_jobs ?? resources.filter((resource) => resource.cstSyncStatus === "PENDING").length;
+  const totalPools = summary?.total_pools ?? stats.totalPools;
+  const totalIps = summary?.total_ips ?? stats.totalResources;
+  const ripePending = summary?.ripe_pending ?? resources.filter((resource) => ["PENDING", "FAILED", "DECOMMISSION_PENDING"].includes(resource.ripeSyncStatus)).length;
+  const cstPending = summary?.cst_pending ?? cstSummary?.pending_jobs ?? resources.filter((resource) => resource.cstSyncStatus === "PENDING").length;
   const criticalConflicts = stats.integrityIssues;
   const workflowTileDefinitions: Array<{
     title: string;
@@ -2008,7 +2042,7 @@ function ExecutiveDashboard({
     registryPanel?: RegistryPanelId;
     adminOnly?: boolean;
   }> = [
-    { title: "Resource Registry", detail: "Browse allocated pools, child pools, available blocks, assignments, and RIPE-discovered roots.", status: `${stats.totalPools} registered subnets`, accent: "cyan", icon: <Database className="h-5 w-5" />, view: "registry", registryPanel: "subnet-navigator" },
+    { title: "Resource Registry", detail: "Browse allocated pools, child pools, available blocks, assignments, and RIPE-discovered roots.", status: `${totalPools} registered subnets`, accent: "cyan", icon: <Database className="h-5 w-5" />, view: "registry", registryPanel: "subnet-navigator" },
     { title: "Assignment Management", detail: "Assign, reserve, release, and retire customer or internal subnet resources.", status: `${assignmentTotal} active assignments`, accent: "green", icon: <Users className="h-5 w-5" />, view: "assignments" },
     { title: "Global Search", detail: "Find resources by CIDR, UUID, transaction ID, owner, netname, or status.", status: "CIDR and transaction lookup", accent: "slate", icon: <Search className="h-5 w-5" />, view: "search" },
     { title: "RIPE Discovery", detail: "Discover RIPE root pools maintained by Salam and sync them into the local LIR registry.", status: "Maintainer discovery", accent: "blue", icon: <Radar className="h-5 w-5" />, view: "registry", registryPanel: "lir-discovery" },
@@ -2024,7 +2058,7 @@ function ExecutiveDashboard({
   return (
     <div className="grid gap-5">
       <section className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-        <HomeMetric label="Total Pools" value={String(stats.totalPools)} detail={`${formatHosts(stats.totalResources)} total IPs`} tone="cyan" />
+        <HomeMetric label="Total Pools" value={String(totalPools)} detail={`${formatHosts(totalIps)} total IPs`} tone="cyan" />
         <HomeMetric label="Assigned IPs" value={formatHosts(assignedIps)} detail={`${assignmentTotal} assignment records`} tone="green" />
         <HomeMetric label="RIPE Pending" value={String(ripePending)} detail="Push, retry, or removal worklist" tone={ripePending ? "amber" : "green"} />
         <HomeMetric label="CST Pending" value={String(cstPending)} detail="Local transaction jobs" tone={cstPending ? "violet" : "green"} />
@@ -6486,6 +6520,8 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
             continue;
           }
           const freeUuid = resourceUuid("free", pool.id, block.cidr);
+          const blockClassification = classifyCidr(block.cidr);
+          const blockIsPublic = blockClassification === "PUBLIC";
           resources.push({
             id: freeUuid,
             uuid: freeUuid,
@@ -6520,13 +6556,13 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
             utilization: 0,
             type: "Subnet",
             role: "Subnet",
-            classification: classifyCidr(block.cidr),
+            classification: blockClassification,
             owner: "Salam LIR",
             status: "AVAILABLE",
             administrativeStatus: "AVAILABLE",
             ripeSyncRequired: false,
             ripeSyncStatus: "EXCLUDED",
-            cstSyncStatus: "NOT_REQUIRED",
+            cstSyncStatus: blockIsPublic ? "PENDING" : "NOT_REQUIRED",
             actionFlag: "S",
             accessTechnologyId: "",
             accessTechnology: "",

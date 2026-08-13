@@ -248,6 +248,16 @@ export type AuditEvent = {
   new_value: string;
 };
 
+export type DashboardSummary = {
+  total_pools: number;
+  total_ips: number;
+  assigned_ips: number;
+  assignment_records: number;
+  ripe_pending: number;
+  cst_pending: number;
+  generated_at: string;
+};
+
 export type Conflict = {
   severity: "critical" | "warning" | "info";
   title: string;
@@ -980,6 +990,11 @@ export async function login(username: string, password: string) {
 
 export async function getPools() {
   const { data } = await api.get<Pool[]>("/pools");
+  return data;
+}
+
+export async function getDashboardSummary() {
+  const { data } = await api.get<DashboardSummary>("/dashboard/summary");
   return data;
 }
 

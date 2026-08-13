@@ -855,6 +855,16 @@ class DatabaseSyncResponse(BaseModel):
     cst_batches: int
     synced_at: str
 
+
+class DashboardSummary(BaseModel):
+    total_pools: int = 0
+    total_ips: int = 0
+    assigned_ips: int = 0
+    assignment_records: int = 0
+    ripe_pending: int = 0
+    cst_pending: int = 0
+    generated_at: str
+
 class CstSyncBatch(BaseModel):
     id: str
     workflow_type: str
@@ -4766,6 +4776,7 @@ def init_db() -> None:
         connection.execute("UPDATE assignments SET cst_sync_status = 'PENDING', action_flag = 'U' WHERE cst_sync_status = 'BLOCKED'")
         connection.execute("UPDATE cst_sync_batches SET status = 'PENDING', blocked_jobs = 0 WHERE status = 'BLOCKED' OR blocked_jobs > 0")
         connection.execute("UPDATE ip_resources SET cst_sync_status = 'NOT_REQUIRED', ripe_sync_status = 'NOT_REQUIRED', action_flag = 'N' WHERE ip_type = 'PRIVATE'")
+        connection.execute("UPDATE ip_resources SET cst_sync_status = 'PENDING', action_flag = CASE WHEN COALESCE(action_flag, '') = '' THEN 'N' ELSE action_flag END WHERE ip_type = 'PUBLIC' AND assignment_status_id = 1 AND status != 'RETIRED' AND cst_sync_status = 'NOT_REQUIRED'")
         connection.execute("UPDATE assignments SET cst_sync_status = 'NOT_REQUIRED', ripe_sync_status = 'NOT_REQUIRED', action_flag = 'N' WHERE id IN (SELECT source_entity_id FROM ip_resources WHERE source_entity_type = 'assignment' AND ip_type = 'PRIVATE')")
         connection.execute("UPDATE cst_sync_jobs SET status = 'NOT_REQUIRED', last_error = '', response_json = ? WHERE status IN ('PENDING', 'RUNNING') AND resource_uuid IN (SELECT resource_uuid FROM ip_resources WHERE ip_type = 'PRIVATE')", (json.dumps({"externalApiCalled": False, "accepted": True, "message": "Private IP range is excluded from CST synchronization"}, sort_keys=True),))
 
@@ -5825,6 +5836,37 @@ def login(payload: LoginRequest) -> LoginResponse:
     if row is None or row["status"] != "Active" or not verify_password(payload.password, row["password_salt"], row["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid username or password")
     return LoginResponse(token=f"demo-{uuid4().hex}", username=row["username"], role=row["role"])
+
+
+@app.get("/dashboard/summary", response_model=DashboardSummary)
+def dashboard_summary() -> DashboardSummary:
+    with connect() as connection:
+        release_expired_reservations(connection)
+        pool_row = connection.execute("SELECT COUNT(*) AS count, COALESCE(SUM(size), 0) AS total_ips FROM pools").fetchone()
+        assignment_records = int(connection.execute("SELECT COUNT(*) FROM assignments WHERE status NOT IN ('Retiring')").fetchone()[0] or 0)
+        assigned_ips = int(connection.execute("SELECT COALESCE(SUM(size), 0) FROM assignments WHERE status NOT IN ('Reserved', 'Planned', 'Retiring')").fetchone()[0] or 0)
+        ripe_pending = int(connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM ip_resources
+            WHERE ip_type = 'PUBLIC'
+              AND status != 'RETIRED'
+              AND (
+                source_entity_type = 'pool'
+                OR ripe_sync_status IN ('PENDING', 'FAILED', 'DECOMMISSION_PENDING')
+              )
+            """
+        ).fetchone()[0] or 0)
+        cst_pending = int(connection.execute("SELECT COUNT(*) FROM cst_sync_jobs WHERE status IN ('PENDING', 'RUNNING')").fetchone()[0] or 0)
+    return DashboardSummary(
+        total_pools=int(pool_row["count"] or 0),
+        total_ips=int(pool_row["total_ips"] or 0),
+        assigned_ips=assigned_ips,
+        assignment_records=assignment_records,
+        ripe_pending=ripe_pending,
+        cst_pending=cst_pending,
+        generated_at=now_iso(),
+    )
 
 
 @app.get("/users", response_model=list[UserOut])
