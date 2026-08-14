@@ -17,20 +17,18 @@ import {
   GitMerge,
   History,
   KeyRound,
-  Leaf,
   Layers3,
   ListTree,
   Loader2,
   Lock,
-  Moon,
   LogOut,
   Network,
   Radar,
   RefreshCcw,
   Search,
+  Settings,
   Shield,
   CheckCircle2,
-  Sun,
   Upload,
   Users
 } from "lucide-react";
@@ -79,6 +77,7 @@ import {
   getDashboardSummary,
   getDatabaseConnectionStatus,
   getPools,
+  getResources,
   getRipeAllocatedPools,
   getRipeConfig,
   getSiebelConfig,
@@ -94,6 +93,7 @@ import {
   RipeDiscoveryResponse,
   RipePushResponse,
   RipeReportResponse,
+  ResourceRecord,
   SiebelConfig,
   SiebelConfigPayload,
   SiebelLookupResponse,
@@ -267,6 +267,7 @@ type SearchFilterField =
   | "type"
   | "classification"
   | "owner"
+  | "assignedTo"
   | "administrativeStatus"
   | "ripeSyncStatus"
   | "cstSyncStatus"
@@ -289,12 +290,13 @@ type PoolAssignmentDraft = {
   prefix: string;
 };
 
-type AppTheme = "default" | "white" | "green";
+type AppTheme = "default" | "white" | "green" | "salam";
 
-const themeOptions: Array<{ id: AppTheme; label: string; icon: React.ReactNode }> = [
-  { id: "default", label: "Default", icon: <Moon className="h-4 w-4" /> },
-  { id: "white", label: "White", icon: <Sun className="h-4 w-4" /> },
-  { id: "green", label: "Green", icon: <Leaf className="h-4 w-4" /> }
+const themeOptions: Array<{ id: AppTheme; label: string }> = [
+  { id: "default", label: "Default" },
+  { id: "white", label: "White" },
+  { id: "green", label: "Green" },
+  { id: "salam", label: "Salam" }
 ];
 
 function storedAppTheme(): AppTheme {
@@ -302,7 +304,7 @@ function storedAppTheme(): AppTheme {
     return "default";
   }
   const storedTheme = window.localStorage.getItem("ipam-theme");
-  return storedTheme === "white" || storedTheme === "green" || storedTheme === "default" ? storedTheme : "default";
+  return storedTheme === "white" || storedTheme === "green" || storedTheme === "salam" || storedTheme === "default" ? storedTheme : "default";
 }
 
 function salamLogoForTheme(theme: AppTheme) {
@@ -321,6 +323,7 @@ const SEARCH_FILTER_FIELDS: Array<{ value: SearchFilterField; label: string; mod
   { value: "type", label: "Type", mode: "select" },
   { value: "classification", label: "Classification", mode: "select" },
   { value: "owner", label: "Owner", mode: "select" },
+  { value: "assignedTo", label: "Assigned To", mode: "select" },
   { value: "administrativeStatus", label: "Status", mode: "select" },
   { value: "ripeSyncStatus", label: "RIPE Status", mode: "select" },
   { value: "cstSyncStatus", label: "CST Sync Status", mode: "select" },
@@ -950,6 +953,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
     ...liveQueryOptions
   });
   const registryAssignmentsQuery = useQuery({ queryKey: ["assignments", "registry-coverage"], queryFn: getRegistryCoverageAssignments, enabled: registryCoverageNeeded, ...liveQueryOptions });
+  const persistedResourcesQuery = useQuery({ queryKey: ["resources"], queryFn: getResources, ...liveQueryOptions });
   const dashboardSummaryQuery = useQuery({ queryKey: ["dashboard-summary"], queryFn: getDashboardSummary, ...liveQueryOptions });
   const conflictsQuery = useQuery({ queryKey: ["conflicts"], queryFn: getConflicts, ...liveQueryOptions });
   const auditQuery = useQuery({ queryKey: ["audit"], queryFn: getAuditEvents, ...liveQueryOptions });
@@ -980,6 +984,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   const assignmentPageData = assignmentsQuery.data ?? null;
   const assignments = assignmentPageData?.items ?? lastGoodAssignments;
   const registryAssignments = registryAssignmentsQuery.data ?? lastGoodRegistryAssignments ?? assignments;
+  const persistedResources = persistedResourcesQuery.data ?? [];
   const dashboardSummary = dashboardSummaryQuery.data ?? null;
   const assignmentTotal = dashboardSummary?.assignment_records ?? assignmentPageData?.total ?? registryAssignments.length ?? lastGoodAssignments.length;
   const conflicts = conflictsQuery.data ?? [];
@@ -1101,7 +1106,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
     return () => window.removeEventListener("popstate", applyRoute);
   }, []);
 
-  const resources = useMemo(() => buildRegistryResources(pools, registryAssignments), [pools, registryAssignments]);
+  const resources = useMemo(() => buildRegistryResources(pools, registryAssignments, persistedResources), [pools, registryAssignments, persistedResources]);
   const stats = useMemo(() => buildRegistryStats(resources, conflicts), [resources, conflicts]);
   const selectedResource = resources.find((resource) => resource.id === selectedResourceId) ?? resources[0] ?? null;
   const usingCachedAssignments = assignmentsQuery.isError && lastGoodAssignments.length > 0;
@@ -1119,6 +1124,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   const refresh = () => {
     void queryClient.invalidateQueries({ queryKey: ["pools"] });
     void queryClient.invalidateQueries({ queryKey: ["assignments"] });
+    void queryClient.invalidateQueries({ queryKey: ["resources"] });
     void queryClient.invalidateQueries({ queryKey: ["dashboard-summary"] });
     void queryClient.invalidateQueries({ queryKey: ["conflicts"] });
     void queryClient.invalidateQueries({ queryKey: ["audit"] });
@@ -1135,6 +1141,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
     void queryClient.invalidateQueries({ queryKey: ["cst-transactions"] });
     void poolsQuery.refetch();
     void assignmentsQuery.refetch();
+    void persistedResourcesQuery.refetch();
     if (registryCoverageNeeded) {
       void registryAssignmentsQuery.refetch();
     }
@@ -1646,6 +1653,14 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                 assignmentTotalPages={assignmentPageData?.total_pages ?? 1}
                 assignmentSearch={assignmentSearch}
                 assignmentsLoading={assignmentsQuery.isFetching}
+                searchQuery={globalSearch}
+                searchFilters={globalSearchFilters}
+                searchRefreshing={poolsQuery.isFetching || registryAssignmentsQuery.isFetching || conflictsQuery.isFetching}
+                searchLastUpdated={Math.max(poolsQuery.dataUpdatedAt, registryAssignmentsQuery.dataUpdatedAt, conflictsQuery.dataUpdatedAt)}
+                onSearchQuery={setGlobalSearch}
+                onSearchFilters={setGlobalSearchFilters}
+                onSearchRefresh={refresh}
+                onSearchOpen={() => { void registryAssignmentsQuery.refetch(); }}
                 onAssignmentPage={setAssignmentPage}
                 onAssignmentPageSize={(value) => { setAssignmentPageSize(value); setAssignmentPage(1); }}
                 onAssignmentSearch={(value) => { setAssignmentSearch(value); setAssignmentPage(1); }}
@@ -1721,7 +1736,6 @@ ${errorMessage(error)}`
                   void poolsQuery.refetch();
                   setNotice({ title: "BSS Delta Sync", detail: `${data.message}: ${data.updated} updated, ${data.unchanged} unchanged, ${data.failed} failed.` });
                 })}
-                onGlobalSearch={() => navigateTo("search")}
                 onLookupSiebelService={(serviceId) => run(async () => {
                   const { data } = await api.post<SiebelLookupResponse>("/siebel/business-customer", { service_id: serviceId });
                   if (!data.found) {
@@ -2001,27 +2015,19 @@ ${errorMessage(error)}`
 
 function ThemeSelector({ theme, onTheme }: { theme: AppTheme; onTheme: (theme: AppTheme) => void }) {
   return (
-    <div className="flex rounded-md border bg-muted/30 p-1" aria-label="Theme selector">
-      {themeOptions.map((option) => (
-        <button
-          key={option.id}
-          className={cn(
-            "flex h-8 items-center gap-1.5 rounded px-2 text-xs font-semibold transition hover:bg-background hover:text-foreground",
-            theme === option.id ? "bg-primary text-primary-foreground shadow-sm" : "text-muted-foreground"
-          )}
-          type="button"
-          onClick={() => onTheme(option.id)}
-          aria-pressed={theme === option.id}
-          title={`${option.label} theme`}
-        >
-          {option.icon}
-          <span>{option.label}</span>
-        </button>
-      ))}
+    <div className="relative w-32" aria-label="Theme selector">
+      <select
+        className="h-9 w-full appearance-none rounded-md border bg-muted/40 py-0 pl-3 pr-8 text-sm font-semibold outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/25"
+        value={theme}
+        onChange={(event) => onTheme(event.target.value as AppTheme)}
+        title="Application theme"
+      >
+        {themeOptions.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}
+      </select>
+      <ChevronDown className="pointer-events-none absolute right-2 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
     </div>
   );
 }
-
 function ExecutiveDashboard({
   stats,
   resources,
@@ -2039,23 +2045,34 @@ function ExecutiveDashboard({
   currentRole: User["role"];
   onNavigate: (view: ViewKey, registryPanel?: RegistryPanelId) => void;
 }) {
-  const [salamOnlyMetrics, setSalamOnlyMetrics] = useState(false);
-  const metricResources = salamOnlyMetrics ? resources.filter((resource) => String(resource.owner || "").trim().toLowerCase() === "salam") : resources;
+  const [metricOwnerMenuOpen, setMetricOwnerMenuOpen] = useState(false);
+  const [metricOwnerSelection, setMetricOwnerSelection] = useState<Record<string, boolean>>({});
+  const metricOwnerOptions = useMemo(
+    () => uniqueSorted(resources.map((resource) => String(resource.owner || "Unknown").trim() || "Unknown")),
+    [resources]
+  );
+  const selectedMetricOwners = metricOwnerOptions.filter((owner) => metricOwnerSelection[owner] !== false);
+  const allMetricOwnersSelected = metricOwnerOptions.length === 0 || selectedMetricOwners.length === metricOwnerOptions.length;
+  const selectedMetricOwnerSet = new Set(selectedMetricOwners);
+  const metricResources = allMetricOwnersSelected ? resources : resources.filter((resource) => selectedMetricOwnerSet.has(String(resource.owner || "Unknown").trim() || "Unknown"));
   const fallbackPools = metricResources.filter(isRegisteredSubnet);
   const fallbackAssignments = metricResources.filter((resource) => resource.administrativeStatus === "ASSIGNED");
   const fallbackAssignedIps = fallbackAssignments.reduce((sum, resource) => sum + resource.totalIps, 0);
   const fallbackTotalIps = fallbackPools.reduce((sum, resource) => sum + resource.totalIps, 0);
   const fallbackTotalPools = fallbackPools.length;
-  const assignedIps = salamOnlyMetrics ? summary?.salam_assigned_ips ?? fallbackAssignedIps : summary?.assigned_ips ?? fallbackAssignedIps;
-  const assignmentRecords = salamOnlyMetrics ? summary?.salam_assignment_records ?? fallbackAssignments.length : summary?.assignment_records ?? assignmentTotal;
-  const totalPools = salamOnlyMetrics ? summary?.salam_total_pools ?? fallbackTotalPools : summary?.total_pools ?? stats.totalPools;
-  const totalIps = salamOnlyMetrics ? summary?.salam_total_ips ?? fallbackTotalIps : summary?.total_ips ?? stats.totalResources;
+  const salamOwnerSelected = selectedMetricOwners.length === 1 && selectedMetricOwners[0].trim().toLowerCase() === "salam";
+  const assignedIps = allMetricOwnersSelected ? summary?.assigned_ips ?? fallbackAssignedIps : salamOwnerSelected ? summary?.salam_assigned_ips ?? fallbackAssignedIps : fallbackAssignedIps;
+  const assignmentRecords = allMetricOwnersSelected ? summary?.assignment_records ?? assignmentTotal : salamOwnerSelected ? summary?.salam_assignment_records ?? fallbackAssignments.length : fallbackAssignments.length;
+  const totalPools = allMetricOwnersSelected ? summary?.total_pools ?? stats.totalPools : salamOwnerSelected ? summary?.salam_total_pools ?? fallbackTotalPools : fallbackTotalPools;
+  const totalIps = allMetricOwnersSelected ? summary?.total_ips ?? stats.totalResources : salamOwnerSelected ? summary?.salam_total_ips ?? fallbackTotalIps : fallbackTotalIps;
   const availableIps = Math.max(totalIps - assignedIps, 0);
   const utilization = totalIps ? round1((assignedIps / totalIps) * 100) : 0;
-  const ripePending = salamOnlyMetrics ? summary?.salam_ripe_pending ?? metricResources.filter((resource) => ["PENDING", "FAILED", "DECOMMISSION_PENDING"].includes(resource.ripeSyncStatus)).length : summary?.ripe_pending ?? resources.filter((resource) => ["PENDING", "FAILED", "DECOMMISSION_PENDING"].includes(resource.ripeSyncStatus)).length;
-  const cstPending = salamOnlyMetrics ? summary?.salam_cst_pending ?? metricResources.filter((resource) => resource.cstSyncStatus === "PENDING").length : summary?.cst_pending ?? cstSummary?.pending_jobs ?? resources.filter((resource) => resource.cstSyncStatus === "PENDING").length;
+  const ripePending = allMetricOwnersSelected ? summary?.ripe_pending ?? resources.filter((resource) => ["PENDING", "FAILED", "DECOMMISSION_PENDING"].includes(resource.ripeSyncStatus)).length : salamOwnerSelected ? summary?.salam_ripe_pending ?? metricResources.filter((resource) => ["PENDING", "FAILED", "DECOMMISSION_PENDING"].includes(resource.ripeSyncStatus)).length : metricResources.filter((resource) => ["PENDING", "FAILED", "DECOMMISSION_PENDING"].includes(resource.ripeSyncStatus)).length;
+  const cstPending = allMetricOwnersSelected ? summary?.cst_pending ?? cstSummary?.pending_jobs ?? resources.filter((resource) => resource.cstSyncStatus === "PENDING").length : salamOwnerSelected ? summary?.salam_cst_pending ?? metricResources.filter((resource) => resource.cstSyncStatus === "PENDING").length : metricResources.filter((resource) => resource.cstSyncStatus === "PENDING").length;
   const criticalConflicts = stats.integrityIssues;
-  const metricScopeLabel = salamOnlyMetrics ? "Salam only" : "All owners";
+  const metricScopeLabel = allMetricOwnersSelected ? "All owners" : selectedMetricOwners.length ? selectedMetricOwners.join(", ") : "No owners selected";
+  const setOwnerSelected = (owner: string, selected: boolean) => setMetricOwnerSelection((current) => ({ ...current, [owner]: selected }));
+  const setAllOwnersSelected = (selected: boolean) => setMetricOwnerSelection(Object.fromEntries(metricOwnerOptions.map((owner) => [owner, selected])) as Record<string, boolean>);
   const workflowTileDefinitions: Array<{
     title: string;
     detail: string;
@@ -2082,23 +2099,53 @@ function ExecutiveDashboard({
   return (
     <div className="grid gap-5">
       <section className="grid gap-3">
-        <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border bg-card p-3">
+        <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
-            <p className="text-sm font-semibold">Dashboard metrics scope</p>
-            <p className="text-xs text-muted-foreground">Currently showing {metricScopeLabel} capacity and sync counts.</p>
+            <p className="text-sm font-semibold">Dashboard metrics</p>
+            <p className="text-xs text-muted-foreground">Scope: {metricScopeLabel}</p>
           </div>
-          <button
-            type="button"
-            role="switch"
-            aria-checked={salamOnlyMetrics}
-            className={cn("flex items-center gap-3 rounded-md border px-3 py-2 text-sm font-semibold transition", salamOnlyMetrics ? "border-primary/50 bg-primary/10 text-primary" : "bg-muted/20 text-muted-foreground hover:bg-muted/35 hover:text-foreground")}
-            onClick={() => setSalamOnlyMetrics((current) => !current)}
-          >
-            <span>Include only Salam</span>
-            <span className={cn("relative h-5 w-9 rounded-full border transition", salamOnlyMetrics ? "border-primary bg-primary" : "border-border bg-muted")}>
-              <span className={cn("absolute top-1/2 h-3.5 w-3.5 -translate-y-1/2 rounded-full bg-background shadow transition", salamOnlyMetrics ? "left-5" : "left-1")} />
-            </span>
-          </button>
+          <div className="relative">
+            <Button size="sm" variant="outline" onClick={() => setMetricOwnerMenuOpen((current) => !current)} aria-expanded={metricOwnerMenuOpen} aria-label="Dashboard metric owner settings">
+              <Settings className="h-4 w-4" />
+              Metrics
+            </Button>
+            {metricOwnerMenuOpen ? (
+              <div className="absolute right-0 z-30 mt-2 w-72 rounded-md border bg-popover p-3 text-popover-foreground shadow-lg">
+                <div className="mb-3 flex items-start justify-between gap-3">
+                  <div>
+                    <p className="text-sm font-semibold">Metric Owners</p>
+                    <p className="text-xs text-muted-foreground">Toggle each resource owner included in the cards.</p>
+                  </div>
+                  <Badge variant="muted">{selectedMetricOwners.length}/{metricOwnerOptions.length}</Badge>
+                </div>
+                <div className="grid max-h-64 gap-2 overflow-auto pr-1">
+                  {metricOwnerOptions.map((owner) => {
+                    const selected = metricOwnerSelection[owner] !== false;
+                    return (
+                      <button
+                        key={owner}
+                        type="button"
+                        role="switch"
+                        aria-checked={selected}
+                        className="flex items-center justify-between gap-3 rounded-md border bg-muted/20 px-3 py-2 text-left text-sm hover:bg-muted/35"
+                        onClick={() => setOwnerSelected(owner, !selected)}
+                      >
+                        <span className="font-medium">{owner}</span>
+                        <span className={cn("relative h-5 w-9 rounded-full border transition", selected ? "border-primary bg-primary" : "border-border bg-muted")}>
+                          <span className={cn("absolute top-1/2 h-3.5 w-3.5 -translate-y-1/2 rounded-full bg-background shadow transition", selected ? "left-5" : "left-1")} />
+                        </span>
+                      </button>
+                    );
+                  })}
+                  {!metricOwnerOptions.length ? <p className="rounded-md border bg-muted/20 p-3 text-sm text-muted-foreground">No owners found yet.</p> : null}
+                </div>
+                <div className="mt-3 flex justify-end gap-2">
+                  <Button size="sm" variant="ghost" onClick={() => setAllOwnersSelected(false)} disabled={!metricOwnerOptions.length}>Clear</Button>
+                  <Button size="sm" variant="secondary" onClick={() => setAllOwnersSelected(true)} disabled={!metricOwnerOptions.length}>All Owners</Button>
+                </div>
+              </div>
+            ) : null}
+          </div>
         </div>
         <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
           <HomeMetric label="Available IPs" value={formatHosts(availableIps)} detail={`${metricScopeLabel} free capacity ready for assignment`} tone="cyan" emphasis />
@@ -2972,7 +3019,7 @@ function ReservationManagement(props: {
   );
 }
 
-type AssignmentWorkflow = "assign" | "unassign" | "partial";
+type AssignmentWorkflow = "assign" | "unassign" | "partial" | "search";
 
 function AssignmentManagement(props: {
   resources: ManagedResource[];
@@ -2983,6 +3030,14 @@ function AssignmentManagement(props: {
   assignmentTotalPages: number;
   assignmentSearch: string;
   assignmentsLoading: boolean;
+  searchQuery: string;
+  searchFilters: SearchFilterCriterion[];
+  searchRefreshing: boolean;
+  searchLastUpdated: number;
+  onSearchQuery: (value: string) => void;
+  onSearchFilters: (value: SearchFilterCriterion[]) => void;
+  onSearchRefresh: () => void;
+  onSearchOpen: () => void;
   onAssignmentPage: (page: number) => void;
   onAssignmentPageSize: (pageSize: number) => void;
   onAssignmentSearch: (search: string) => void;
@@ -2997,7 +3052,6 @@ function AssignmentManagement(props: {
   onStatus: (assignment: Assignment, status: AssignmentStatus) => void;
   onRefreshSiebelAssignment: (assignment: Assignment) => void;
   onLookupSiebelService: (serviceId: string) => void;
-  onGlobalSearch: () => void;
 }) {
   const [workflow, setWorkflow] = useState<AssignmentWorkflow>("assign");
   const [partialAssignmentId, setPartialAssignmentId] = useState("");
@@ -3021,8 +3075,9 @@ function AssignmentManagement(props: {
   const filteredAssignments = props.assignments;
   const resourceByAssignmentId = new Map(props.resources.map((resource) => [resource.source && "customer_name" in resource.source ? resource.source.id : "", resource]));
   const resourceByCidr = new Map(props.resources.map((resource) => [resource.cidr, resource]));
+  const resourceForAssignment = (assignment: Assignment) => resourceByAssignmentId.get(assignment.id) ?? resourceByCidr.get(assignment.cidr) ?? null;
   const openAssignmentSummary = (assignment: Assignment) => {
-    const resource = resourceByAssignmentId.get(assignment.id) ?? resourceByCidr.get(assignment.cidr);
+    const resource = resourceForAssignment(assignment);
     if (resource) {
       props.onOpen(resource);
     }
@@ -3089,11 +3144,11 @@ function AssignmentManagement(props: {
     {
       id: "global-search",
       title: "Global Search",
-      description: "Open the full Global Search page for CIDR, resource, transaction, customer, service, and status lookup.",
+      description: "Search CIDR, resource, transaction, customer, service, owner, and status without leaving Assignment Management.",
       metric: "CIDR and transaction lookup",
       icon: Search,
-      action: props.onGlobalSearch,
-      active: false
+      action: () => { props.onSearchOpen(); openWorkflow("search"); },
+      active: workflow === "search"
     }
   ];
   const assignmentDetailsPanel = (
@@ -3268,6 +3323,8 @@ function AssignmentManagement(props: {
               <TableRow>
                 <TableHead>CIDR</TableHead>
                 <TableHead>Owner</TableHead>
+                <TableHead>Assigned To</TableHead>
+                <TableHead>Display Name</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead>Transaction</TableHead>
                 <TableHead>BSS Sync</TableHead>
@@ -3276,7 +3333,7 @@ function AssignmentManagement(props: {
             </TableHeader>
             <TableBody>
               {props.assignmentsLoading ? (
-                <TableRow><TableCell colSpan={6}>Loading assignments...</TableCell></TableRow>
+                <TableRow><TableCell colSpan={8}>Loading assignments...</TableCell></TableRow>
               ) : filteredAssignments.length ? filteredAssignments.map((assignment) => (
                 <TableRow key={assignment.id}>
                   <TableCell className="font-semibold">
@@ -3284,7 +3341,9 @@ function AssignmentManagement(props: {
                       {assignment.cidr}
                     </button>
                   </TableCell>
-                  <TableCell>{assignment.customer_name || assignment.internal_application_name}</TableCell>
+                  <TableCell>{resourceForAssignment(assignment)?.owner || "-"}</TableCell>
+                  <TableCell>{assignedToLabelForAssignment(assignment)}</TableCell>
+                  <TableCell>{assignmentDisplayName(assignment)}</TableCell>
                   <TableCell><Badge variant={assignment.status === "Blocked" ? "danger" : assignment.status === "Reserved" ? "warning" : "success"}>{assignment.status}</Badge></TableCell>
                   <TableCell>{assignment.service_instance_id || assignment.id}</TableCell>
                   <TableCell className="text-xs text-muted-foreground">{assignment.siebel_last_sync_at ? formatDateTime(assignment.siebel_last_sync_at) : assignment.siebel_last_checked_at ? `Checked ${formatDateTime(assignment.siebel_last_checked_at)}` : "Not synced"}</TableCell>
@@ -3307,7 +3366,7 @@ function AssignmentManagement(props: {
                 </TableRow>
               )) : (
                 <TableRow>
-                  <TableCell colSpan={6} className="py-8 text-center text-sm text-muted-foreground">{props.assignmentTotal ? "No assignments match the search." : "No assignments found."}</TableCell>
+                  <TableCell colSpan={8} className="py-8 text-center text-sm text-muted-foreground">{props.assignmentTotal ? "No assignments match the search." : "No assignments found."}</TableCell>
                 </TableRow>
               )}
             </TableBody>
@@ -3326,7 +3385,7 @@ function AssignmentManagement(props: {
 
   return (
     <div className="grid gap-5">
-      <PageTitle title="Assignment Management" description="Choose Assign, Unassign, Partial Reassign, or open Global Search." />
+      <PageTitle title="Assignment Management" description="Choose Assign, Unassign, Partial Reassign, or search registry resources in-place." />
       <div className="grid gap-3 lg:grid-cols-4">
         {workflowTiles.map((tile) => {
           const Icon = tile.icon;
@@ -3360,6 +3419,20 @@ function AssignmentManagement(props: {
           {partialAssignment ? renderAssignmentForm() : null}
           {renderAssignmentTable()}
         </>
+      ) : null}
+      {workflow === "search" ? (
+        <GlobalSearchPanel
+          resources={props.resources}
+          query={props.searchQuery}
+          filters={props.searchFilters}
+          isRefreshing={props.searchRefreshing}
+          lastUpdated={props.searchLastUpdated}
+          onQuery={props.onSearchQuery}
+          onFilters={props.onSearchFilters}
+          onRefresh={props.onSearchRefresh}
+          onOpen={props.onOpen}
+          scope="assignment-global-search"
+        />
       ) : null}
     </div>
   );
@@ -4307,17 +4380,7 @@ function ReportMetric({ label, value, detail }: { label: string; value: string; 
   );
 }
 
-function GlobalSearch({
-  resources,
-  query,
-  filters,
-  isRefreshing,
-  lastUpdated,
-  onQuery,
-  onFilters,
-  onRefresh,
-  onOpen
-}: {
+type GlobalSearchPanelProps = {
   resources: ManagedResource[];
   query: string;
   filters: SearchFilterCriterion[];
@@ -4327,7 +4390,30 @@ function GlobalSearch({
   onFilters: (value: SearchFilterCriterion[]) => void;
   onRefresh: () => void;
   onOpen: (resource: ManagedResource) => void;
-}) {
+  scope?: string;
+};
+
+function GlobalSearch(props: GlobalSearchPanelProps) {
+  return (
+    <div className="grid gap-5">
+      <PageTitle title="Global Search" description="Search by IP address, CIDR, Resource ID, Transaction ID, customer, service, owner, status, RIPE/CST sync status, netname, and selected filter criteria." />
+      <GlobalSearchPanel {...props} scope="global-search" />
+    </div>
+  );
+}
+
+function GlobalSearchPanel({
+  resources,
+  query,
+  filters,
+  isRefreshing,
+  lastUpdated,
+  onQuery,
+  onFilters,
+  onRefresh,
+  onOpen,
+  scope = "global-search"
+}: GlobalSearchPanelProps) {
   const [draftFilter, setDraftFilter] = useState<{ field: SearchFilterField; value: string }>({ field: "administrativeStatus", value: "" });
   const results = filterResources(resources, query, filters).sort((left, right) => left.startNumber - right.startNumber || left.prefix - right.prefix || resourceTypeLabel(left).localeCompare(resourceTypeLabel(right)));
   const selectedField = SEARCH_FILTER_FIELDS.find((field) => field.value === draftFilter.field) ?? SEARCH_FILTER_FIELDS[0];
@@ -4345,7 +4431,6 @@ function GlobalSearch({
 
   return (
     <div className="grid gap-5">
-      <PageTitle title="Global Search" description="Search by IP address, CIDR, Resource ID, Transaction ID, customer, service, owner, status, RIPE/CST sync status, netname, and selected filter criteria." />
       <Card>
         <CardContent className="grid gap-3 pt-5">
           <div className="flex flex-col gap-2 md:flex-row">
@@ -4409,7 +4494,7 @@ function GlobalSearch({
           <CardDescription>{results.length} matching resources. Select any result to open the Resource Summary page.</CardDescription>
         </CardHeader>
         <CardContent>
-          <GlobalSearchResultsTable resources={results} onOpen={onOpen} scope="global-search" />
+          <GlobalSearchResultsTable resources={results} onOpen={onOpen} scope={scope} />
         </CardContent>
       </Card>
     </div>
@@ -4437,7 +4522,9 @@ function GlobalSearchResultsTable({
             <TableHead>CIDR</TableHead>
             <TableHead>Range</TableHead>
             <TableHead>Type</TableHead>
-            <TableHead>Owner / Customer</TableHead>
+            <TableHead>Owner</TableHead>
+            <TableHead>Assigned To</TableHead>
+            <TableHead>Customer / Resource</TableHead>
             <TableHead>Status</TableHead>
             <TableHead>Sync</TableHead>
             <TableHead>Service / Transaction</TableHead>
@@ -4448,7 +4535,7 @@ function GlobalSearchResultsTable({
         </TableHeader>
         <TableBody>
           {resources.map((resource, resourceIndex) => {
-            const owner = assignedResourceCustomerLabel(resource) || resource.organizationName || resource.fullName || resource.owner || "-";
+            const customer = resourceDisplayName(resource);
             const service = assignedResourceServiceLabel(resource) || resource.serviceId || resource.serviceDescription || "-";
             const location = [resource.regionId ? `Region ${resource.regionId}` : "", resource.cityId ? `City ${resource.cityId}` : ""].filter(Boolean).join(" / ") || resource.country || resource.maintainer || "-";
             const rowActions = actions?.(resource);
@@ -4465,8 +4552,10 @@ function GlobalSearchResultsTable({
                   <ResourceTypeBadge resource={resource} />
                   <p className="mt-1 text-xs text-muted-foreground">{resource.classification}</p>
                 </TableCell>
+                <TableCell className="min-w-[120px] font-medium">{resource.owner || "-"}</TableCell>
+                <TableCell className="min-w-[120px]">{assignedToLabelForResource(resource)}</TableCell>
                 <TableCell className="min-w-[200px]">
-                  <p className="font-medium">{owner}</p>
+                  <p className="font-medium">{customer}</p>
                   <p className="text-xs text-muted-foreground">{resource.netname || resource.description || "-"}</p>
                 </TableCell>
                 <TableCell>
@@ -4491,7 +4580,7 @@ function GlobalSearchResultsTable({
           })}
           {!resources.length ? (
             <TableRow>
-              <TableCell colSpan={actions ? 10 : 9} className="py-8 text-center text-sm text-muted-foreground">{empty}</TableCell>
+              <TableCell colSpan={actions ? 12 : 11} className="py-8 text-center text-sm text-muted-foreground">{empty}</TableCell>
             </TableRow>
           ) : null}
         </TableBody>
@@ -6120,6 +6209,8 @@ function ResourceTable({ resources, empty, onRelease }: { resources: ManagedReso
                 <TableHead>Resource</TableHead>
                 <TableHead>Type</TableHead>
                 <TableHead>Owner</TableHead>
+                <TableHead>Assigned To</TableHead>
+                <TableHead>Display Name</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead>Capacity</TableHead>
                 {onRelease ? <TableHead /> : null}
@@ -6744,9 +6835,26 @@ function nearestParentPoolIdForAssignment(range: Range, entries: Array<{ pool: P
   });
   return candidates[0]?.pool.id ?? "";
 }
-function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
+function buildRegistryResources(pools: Pool[], assignments: Assignment[], persistedResources: ResourceRecord[] = []) {
   const resources: ManagedResource[] = [];
   const poolEntries = poolHierarchyEntries(pools);
+  const persistedByUuid = new Map(persistedResources.map((resource) => [resource.resource_uuid, resource]));
+  const persistedBySource = new Map(persistedResources.map((resource) => [`${resource.source_entity_type}:${resource.source_entity_id}`, resource]));
+  const persistedByCidr = new Map<string, ResourceRecord[]>();
+  for (const resource of persistedResources) {
+    const rows = persistedByCidr.get(resource.cidr) ?? [];
+    rows.push(resource);
+    persistedByCidr.set(resource.cidr, rows);
+  }
+  const persistedFor = (uuid: string, sourceType: string, sourceId: string, cidr: string) => (
+    persistedByUuid.get(uuid)
+    ?? persistedBySource.get(`${sourceType}:${sourceId}`)
+    ?? persistedByCidr.get(cidr)?.find((resource) => resource.source_entity_type === sourceType)
+    ?? persistedByCidr.get(cidr)?.find((resource) => resource.source_entity_type !== "pool")
+    ?? persistedByCidr.get(cidr)?.[0]
+    ?? null
+  );
+  const persistedCstStatus = (resource: ResourceRecord | null, fallback: CstSyncStatus) => resource?.cst_sync_status ? normalizeCstSyncStatus(resource.cst_sync_status) : fallback;
   const poolById = new Map(pools.map((pool) => [pool.id, pool]));
   const occupyingAssignments = assignments.filter((assignment) => !assignmentReleasedAfterRipeRemoval(assignment));
   const poolParentById = new Map(poolEntries.map(({ pool, range }) => [pool.id, nearestParentPoolIdForPool(pool, range, poolEntries)]));
@@ -6761,11 +6869,13 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
     const poolStatus = poolAdministrativeStatus(pool);
     const poolClassification = classifyCidr(pool.cidr);
     const poolIsPublic = poolClassification === "PUBLIC";
-    const poolMaintainer = resourceMaintainerFromPool(pool);
-    const poolOwner = ipResourceOwnerFromMaintainer(poolMaintainer);
+    const poolResourceUuid = resourceUuid("pool", pool.id, pool.cidr);
+    const persistedPoolResource = persistedFor(poolResourceUuid, "pool", pool.id, pool.cidr);
+    const poolMaintainer = persistedPoolResource?.maintainer || resourceMaintainerFromPool(pool);
+    const poolOwner = persistedPoolResource?.owner || ipResourceOwnerFromMaintainer(poolMaintainer);
     resources.push({
       id: pool.id,
-      uuid: resourceUuid("pool", pool.id, pool.cidr),
+      uuid: poolResourceUuid,
       parentId: poolParentById.get(pool.id) || "",
       cidr: pool.cidr,
       serviceProviderId: "5",
@@ -6803,14 +6913,14 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
       administrativeStatus: poolStatus,
       ripeSyncRequired: poolIsPublic,
       ripeSyncStatus: poolIsPublic ? "PENDING" : "EXCLUDED",
-      cstSyncStatus: poolIsPublic ? "PENDING" : "NOT_REQUIRED",
-      actionFlag: "N",
+      cstSyncStatus: poolIsPublic ? persistedCstStatus(persistedPoolResource, "PENDING") : "NOT_REQUIRED",
+      actionFlag: persistedPoolResource?.action_flag || "N",
       accessTechnologyId: "",
       accessTechnology: "",
       serviceDescription: "",
-      transactionId: pool.external_id || pool.id,
+      transactionId: persistedPoolResource?.transaction_id || pool.external_id || pool.id,
       sourceRegistry: pool.source_system || "Local Registry",
-      lastUpdated: pool.last_audit_at || pool.created_at,
+      lastUpdated: persistedPoolResource?.updated_at || pool.last_audit_at || pool.created_at,
       netname: pool.name,
       description: pool.description || pool.name,
       country: "SA",
@@ -6830,11 +6940,13 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
       const assignmentClassification = classifyCidr(assignment.cidr);
       const assignmentIsPublic = assignmentClassification === "PUBLIC";
       const assignmentParentPool = poolById.get(assignmentParentById.get(assignment.id) || "") ?? null;
-      const assignmentMaintainer = resourceMaintainerFromPool(assignmentParentPool);
-      const ipResourceOwner = ipResourceOwnerFromMaintainer(assignmentMaintainer);
+      const assignmentResourceUuid = resourceUuid("assignment", assignment.id, assignment.cidr);
+      const persistedAssignmentResource = persistedFor(assignmentResourceUuid, "assignment", assignment.id, assignment.cidr);
+      const assignmentMaintainer = persistedAssignmentResource?.maintainer || resourceMaintainerFromPool(assignmentParentPool);
+      const ipResourceOwner = persistedAssignmentResource?.owner || ipResourceOwnerFromMaintainer(assignmentMaintainer);
       resources.push({
         id: assignment.id,
-        uuid: resourceUuid("assignment", assignment.id, assignment.cidr),
+        uuid: assignmentResourceUuid,
         parentId: pool.id,
         cidr: assignment.cidr,
         serviceProviderId: assignment.service_provider_id || "5",
@@ -6872,14 +6984,14 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
         administrativeStatus: assignmentToAdministrativeStatus(assignment),
         ripeSyncRequired: assignmentIsPublic,
         ripeSyncStatus: ripeStatusForAssignment(assignment, assignmentIsPublic),
-        cstSyncStatus: assignmentIsPublic ? normalizeCstSyncStatus(assignment.cst_sync_status) : "NOT_REQUIRED",
-        actionFlag: assignment.action_flag || "N",
+        cstSyncStatus: assignmentIsPublic ? persistedCstStatus(persistedAssignmentResource, normalizeCstSyncStatus(assignment.cst_sync_status)) : "NOT_REQUIRED",
+        actionFlag: persistedAssignmentResource?.action_flag || assignment.action_flag || "N",
         accessTechnologyId: assignment.access_technology_id,
         accessTechnology: assignment.access_technology || accessTechnologyLabels[assignment.access_technology_id] || "",
         serviceDescription: assignment.service_description || assignment.service || assignment.assignment_purpose,
-        transactionId: assignment.service_instance_id || assignment.id,
+        transactionId: persistedAssignmentResource?.transaction_id || assignment.service_instance_id || assignment.id,
         sourceRegistry: "Local Registry",
-        lastUpdated: assignment.created_at,
+        lastUpdated: persistedAssignmentResource?.updated_at || assignment.created_at,
         netname: assignment.customer_name || assignment.internal_application_name || assignment.assignment_name,
         description: assignment.service || assignment.assignment_description || assignment.assignment_name,
         country: "SA",
@@ -6900,6 +7012,7 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
             continue;
           }
           const freeUuid = resourceUuid("free", pool.id, block.cidr);
+          const persistedFreeResource = persistedFor(freeUuid, "bulk_unassigned_fragment", `${poolResourceUuid}:${block.cidr}`, block.cidr);
           const blockClassification = classifyCidr(block.cidr);
           const blockIsPublic = blockClassification === "PUBLIC";
           resources.push({
@@ -6942,20 +7055,20 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[]) {
             administrativeStatus: "AVAILABLE",
             ripeSyncRequired: false,
             ripeSyncStatus: "EXCLUDED",
-            cstSyncStatus: blockIsPublic ? "PENDING" : "NOT_REQUIRED",
-            actionFlag: "S",
+            cstSyncStatus: blockIsPublic ? persistedCstStatus(persistedFreeResource, "PENDING") : "NOT_REQUIRED",
+            actionFlag: persistedFreeResource?.action_flag || "S",
             accessTechnologyId: "",
             accessTechnology: "",
             serviceDescription: "",
-            transactionId: `AVAILABLE-${pool.id}`,
+            transactionId: persistedFreeResource?.transaction_id || `AVAILABLE-${pool.id}`,
             sourceRegistry: "Calculated",
-            lastUpdated: pool.created_at,
+            lastUpdated: persistedFreeResource?.updated_at || pool.created_at,
             netname: `${pool.name}-FREE`,
             description: "Calculated available free block",
             country: "SA",
             maintainer: poolMaintainer,
             previousUuid: "",
-            sourceUuid: resourceUuid("pool", pool.id, pool.cidr),
+            sourceUuid: persistedFreeResource?.parent_resource_uuid || poolResourceUuid,
             successorUuid: "",
             operationType: "CALCULATED_FREE_SPACE",
             source: null,
@@ -7008,6 +7121,7 @@ function filterResources(resources: ManagedResource[], query: string, filters: S
       resource.type,
       resource.classification,
       resource.owner,
+      assignedToLabelForResource(resource),
       resource.administrativeStatus,
       resource.ripeSyncStatus,
       resource.cstSyncStatus,
@@ -7042,6 +7156,9 @@ function searchCriterionMatches(resource: ManagedResource, filter: SearchFilterC
 }
 
 function resourceValueForSearchField(resource: ManagedResource, field: SearchFilterField) {
+  if (field === "assignedTo") {
+    return assignedToLabelForResource(resource);
+  }
   return resource[field];
 }
 
@@ -7059,6 +7176,9 @@ function filterOptionsForField(field: SearchFilterField, resources: ManagedResou
   if (field === "cstSyncStatus") {
     return uniqueSorted([...CST_SYNC_STATUS_OPTIONS, ...resources.map((resource) => String(resource.cstSyncStatus ?? ""))]);
   }
+  if (field === "assignedTo") {
+    return uniqueSorted(resources.map((resource) => assignedToLabelForResource(resource)));
+  }
   return uniqueSorted(resources.map((resource) => String(resourceValueForSearchField(resource, field) ?? "")));
 }
 
@@ -7073,6 +7193,8 @@ const REGISTRY_EXPORT_COLUMNS: Array<{ key: string; header: string }> = [
   { key: "transactionId", header: "transactionId" },
   { key: "serviceProviderId", header: "serviceProviderId" },
   { key: "ipSubnet", header: "ipSubnet" },
+  { key: "owner", header: "owner" },
+  { key: "assigned_to", header: "Assigned To" },
   { key: "asn", header: "asn" },
   { key: "ipVersion", header: "ipVersion" },
   { key: "assignmentStatusId", header: "assignmentStatusId" },
@@ -7103,6 +7225,8 @@ const REGISTRY_EXPORT_COLUMNS: Array<{ key: string; header: string }> = [
 const POOL_SUMMARY_COLUMNS: Array<{ key: string; header: string }> = [
   { key: "pool_name", header: "Subnet Name" },
   { key: "allocation", header: "Allocation" },
+  { key: "owner", header: "Owner" },
+  { key: "assigned_to", header: "Assigned To" },
   { key: "total", header: "Total" },
   { key: "usable", header: "Usable" },
   { key: "in_use", header: "In Use" },
@@ -7119,6 +7243,8 @@ const LOCAL_ALLOCATED_POOL_UTILIZATION_COLUMNS: Array<{ key: string; header: str
   { key: "allocation", header: "Allocation" },
   { key: "resource_uuid", header: "Resource UUID" },
   { key: "classification", header: "Classification" },
+  { key: "owner", header: "Owner" },
+  { key: "assigned_to", header: "Assigned To" },
   { key: "total", header: "Total IPs" },
   { key: "usable", header: "Usable IPs" },
   { key: "in_use", header: "In Use IPs" },
@@ -7139,6 +7265,8 @@ const ACTIVE_ASSIGNMENT_COLUMNS: Array<{ key: string; header: string }> = [
   { key: "total_ips", header: "Total IPs" },
   { key: "assignment_status", header: "Assignment Status" },
   { key: "assignment_target_type", header: "Assignment Target Type" },
+  { key: "owner", header: "Owner" },
+  { key: "assigned_to", header: "Assigned To" },
   { key: "customer_name", header: "Customer Name" },
   { key: "organization_name", header: "Organization Name" },
   { key: "customer_id", header: "Customer ID" },
@@ -7201,7 +7329,8 @@ const ALL_IP_REPORT_COLUMNS: Array<{ key: string; header: string }> = [
   { key: "source_registry", header: "Source Registry" },
   { key: "netname", header: "Netname" },
   { key: "description", header: "Description" },
-  { key: "owner", header: "Owner / Maintainer" },
+  { key: "owner", header: "Owner" },
+  { key: "assigned_to", header: "Assigned To" },
   { key: "asn", header: "ASN" },
   { key: "site", header: "Site" },
   { key: "vrf_name", header: "VRF Name" },
@@ -7232,6 +7361,7 @@ const RESOURCE_UTILIZATION_COLUMNS: Array<{ key: string; header: string }> = [
   { key: "ripe_sync_required", header: "RIPE Sync Required" },
   { key: "ripe_sync_status", header: "RIPE Sync Status" },
   { key: "owner", header: "Owner" },
+  { key: "assigned_to", header: "Assigned To" },
   { key: "netname", header: "Netname" },
   { key: "description", header: "Description" },
   { key: "country", header: "Country" },
@@ -7314,6 +7444,8 @@ function activeAssignmentReportRows(resources: ManagedResource[]): ResourceUtili
         total_ips: resource.totalIps,
         assignment_status: assignment?.status || resource.administrativeStatus,
         assignment_target_type: assignment?.assignment_target_type || "",
+        owner: resource.owner,
+        assigned_to: assignedToLabelForResource(resource),
         customer_name: assignment?.customer_name || resource.organizationName || resource.fullName || resource.owner,
         organization_name: assignment?.organization_name || resource.organizationName,
         customer_id: assignment?.customer_id || "",
@@ -7355,6 +7487,8 @@ function registryExportRows(resources: ManagedResource[]): ResourceUtilizationRo
     transactionId: resource.transactionId,
     serviceProviderId: resource.serviceProviderId,
     ipSubnet: resource.cidr,
+    owner: resource.owner,
+    assignedTo: assignedToLabelForResource(resource),
     asn: resource.asn,
     ipVersion: 1,
     assignmentStatusId: resource.assignmentStatusId,
@@ -7416,6 +7550,8 @@ function poolSummaryReportRows(resources: ManagedResource[]): ResourceUtilizatio
     return {
       pool_name: pool.netname,
       allocation: pool.cidr,
+      owner: pool.owner,
+      assigned_to: assignedToLabelForResource(pool),
       total: pool.totalIps,
       usable,
       in_use: inUse,
@@ -7435,6 +7571,8 @@ function localAllocatedPoolUtilizationRows(resources: ManagedResource[]): Resour
     allocation: pool.cidr,
     resource_uuid: pool.uuid,
     classification: pool.classification,
+    owner: pool.owner,
+      assigned_to: assignedToLabelForResource(pool),
     total: pool.totalIps,
     usable: usableAddressCount(pool),
     in_use: pool.usedIps,
@@ -7534,6 +7672,7 @@ function resourceUtilizationRows(resources: ManagedResource[]): ResourceUtilizat
       ripe_sync_required: resource.ripeSyncRequired ? "Yes" : "No",
       ripe_sync_status: resource.ripeSyncStatus,
       owner: resource.owner,
+      assigned_to: assignedToLabelForResource(resource),
       netname: resource.netname,
       description: resource.description,
       country: resource.country,
@@ -8080,6 +8219,56 @@ function normalizeCstSyncStatus(value: string | undefined | null): CstSyncStatus
   return CST_SYNC_STATUS_OPTIONS.includes(normalized as CstSyncStatus) ? normalized as CstSyncStatus : "PENDING";
 }
 
+function assignedToLabelForStatus(statusId: number | string | null | undefined, targetType: string | null | undefined = "") {
+  const normalizedTarget = String(targetType || "").toLowerCase();
+  const parsedStatus = Number(statusId || 0);
+  if (parsedStatus === 3 || normalizedTarget === "business_customer") {
+    return "Business";
+  }
+  if (parsedStatus === 2 || normalizedTarget === "internal") {
+    return "Internal";
+  }
+  if (parsedStatus === 4 || normalizedTarget === "individual") {
+    return "Individual";
+  }
+  return "Unassigned";
+}
+
+function assignedToLabelForAssignment(assignment: Assignment) {
+  return assignedToLabelForStatus(assignment.assignment_status_id, assignment.assignment_target_type);
+}
+
+function assignedToLabelForResource(resource: ManagedResource) {
+  return assignedToLabelForStatus(resource.assignmentStatusId);
+}
+
+function assignmentDisplayName(assignment: Assignment) {
+  const assignedTo = assignedToLabelForAssignment(assignment);
+  if (assignedTo === "Internal") {
+    return assignment.service_description || assignment.internal_application_name || assignment.service || assignment.assignment_purpose || assignment.assignment_name || "Internal";
+  }
+  if (assignedTo === "Business") {
+    return assignment.organization_name || assignment.customer_name || assignment.service_description || assignment.service || "Business";
+  }
+  if (assignedTo === "Individual") {
+    return assignment.full_name || assignment.customer_name || "Individual";
+  }
+  return assignment.service_description || assignment.assignment_name || "Unassigned";
+}
+
+function resourceDisplayName(resource: ManagedResource) {
+  const assignedTo = assignedToLabelForResource(resource);
+  if (assignedTo === "Internal") {
+    return resource.serviceDescription || resource.netname || resource.description || "Internal";
+  }
+  if (assignedTo === "Business") {
+    return resource.organizationName || assignedResourceCustomerLabel(resource) || resource.netname || resource.description || "Business";
+  }
+  if (assignedTo === "Individual") {
+    return resource.fullName || assignedResourceCustomerLabel(resource) || "Individual";
+  }
+  return resource.netname || resource.description || "Unassigned";
+}
 function assignmentOwner(assignment: Assignment): ResourceOwner | string {
   if (assignment.assignment_target_type === "internal") {
     return assignment.owner || assignment.internal_business_unit || "Internal";
@@ -8345,6 +8534,18 @@ function errorMessage(error: unknown) {
   }
   return error instanceof Error ? error.message : "Unknown error";
 }
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 

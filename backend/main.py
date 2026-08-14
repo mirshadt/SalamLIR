@@ -3245,6 +3245,9 @@ def materialize_bulk_unassigned_fragments(connection: sqlite3.Connection) -> tup
             existing = find_resource_by_cidr(connection, str(fragment))
             if existing and existing.source_entity_type != BULK_UNASSIGNED_FRAGMENT_SOURCE:
                 continue
+            existing_fragment = existing if existing and existing.source_entity_type == BULK_UNASSIGNED_FRAGMENT_SOURCE else None
+            if existing_fragment:
+                resource_uuid = existing_fragment.resource_uuid
             fragment_resource = cst_resource_from_network(
                 fragment,
                 resource_uuid,
@@ -3264,6 +3267,17 @@ def materialize_bulk_unassigned_fragments(connection: sqlite3.Connection) -> tup
                 "cst_sync_ready": True,
                 "cst_validation_status": "READY",
             })
+            if existing_fragment:
+                fragment_resource = fragment_resource.model_copy(update={
+                    "version_uuid": existing_fragment.version_uuid,
+                    "transaction_id": existing_fragment.transaction_id,
+                    "action_flag": existing_fragment.action_flag,
+                    "cst_sync_status": existing_fragment.cst_sync_status,
+                    "cst_validation_status": existing_fragment.cst_validation_status,
+                    "cst_validation_errors": existing_fragment.cst_validation_errors,
+                    "cst_validation_warnings": existing_fragment.cst_validation_warnings,
+                    "created_at": existing_fragment.created_at,
+                })
             desired[resource_uuid] = fragment_resource
 
     stale_rows = connection.execute(
@@ -4954,6 +4968,7 @@ def init_db() -> None:
         connection.execute("UPDATE cst_sync_batches SET status = 'PENDING', blocked_jobs = 0 WHERE status = 'BLOCKED' OR blocked_jobs > 0")
         connection.execute("UPDATE ip_resources SET cst_sync_status = 'NOT_REQUIRED', ripe_sync_status = 'NOT_REQUIRED', action_flag = 'N' WHERE ip_type = 'PRIVATE'")
         repair_public_unassigned_cst_status(connection)
+        reconcile_cst_success_resource_statuses(connection)
         connection.execute("UPDATE assignments SET cst_sync_status = 'NOT_REQUIRED', ripe_sync_status = 'NOT_REQUIRED', action_flag = 'N' WHERE id IN (SELECT source_entity_id FROM ip_resources WHERE source_entity_type = 'assignment' AND ip_type = 'PRIVATE')")
         connection.execute("UPDATE cst_sync_jobs SET status = 'NOT_REQUIRED', last_error = '', response_json = ? WHERE status IN ('PENDING', 'RUNNING') AND resource_uuid IN (SELECT resource_uuid FROM ip_resources WHERE ip_type = 'PRIVATE')", (json.dumps({"externalApiCalled": False, "accepted": True, "message": "Private IP range is excluded from CST synchronization"}, sort_keys=True),))
 
@@ -9695,5 +9710,7 @@ def init_db_with_retry(max_attempts: int = 6) -> None:
 
 
 init_db_with_retry()
+
+
 
 

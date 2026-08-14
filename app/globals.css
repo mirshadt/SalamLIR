@@ -69,12 +69,38 @@ html[data-theme="green"] {
   --ring: 154 66% 28%;
 }
 
+
+html[data-theme="salam"] {
+  --background: 115 100% 97%;
+  --foreground: 172 100% 11%;
+  --card: 120 100% 100%;
+  --card-foreground: 172 100% 11%;
+  --popover: 120 100% 100%;
+  --popover-foreground: 172 100% 11%;
+  --primary: 123 99% 46%;
+  --primary-foreground: 172 100% 11%;
+  --secondary: 173 100% 11%;
+  --secondary-foreground: 115 100% 96%;
+  --muted: 115 100% 96%;
+  --muted-foreground: 170 18% 40%;
+  --accent: 142 100% 47%;
+  --accent-foreground: 172 100% 11%;
+  --destructive: 0 90% 63%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 170 13% 73%;
+  --input: 170 13% 73%;
+  --ring: 123 99% 46%;
+}
 html[data-theme="white"] .text-cyan-300 {
   color: rgb(14 116 144);
 }
 
 html[data-theme="green"] .text-cyan-300 {
   color: rgb(15 118 110);
+}
+
+html[data-theme="salam"] .text-cyan-300 {
+  color: rgb(0 56 49);
 }
 
 html[data-theme="white"] .text-sky-100,
@@ -89,12 +115,21 @@ html[data-theme="green"] .text-sky-300 {
   color: rgb(14 116 144);
 }
 
+html[data-theme="salam"] .text-sky-100,
+html[data-theme="salam"] .text-sky-200,
+html[data-theme="salam"] .text-sky-300 {
+  color: rgb(0 86 76);
+}
+
 html[data-theme="white"] .text-emerald-100,
 html[data-theme="white"] .text-emerald-200,
 html[data-theme="white"] .text-emerald-300,
 html[data-theme="green"] .text-emerald-100,
 html[data-theme="green"] .text-emerald-200,
-html[data-theme="green"] .text-emerald-300 {
+html[data-theme="green"] .text-emerald-300,
+html[data-theme="salam"] .text-emerald-100,
+html[data-theme="salam"] .text-emerald-200,
+html[data-theme="salam"] .text-emerald-300 {
   color: rgb(4 120 87);
 }
 
@@ -103,24 +138,31 @@ html[data-theme="white"] .text-amber-200,
 html[data-theme="white"] .text-amber-300,
 html[data-theme="green"] .text-amber-100,
 html[data-theme="green"] .text-amber-200,
-html[data-theme="green"] .text-amber-300 {
+html[data-theme="green"] .text-amber-300,
+html[data-theme="salam"] .text-amber-100,
+html[data-theme="salam"] .text-amber-200,
+html[data-theme="salam"] .text-amber-300 {
   color: rgb(180 83 9);
 }
 
 html[data-theme="white"] .text-red-200,
 html[data-theme="white"] .text-red-300,
 html[data-theme="green"] .text-red-200,
-html[data-theme="green"] .text-red-300 {
+html[data-theme="green"] .text-red-300,
+html[data-theme="salam"] .text-red-200,
+html[data-theme="salam"] .text-red-300 {
   color: rgb(185 28 28);
 }
 
 html[data-theme="white"] .text-violet-200,
-html[data-theme="green"] .text-violet-200 {
+html[data-theme="green"] .text-violet-200,
+html[data-theme="salam"] .text-violet-200 {
   color: rgb(109 40 217);
 }
 
 html[data-theme="white"] .text-slate-200,
-html[data-theme="green"] .text-slate-200 {
+html[data-theme="green"] .text-slate-200,
+html[data-theme="salam"] .text-slate-200 {
   color: rgb(51 65 85);
 }
 
@@ -148,3 +190,5 @@ textarea {
 .recharts-cartesian-axis-tick-value {
   fill: hsl(var(--muted-foreground));
 }
+
+
