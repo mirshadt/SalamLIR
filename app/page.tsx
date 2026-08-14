@@ -1267,27 +1267,33 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   return (
     <main className="min-h-screen px-4 py-4 md:px-6">
       <div className="mx-auto grid max-w-[1500px] gap-4">
-        <header className="flex flex-col gap-4 rounded-lg border bg-card p-4 md:flex-row md:items-center md:justify-between">
-          <div className="flex min-w-0 items-center gap-3">
-            <button className="shrink-0 rounded-md text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" type="button" onClick={() => navigateTo("executive")} aria-label="Go to home">
-              <img src={salamLogoForTheme(theme)} alt="Salam" className="h-9 w-36 object-contain" />
+        <header className="relative overflow-hidden rounded-xl border bg-card p-4 shadow-sm md:p-5">
+          <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_top_left,hsl(var(--primary)/0.18),transparent_34%),linear-gradient(135deg,hsl(var(--card)),hsl(var(--muted)/0.72))]" />
+          <div className="relative flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+            <button className="group flex min-w-0 items-center gap-4 rounded-lg text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" type="button" onClick={() => navigateTo("executive")} aria-label="Go to home">
+              <span className="flex h-14 w-14 shrink-0 items-center justify-center rounded-2xl border border-primary/25 bg-primary/10 shadow-inner transition group-hover:scale-[1.02]">
+                <img src="/salam-favicon.png" alt="" className="h-10 w-10 object-contain" />
+              </span>
+              <span className="min-w-0">
+                <span className="flex flex-wrap items-center gap-2">
+                  <span className="text-3xl font-black leading-none tracking-tight text-primary">salam</span>
+                  <span className="rounded-full border border-primary/25 bg-primary/10 px-2 py-0.5 text-xs font-bold uppercase tracking-wide text-foreground">LIR</span>
+                </span>
+                <span className="mt-1 block truncate text-xl font-semibold tracking-normal md:text-2xl">Salam Local Internet Registry</span>
+              </span>
             </button>
-            <div className="min-w-0">
-              <p className="text-xs font-semibold uppercase text-muted-foreground">Salam LIR</p>
-              <h1 className="truncate text-2xl font-semibold tracking-normal">Salam Local Internet Registry</h1>
+            <div className="flex shrink-0 flex-wrap items-center justify-start gap-2 rounded-lg border bg-background/70 p-2 shadow-sm backdrop-blur md:justify-end">
+              <Badge variant={registryUnavailable ? "danger" : "success"}>
+                <Database className="mr-1 h-3 w-3" />
+                SQLite {registryUnavailable ? "unavailable" : "online"}
+              </Badge>
+              <Badge variant="default">{signedInUser}</Badge>
+              <ThemeSelector theme={theme} onTheme={onTheme} />
+              <Button variant="outline" size="sm" onClick={onLogout}>
+                <LogOut className="h-4 w-4" />
+                Logout
+              </Button>
             </div>
-          </div>
-          <div className="flex shrink-0 flex-wrap items-center justify-start gap-2 md:justify-end">
-            <Badge variant={registryUnavailable ? "danger" : "success"}>
-              <Database className="mr-1 h-3 w-3" />
-              SQLite {registryUnavailable ? "unavailable" : "online"}
-            </Badge>
-            <Badge variant="default">{signedInUser}</Badge>
-            <ThemeSelector theme={theme} onTheme={onTheme} />
-            <Button variant="outline" size="sm" onClick={onLogout}>
-              <LogOut className="h-4 w-4" />
-              Logout
-            </Button>
           </div>
         </header>
 
@@ -2047,28 +2053,39 @@ function ExecutiveDashboard({
 }) {
   const [metricOwnerMenuOpen, setMetricOwnerMenuOpen] = useState(false);
   const [metricOwnerSelection, setMetricOwnerSelection] = useState<Record<string, boolean>>({});
+  const registeredMetricPools = useMemo(() => resources.filter(isRegisteredSubnet), [resources]);
   const metricOwnerOptions = useMemo(
-    () => uniqueSorted(resources.map((resource) => String(resource.owner || "Unknown").trim() || "Unknown")),
-    [resources]
+    () => uniqueSorted(registeredMetricPools.map((resource) => String(resource.owner || "Unknown").trim() || "Unknown")),
+    [registeredMetricPools]
   );
   const selectedMetricOwners = metricOwnerOptions.filter((owner) => metricOwnerSelection[owner] !== false);
   const allMetricOwnersSelected = metricOwnerOptions.length === 0 || selectedMetricOwners.length === metricOwnerOptions.length;
   const selectedMetricOwnerSet = new Set(selectedMetricOwners);
-  const metricResources = allMetricOwnersSelected ? resources : resources.filter((resource) => selectedMetricOwnerSet.has(String(resource.owner || "Unknown").trim() || "Unknown"));
-  const fallbackPools = metricResources.filter(isRegisteredSubnet);
-  const fallbackAssignments = metricResources.filter((resource) => resource.administrativeStatus === "ASSIGNED");
-  const fallbackAssignedIps = fallbackAssignments.reduce((sum, resource) => sum + resource.totalIps, 0);
-  const fallbackTotalIps = fallbackPools.reduce((sum, resource) => sum + resource.totalIps, 0);
-  const fallbackTotalPools = fallbackPools.length;
-  const salamOwnerSelected = selectedMetricOwners.length === 1 && selectedMetricOwners[0].trim().toLowerCase() === "salam";
-  const assignedIps = allMetricOwnersSelected ? summary?.assigned_ips ?? fallbackAssignedIps : salamOwnerSelected ? summary?.salam_assigned_ips ?? fallbackAssignedIps : fallbackAssignedIps;
-  const assignmentRecords = allMetricOwnersSelected ? summary?.assignment_records ?? assignmentTotal : salamOwnerSelected ? summary?.salam_assignment_records ?? fallbackAssignments.length : fallbackAssignments.length;
-  const totalPools = allMetricOwnersSelected ? summary?.total_pools ?? stats.totalPools : salamOwnerSelected ? summary?.salam_total_pools ?? fallbackTotalPools : fallbackTotalPools;
-  const totalIps = allMetricOwnersSelected ? summary?.total_ips ?? stats.totalResources : salamOwnerSelected ? summary?.salam_total_ips ?? fallbackTotalIps : fallbackTotalIps;
-  const availableIps = Math.max(totalIps - assignedIps, 0);
+  const metricPools = allMetricOwnersSelected ? registeredMetricPools : registeredMetricPools.filter((resource) => selectedMetricOwnerSet.has(String(resource.owner || "Unknown").trim() || "Unknown"));
+  const metricPoolIds = new Set(metricPools.map((resource) => resource.id));
+  const resourceBelongsToMetricScope = (resource: ManagedResource) => {
+    if (allMetricOwnersSelected) {
+      return true;
+    }
+    if (metricPoolIds.has(resource.id) || metricPoolIds.has(resource.parentId)) {
+      return true;
+    }
+    return metricPools.some((pool) => pool.startNumber <= resource.startNumber && pool.endNumber >= resource.endNumber);
+  };
+  const metricResources = resources.filter(resourceBelongsToMetricScope);
+  const fallbackAssignments = resources.filter((resource) => resource.administrativeStatus === "ASSIGNED" && resourceBelongsToMetricScope(resource));
+  const poolAssignedIps = metricPools.reduce((sum, resource) => sum + resource.usedIps, 0);
+  const poolAvailableIps = metricPools.reduce((sum, resource) => sum + resource.freeIps, 0);
+  const poolTotalIps = metricPools.reduce((sum, resource) => sum + resource.totalIps, 0);
+  const hasRegistryMetricData = registeredMetricPools.length > 0;
+  const assignedIps = hasRegistryMetricData || !allMetricOwnersSelected ? poolAssignedIps : summary?.assigned_ips ?? poolAssignedIps;
+  const assignmentRecords = hasRegistryMetricData || !allMetricOwnersSelected ? fallbackAssignments.length : summary?.assignment_records ?? assignmentTotal;
+  const totalPools = hasRegistryMetricData || !allMetricOwnersSelected ? metricPools.length : summary?.total_pools ?? stats.totalPools;
+  const totalIps = hasRegistryMetricData || !allMetricOwnersSelected ? poolTotalIps : summary?.total_ips ?? stats.totalResources;
+  const availableIps = hasRegistryMetricData || !allMetricOwnersSelected ? poolAvailableIps : Math.max(totalIps - assignedIps, 0);
   const utilization = totalIps ? round1((assignedIps / totalIps) * 100) : 0;
-  const ripePending = allMetricOwnersSelected ? summary?.ripe_pending ?? resources.filter((resource) => ["PENDING", "FAILED", "DECOMMISSION_PENDING"].includes(resource.ripeSyncStatus)).length : salamOwnerSelected ? summary?.salam_ripe_pending ?? metricResources.filter((resource) => ["PENDING", "FAILED", "DECOMMISSION_PENDING"].includes(resource.ripeSyncStatus)).length : metricResources.filter((resource) => ["PENDING", "FAILED", "DECOMMISSION_PENDING"].includes(resource.ripeSyncStatus)).length;
-  const cstPending = allMetricOwnersSelected ? summary?.cst_pending ?? cstSummary?.pending_jobs ?? resources.filter((resource) => resource.cstSyncStatus === "PENDING").length : salamOwnerSelected ? summary?.salam_cst_pending ?? metricResources.filter((resource) => resource.cstSyncStatus === "PENDING").length : metricResources.filter((resource) => resource.cstSyncStatus === "PENDING").length;
+  const ripePending = metricResources.filter((resource) => ["PENDING", "FAILED", "DECOMMISSION_PENDING"].includes(resource.ripeSyncStatus)).length;
+  const cstPending = metricResources.filter((resource) => resource.cstSyncStatus === "PENDING").length || (!hasRegistryMetricData && allMetricOwnersSelected ? cstSummary?.pending_jobs ?? 0 : 0);
   const criticalConflicts = stats.integrityIssues;
   const metricScopeLabel = allMetricOwnersSelected ? "All owners" : selectedMetricOwners.length ? selectedMetricOwners.join(", ") : "No owners selected";
   const setOwnerSelected = (owner: string, selected: boolean) => setMetricOwnerSelection((current) => ({ ...current, [owner]: selected }));
@@ -8534,6 +8551,8 @@ function errorMessage(error: unknown) {
   }
   return error instanceof Error ? error.message : "Unknown error";
 }
+
+
 
 
 
