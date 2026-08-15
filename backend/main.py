@@ -3321,15 +3321,21 @@ def active_public_assignment_networks(connection: sqlite3.Connection, root_netwo
 
 
 def active_public_assignment_networks_all(connection: sqlite3.Connection) -> list[IPv4Network]:
-    rows = connection.execute("SELECT * FROM assignments").fetchall()
+    rows = connection.execute(
+        """
+        SELECT a.*
+        FROM assignments a
+        INNER JOIN ip_resources r ON r.source_entity_type = 'assignment' AND r.source_entity_id = a.id
+        WHERE r.ip_type = 'PUBLIC'
+          AND r.status != 'RETIRED'
+        """
+    ).fetchall()
     networks: list[IPv4Network] = []
     for row in rows:
         assignment = assignment_from_row(row)
         if not assignment_active_for_conflict(assignment):
             continue
-        network = network_of(assignment)
-        if not network.is_private:
-            networks.append(network)
+        networks.append(network_of(assignment))
     return networks
 
 
@@ -4721,6 +4727,7 @@ def init_db() -> None:
               status TEXT NOT NULL,
               assignment_date TEXT NOT NULL,
               notes TEXT NOT NULL,
+              reserved_until TEXT NOT NULL DEFAULT '',
               created_at TEXT NOT NULL
             );
 
