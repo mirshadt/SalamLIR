@@ -3970,6 +3970,7 @@ function ConflictSide({ label, side, onOpen }: { label: string; side: ConflictSi
       {side.resource ? (
         <div className="mt-2 grid gap-1 text-xs text-muted-foreground">
           <span>UUID: {side.resource.uuid}</span>
+          <span>Assignment ID: {side.resource.id}</span>
           <span>Status: {side.resource.administrativeStatus}</span>
           <span>Organization: {conflictResourceOrganization(side.resource)}</span>
           <span>Range: {side.resource.startIp} - {side.resource.endIp}</span>
@@ -3990,20 +3991,26 @@ function conflictKey(conflict: Conflict, index: number) {
 
 function conflictSides(conflict: Conflict, resources: ManagedResource[]) {
   const [left, right] = conflict.ranges;
+  const [leftAssignmentId, rightAssignmentId] = conflict.assignment_ids ?? [];
+  const [leftResourceUuid, rightResourceUuid] = conflict.resource_uuids ?? [];
   return {
-    left: left ? conflictSideInfo(left, resources) : null,
-    right: right ? conflictSideInfo(right, resources) : null
+    left: left ? conflictSideInfo(left, resources, leftAssignmentId, leftResourceUuid) : null,
+    right: right ? conflictSideInfo(right, resources, rightAssignmentId, rightResourceUuid) : null
   };
 }
 
-function conflictSideInfo(cidr: string, resources: ManagedResource[]): ConflictSideInfo {
+function conflictSideInfo(cidr: string, resources: ManagedResource[], assignmentId?: string, resourceUuid?: string): ConflictSideInfo {
   const range = safeRange(cidr);
-  const resource = resources.find((item) => item.cidr === cidr) ??
+  const normalizedAssignmentId = String(assignmentId || "").trim();
+  const normalizedResourceUuid = String(resourceUuid || "").trim();
+  const resource = (normalizedAssignmentId ? resources.find((item) => item.id === normalizedAssignmentId) : undefined) ??
+    (normalizedResourceUuid ? resources.find((item) => item.uuid === normalizedResourceUuid) : undefined) ??
+    resources.find((item) => item.cidr === cidr && item.administrativeStatus === "ASSIGNED") ??
+    resources.find((item) => item.cidr === cidr) ??
     (range ? resources.find((item) => item.startNumber === range.start && item.endNumber === range.end) : undefined) ??
     null;
   return { cidr, resource };
 }
-
 function BulkOperations(props: {
   poolCsv: string;
   assignmentCsv: string;
@@ -8551,6 +8558,8 @@ function errorMessage(error: unknown) {
   }
   return error instanceof Error ? error.message : "Unknown error";
 }
+
+
 
 
 
