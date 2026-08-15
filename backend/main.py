@@ -3210,44 +3210,54 @@ def top_level_public_pool_resources(connection: sqlite3.Connection) -> list[Reso
 
 
 def active_public_assignment_networks(connection: sqlite3.Connection, root_network: IPv4Network) -> list[IPv4Network]:
-    rows = connection.execute(
-        """
-        SELECT a.*
-        FROM assignments a
-        INNER JOIN ip_resources r ON r.source_entity_type = 'assignment' AND r.source_entity_id = a.id
-        WHERE r.ip_type = 'PUBLIC'
-          AND r.status != 'RETIRED'
-        """
-    ).fetchall()
+    return [network for network in active_public_assignment_networks_all(connection) if network.subnet_of(root_network)]
+
+
+def active_public_assignment_networks_all(connection: sqlite3.Connection) -> list[IPv4Network]:
+    rows = connection.execute("SELECT * FROM assignments").fetchall()
     networks: list[IPv4Network] = []
     for row in rows:
         assignment = assignment_from_row(row)
         if not assignment_active_for_conflict(assignment):
             continue
         network = network_of(assignment)
-        if network.subnet_of(root_network):
+        if not network.is_private:
             networks.append(network)
     return networks
 
 
 def materialize_bulk_unassigned_fragments(connection: sqlite3.Connection) -> tuple[int, int]:
     roots = top_level_public_pool_resources(connection)
+    active_assignment_networks = active_public_assignment_networks_all(connection)
+    existing_by_cidr: dict[str, list[ResourceRecord]] = {}
+    for row in connection.execute("SELECT * FROM ip_resources").fetchall():
+        resource = resource_from_row(row)
+        existing_by_cidr.setdefault(resource.cidr, []).append(resource)
+
+    def existing_resource_for_cidr(cidr: str) -> ResourceRecord | None:
+        candidates = existing_by_cidr.get(cidr, [])
+        return next((resource for resource in candidates if resource.source_entity_type == BULK_UNASSIGNED_FRAGMENT_SOURCE), candidates[0] if candidates else None)
+
     desired: dict[str, ResourceRecord] = {}
+    existing_fragment_uuids: set[str] = set()
     for root in roots:
         root_network = normalize_network(root.cidr)
-        assigned_networks = active_public_assignment_networks(connection, root_network)
+        assigned_networks = [network for network in active_assignment_networks if network.subnet_of(root_network)]
         if not assigned_networks:
             continue
         for fragment in subtract_allocated_networks(root_network, assigned_networks):
             if fragment == root_network:
                 continue
             resource_uuid = stable_uuid(BULK_UNASSIGNED_FRAGMENT_SOURCE, root.resource_uuid, str(fragment))
-            existing = find_resource_by_cidr(connection, str(fragment))
+            existing = existing_resource_for_cidr(str(fragment))
             if existing and existing.source_entity_type != BULK_UNASSIGNED_FRAGMENT_SOURCE:
                 continue
             existing_fragment = existing if existing and existing.source_entity_type == BULK_UNASSIGNED_FRAGMENT_SOURCE else None
             if existing_fragment:
                 resource_uuid = existing_fragment.resource_uuid
+                existing_fragment_uuids.add(resource_uuid)
+                desired[resource_uuid] = existing_fragment
+                continue
             fragment_resource = cst_resource_from_network(
                 fragment,
                 resource_uuid,
@@ -3267,17 +3277,6 @@ def materialize_bulk_unassigned_fragments(connection: sqlite3.Connection) -> tup
                 "cst_sync_ready": True,
                 "cst_validation_status": "READY",
             })
-            if existing_fragment:
-                fragment_resource = fragment_resource.model_copy(update={
-                    "version_uuid": existing_fragment.version_uuid,
-                    "transaction_id": existing_fragment.transaction_id,
-                    "action_flag": existing_fragment.action_flag,
-                    "cst_sync_status": existing_fragment.cst_sync_status,
-                    "cst_validation_status": existing_fragment.cst_validation_status,
-                    "cst_validation_errors": existing_fragment.cst_validation_errors,
-                    "cst_validation_warnings": existing_fragment.cst_validation_warnings,
-                    "created_at": existing_fragment.created_at,
-                })
             desired[resource_uuid] = fragment_resource
 
     stale_rows = connection.execute(
@@ -3295,6 +3294,8 @@ def materialize_bulk_unassigned_fragments(connection: sqlite3.Connection) -> tup
 
     materialized = 0
     for resource in desired.values():
+        if resource.resource_uuid in existing_fragment_uuids:
+            continue
         upsert_resource_record(connection, resource)
         materialized += 1
 
@@ -9712,6 +9713,7 @@ def init_db_with_retry(max_attempts: int = 6) -> None:
 
 
 init_db_with_retry()
+
 
 
 

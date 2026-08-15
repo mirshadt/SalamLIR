@@ -946,6 +946,13 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   const poolsQuery = useQuery({ queryKey: ["pools"], queryFn: getPools, ...liveQueryOptions });
   const assignmentPageNeeded = view === "assignments";
   const registryCoverageNeeded = view !== "executive" && view !== "assignments" && view !== "administration";
+  const resourceDataNeeded = view !== "administration";
+  const administrationDataNeeded = view === "administration";
+  const cstMonitorDataNeeded = view === "registry";
+  const cstSummaryNeeded = view === "executive" || view === "registry" || view === "administration";
+  const bulkDataNeeded = view === "bulk";
+  const reportDataNeeded = view === "reports";
+  const conflictDataNeeded = view === "executive" || view === "integrity";
   const assignmentsQuery = useQuery({
     queryKey: ["assignments", assignmentPage, assignmentPageSize, assignmentSearch],
     queryFn: () => getAssignmentsPage({ page: assignmentPage, page_size: assignmentPageSize, search: assignmentSearch }),
@@ -953,29 +960,31 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
     ...liveQueryOptions
   });
   const registryAssignmentsQuery = useQuery({ queryKey: ["assignments", "registry-coverage"], queryFn: getRegistryCoverageAssignments, enabled: registryCoverageNeeded, ...liveQueryOptions });
-  const persistedResourcesQuery = useQuery({ queryKey: ["resources"], queryFn: getResources, ...liveQueryOptions });
+  const persistedResourcesQuery = useQuery({ queryKey: ["resources"], queryFn: getResources, enabled: resourceDataNeeded, ...liveQueryOptions });
   const dashboardSummaryQuery = useQuery({ queryKey: ["dashboard-summary"], queryFn: getDashboardSummary, ...liveQueryOptions });
-  const conflictsQuery = useQuery({ queryKey: ["conflicts"], queryFn: getConflicts, ...liveQueryOptions });
-  const auditQuery = useQuery({ queryKey: ["audit"], queryFn: getAuditEvents, ...liveQueryOptions });
-  const usersQuery = useQuery({ queryKey: ["users"], queryFn: getUsers, ...liveQueryOptions });
-  const ripeConfigQuery = useQuery({ queryKey: ["ripe-config"], queryFn: getRipeConfig, ...liveQueryOptions });
-  const siebelConfigQuery = useQuery({ queryKey: ["siebel-config"], queryFn: getSiebelConfig, ...liveQueryOptions });
-  const ripeAllocatedPoolsQuery = useQuery({ queryKey: ["ripe-allocated-pools"], queryFn: getRipeAllocatedPools, ...liveQueryOptions });
+  const conflictsQuery = useQuery({ queryKey: ["conflicts"], queryFn: getConflicts, enabled: conflictDataNeeded, ...liveQueryOptions });
+  const auditQuery = useQuery({ queryKey: ["audit"], queryFn: getAuditEvents, enabled: reportDataNeeded, ...liveQueryOptions });
+  const usersQuery = useQuery({ queryKey: ["users"], queryFn: getUsers, enabled: administrationDataNeeded, ...liveQueryOptions });
+  const ripeConfigQuery = useQuery({ queryKey: ["ripe-config"], queryFn: getRipeConfig, enabled: administrationDataNeeded, ...liveQueryOptions });
+  const siebelConfigQuery = useQuery({ queryKey: ["siebel-config"], queryFn: getSiebelConfig, enabled: administrationDataNeeded, ...liveQueryOptions });
+  const ripeAllocatedPoolsQuery = useQuery({ queryKey: ["ripe-allocated-pools"], queryFn: getRipeAllocatedPools, enabled: administrationDataNeeded, ...liveQueryOptions });
   const databaseStatusQuery = useQuery({ queryKey: ["database-status"], queryFn: getDatabaseConnectionStatus, ...liveQueryOptions });
-  const cstConfigQuery = useQuery({ queryKey: ["cst-config"], queryFn: getCstConfig, ...liveQueryOptions });
-  const cstSummaryQuery = useQuery({ queryKey: ["cst-summary"], queryFn: getCstSummary, ...liveQueryOptions });
-  const cstBatchesQuery = useQuery({ queryKey: ["cst-batches"], queryFn: () => getCstBatches({ limit: 1000 }), ...liveQueryOptions });
-  const cstSchedulerRunsQuery = useQuery({ queryKey: ["cst-scheduler-runs"], queryFn: getCstSchedulerRuns, ...liveQueryOptions });
+  const cstConfigQuery = useQuery({ queryKey: ["cst-config"], queryFn: getCstConfig, enabled: administrationDataNeeded, ...liveQueryOptions });
+  const cstSummaryQuery = useQuery({ queryKey: ["cst-summary"], queryFn: getCstSummary, enabled: cstSummaryNeeded, ...liveQueryOptions });
+  const cstBatchesQuery = useQuery({ queryKey: ["cst-batches"], queryFn: () => getCstBatches({ limit: 1000 }), enabled: cstMonitorDataNeeded, ...liveQueryOptions });
+  const cstSchedulerRunsQuery = useQuery({ queryKey: ["cst-scheduler-runs"], queryFn: getCstSchedulerRuns, enabled: cstMonitorDataNeeded, ...liveQueryOptions });
   const cstJobsQuery = useQuery({
     queryKey: ["cst-jobs"],
     queryFn: getCstJobs,
+    enabled: cstMonitorDataNeeded,
     refetchInterval: (query) => query.state.data?.some((job) => ["PENDING", "RUNNING"].includes(job.status)) ? 3000 : false,
     ...liveQueryOptions
   });
-  const cstTransactionsQuery = useQuery({ queryKey: ["cst-transactions"], queryFn: getCstTransactions, ...liveQueryOptions });
+  const cstTransactionsQuery = useQuery({ queryKey: ["cst-transactions"], queryFn: getCstTransactions, enabled: cstMonitorDataNeeded, ...liveQueryOptions });
   const bulkBatchesQuery = useQuery({
     queryKey: ["bulk-batches"],
     queryFn: getBulkBatches,
+    enabled: bulkDataNeeded,
     refetchInterval: (query) => query.state.data?.some((batch) => batch.status === "RUNNING") ? 3000 : false,
     ...liveQueryOptions
   });
@@ -8560,6 +8569,9 @@ function errorMessage(error: unknown) {
   }
   return error instanceof Error ? error.message : "Unknown error";
 }
+
+
+
 
 
 
