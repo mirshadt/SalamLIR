@@ -7035,8 +7035,9 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[], persis
           if (block.cidr === pool.cidr) {
             continue;
           }
-          const freeUuid = resourceUuid("free", pool.id, block.cidr);
-          const persistedFreeResource = persistedFor(freeUuid, "bulk_unassigned_fragment", `${poolResourceUuid}:${block.cidr}`, block.cidr);
+          const freeSourceId = `${poolResourceUuid}:${block.cidr}`;
+          const freeUuid = stableUuid(`bulk_unassigned_fragment:${freeSourceId}`);
+          const persistedFreeResource = persistedFor(freeUuid, "bulk_unassigned_fragment", freeSourceId, block.cidr);
           const blockClassification = classifyCidr(block.cidr);
           const blockIsPublic = blockClassification === "PUBLIC";
           resources.push({
@@ -8558,6 +8559,8 @@ function errorMessage(error: unknown) {
   }
   return error instanceof Error ? error.message : "Unknown error";
 }
+
+
 
 
 
