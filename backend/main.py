@@ -726,6 +726,43 @@ class ResourceRecord(BaseModel):
     updated_at: str
 
 
+class IpResourceHistory(BaseModel):
+    id: str
+    archived_resource_uuid: str
+    version_uuid: str = ""
+    parent_resource_uuid: str = ""
+    parent_version_uuid: str = ""
+    transaction_id: str = ""
+    cidr: str = ""
+    prefix: int = 0
+    start_ip: str = ""
+    end_ip: str = ""
+    size: int = 0
+    ownership_type: str = ""
+    status: str = ""
+    cidr_role: str = ""
+    service_provider_id: str = DEFAULT_SERVICE_PROVIDER_ID
+    service_provider_name: str = DEFAULT_SERVICE_PROVIDER_NAME
+    asn: str = DEFAULT_ASN
+    assignment_status_id: int = 1
+    service_id: str = ""
+    customer_name: str = ""
+    organization_name: str = ""
+    organization_id: str = ""
+    owner: str = ""
+    maintainer: str = ""
+    action_flag: str = ""
+    cst_sync_status: str = ""
+    ripe_sync_status: str = ""
+    ip_type: str = ""
+    root_pool_uuid: str = ""
+    source_entity_type: str = ""
+    source_entity_id: str = ""
+    archived_reason: str
+    replaced_by_resource_uuid: str = ""
+    resource_json: str = ""
+    archived_at: str
+
 class AssignmentDetailRecord(BaseModel):
     id: str
     resource_uuid: str
@@ -1534,8 +1571,7 @@ def resource_record_for_pool(pool: Pool, existing: ResourceRecord | None = None)
     ip_type = "PRIVATE" if network.is_private else "PUBLIC"
     updated_at = now_iso()
     resource_uuid = existing.resource_uuid if existing else pool_resource_uuid(pool)
-    preferred_transaction_id = str((existing.transaction_id if existing else "") or pool.id or resource_uuid).strip()
-    transaction_id = preferred_transaction_id if is_uuid_text(preferred_transaction_id) else resource_uuid
+    transaction_id = resource_uuid
     default_cst_sync_status = "PENDING" if ip_type == "PUBLIC" and status != "RETIRED" else "NOT_REQUIRED"
     default_ripe_sync_status = "PENDING" if network.is_global else "NOT_REQUIRED"
     cst_sync_status = existing.cst_sync_status if existing and ip_type == "PUBLIC" else default_cst_sync_status
@@ -1723,6 +1759,55 @@ def upsert_resource_record(connection: sqlite3.Connection, resource: ResourceRec
     )
 
 
+def archive_ip_resource(connection: sqlite3.Connection, resource_uuid: object, archived_reason: str, replaced_by_resource_uuid: str = "") -> None:
+    row = connection.execute("SELECT * FROM ip_resources WHERE resource_uuid = ?", (str(resource_uuid or ""),)).fetchone()
+    if row is None:
+        return
+    resource_data = {key: row[key] for key in row.keys()}
+    history = IpResourceHistory(
+        id=f"ip-resource-history-{uuid4().hex[:12]}",
+        archived_resource_uuid=str(resource_data.get("resource_uuid") or ""),
+        version_uuid=str(resource_data.get("version_uuid") or ""),
+        parent_resource_uuid=str(resource_data.get("parent_resource_uuid") or ""),
+        parent_version_uuid=str(resource_data.get("parent_version_uuid") or ""),
+        transaction_id=str(resource_data.get("transaction_id") or ""),
+        cidr=str(resource_data.get("cidr") or ""),
+        prefix=int(resource_data.get("prefix") or 0),
+        start_ip=str(resource_data.get("start_ip") or ""),
+        end_ip=str(resource_data.get("end_ip") or ""),
+        size=int(resource_data.get("size") or 0),
+        ownership_type=str(resource_data.get("ownership_type") or ""),
+        status=str(resource_data.get("status") or ""),
+        cidr_role=str(resource_data.get("cidr_role") or ""),
+        service_provider_id=str(resource_data.get("service_provider_id") or DEFAULT_SERVICE_PROVIDER_ID),
+        service_provider_name=str(resource_data.get("service_provider_name") or DEFAULT_SERVICE_PROVIDER_NAME),
+        asn=str(resource_data.get("asn") or DEFAULT_ASN),
+        assignment_status_id=int(resource_data.get("assignment_status_id") or 1),
+        service_id=str(resource_data.get("service_id") or ""),
+        customer_name=str(resource_data.get("customer_name") or ""),
+        organization_name=str(resource_data.get("organization_name") or ""),
+        organization_id=str(resource_data.get("organization_id") or ""),
+        owner=str(resource_data.get("owner") or ""),
+        maintainer=str(resource_data.get("maintainer") or ""),
+        action_flag=str(resource_data.get("action_flag") or ""),
+        cst_sync_status=str(resource_data.get("cst_sync_status") or ""),
+        ripe_sync_status=str(resource_data.get("ripe_sync_status") or ""),
+        ip_type=str(resource_data.get("ip_type") or ""),
+        root_pool_uuid=str(resource_data.get("root_pool_uuid") or ""),
+        source_entity_type=str(resource_data.get("source_entity_type") or ""),
+        source_entity_id=str(resource_data.get("source_entity_id") or ""),
+        archived_reason=archived_reason,
+        replaced_by_resource_uuid=str(replaced_by_resource_uuid or ""),
+        resource_json=json.dumps(resource_data, sort_keys=True, default=str),
+        archived_at=now_iso(),
+    )
+    data = history.model_dump()
+    columns = list(data.keys())
+    connection.execute(
+        f"INSERT INTO ip_resource_history ({', '.join(columns)}) VALUES ({', '.join(f':{column}' for column in columns)})",
+        data,
+    )
+
 def upsert_assignment_detail(connection: sqlite3.Connection, detail: AssignmentDetailRecord) -> None:
     data = detail.model_dump()
     columns = list(data.keys())
@@ -1779,6 +1864,28 @@ def sync_normalized_inventory(connection: sqlite3.Connection) -> None:
         sync_pool_resource(connection, pool_from_row(row))
     for row in connection.execute("SELECT * FROM assignments").fetchall():
         sync_assignment_resource(connection, assignment_from_row(row))
+
+
+def sync_allocated_pool_resources(connection: sqlite3.Connection) -> int:
+    updated = 0
+    for row in connection.execute("SELECT * FROM pools").fetchall():
+        pool = pool_from_row(row)
+        before = find_resource_by_source(connection, "pool", pool.id) or find_resource_by_cidr(connection, pool.cidr)
+        before_transaction_id = before.transaction_id if before else ""
+        resource = sync_pool_resource(connection, pool)
+        if not before or before_transaction_id != resource.transaction_id:
+            updated += 1
+    cursor = connection.execute(
+        """
+        UPDATE ip_resources
+        SET transaction_id = resource_uuid,
+            updated_at = ?
+        WHERE source_entity_type = 'pool'
+          AND COALESCE(transaction_id, '') != resource_uuid
+        """,
+        (now_iso(),),
+    )
+    return updated + int(cursor.rowcount or 0)
 
 def refresh_ip_resource_pool_owners(connection: sqlite3.Connection) -> int:
     pools = [pool_from_row(row) for row in connection.execute("SELECT * FROM pools").fetchall()]
@@ -3285,8 +3392,7 @@ def materialize_bulk_unassigned_fragments(connection: sqlite3.Connection) -> tup
     ).fetchall()
     deleted = 0
     for row in stale_rows:
-        status = str(row["cst_sync_status"] or "").upper()
-        if str(row["resource_uuid"]) in desired or status in {"SUCCESS", "SYNCHRONIZED"}:
+        if str(row["resource_uuid"]) in desired:
             continue
         connection.execute("DELETE FROM assignment_details WHERE resource_uuid = ?", (row["resource_uuid"],))
         connection.execute("DELETE FROM ip_resources WHERE resource_uuid = ?", (row["resource_uuid"],))
@@ -4654,6 +4760,49 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_ip_resources_source ON ip_resources (source_entity_type, source_entity_id);
             CREATE INDEX IF NOT EXISTS idx_ip_resources_owner ON ip_resources (owner);
             CREATE INDEX IF NOT EXISTS idx_ip_resources_maintainer ON ip_resources (maintainer);
+            CREATE TABLE IF NOT EXISTS ip_resource_history (
+              id TEXT PRIMARY KEY,
+              archived_resource_uuid TEXT NOT NULL,
+              version_uuid TEXT NOT NULL,
+              parent_resource_uuid TEXT NOT NULL,
+              parent_version_uuid TEXT NOT NULL,
+              transaction_id TEXT NOT NULL,
+              cidr TEXT NOT NULL,
+              prefix INTEGER NOT NULL,
+              start_ip TEXT NOT NULL,
+              end_ip TEXT NOT NULL,
+              size INTEGER NOT NULL,
+              ownership_type TEXT NOT NULL,
+              status TEXT NOT NULL,
+              cidr_role TEXT NOT NULL,
+              service_provider_id TEXT NOT NULL,
+              service_provider_name TEXT NOT NULL,
+              asn TEXT NOT NULL,
+              assignment_status_id INTEGER NOT NULL,
+              service_id TEXT NOT NULL,
+              customer_name TEXT NOT NULL,
+              organization_name TEXT NOT NULL,
+              organization_id TEXT NOT NULL,
+              owner TEXT NOT NULL,
+              maintainer TEXT NOT NULL,
+              action_flag TEXT NOT NULL,
+              cst_sync_status TEXT NOT NULL,
+              ripe_sync_status TEXT NOT NULL,
+              ip_type TEXT NOT NULL,
+              root_pool_uuid TEXT NOT NULL,
+              source_entity_type TEXT NOT NULL,
+              source_entity_id TEXT NOT NULL,
+              archived_reason TEXT NOT NULL,
+              replaced_by_resource_uuid TEXT NOT NULL,
+              resource_json TEXT NOT NULL,
+              archived_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_ip_resource_history_cidr ON ip_resource_history (cidr);
+            CREATE INDEX IF NOT EXISTS idx_ip_resource_history_transaction ON ip_resource_history (transaction_id);
+            CREATE INDEX IF NOT EXISTS idx_ip_resource_history_resource ON ip_resource_history (archived_resource_uuid);
+            CREATE INDEX IF NOT EXISTS idx_ip_resource_history_reason ON ip_resource_history (archived_reason);
+            CREATE INDEX IF NOT EXISTS idx_ip_resource_history_archived_at ON ip_resource_history (archived_at);
 
             CREATE TABLE IF NOT EXISTS assignment_details (
               id TEXT PRIMARY KEY,
@@ -4941,6 +5090,7 @@ def init_db() -> None:
         connection.execute("UPDATE assignments SET customer_type = 'RESI' WHERE UPPER(TRIM(customer_type)) IN ('INDIVIDUAL', 'RESIDENTIAL', 'CONSUMER', 'HOME', 'PERSONAL')")
         connection.execute("UPDATE assignments SET customer_type = 'NA' WHERE COALESCE(assignment_target_type, '') != 'business_customer' AND COALESCE(assignment_status_id, 0) != 3")
         add_missing_columns(connection, "ip_resources", ResourceRecord)
+        add_missing_columns(connection, "ip_resource_history", IpResourceHistory)
         add_missing_columns(connection, "assignment_details", AssignmentDetailRecord)
         bss_audit_columns = {row["name"] for row in connection.execute("PRAGMA table_info(bss_sync_audit)").fetchall()}
         if "service_id" not in bss_audit_columns:
@@ -5018,6 +5168,7 @@ def init_db() -> None:
 
         if normalized_inventory_needs_sync(connection):
             sync_normalized_inventory(connection)
+        sync_allocated_pool_resources(connection)
         refresh_ip_resource_pool_owners(connection)
 
 
@@ -7202,6 +7353,7 @@ def cst_migration_review_items(connection: sqlite3.Connection, request: CstMigra
     return items
 
 def cst_migration_resource_rows(connection: sqlite3.Connection, payload: CstManualMigrationRequest) -> tuple[list[ResourceRecord], int]:
+    sync_allocated_pool_resources(connection)
     materialize_bulk_unassigned_fragments(connection)
     repair_public_unassigned_cst_status(connection)
     resource_scope = normalize_cst_resource_scope(payload.resource_scope)
@@ -8219,7 +8371,7 @@ def join_pools(payload: JoinRequest) -> Pool:
     )
     with connect() as connection:
         connection.execute("DELETE FROM pools WHERE id IN (?, ?)", (left.id, right.id))
-        connection.execute("DELETE FROM ip_resources WHERE source_entity_type = 'pool' AND source_entity_id IN (?, ?)", (left.id, right.id))
+        for row in connection.execute("SELECT resource_uuid FROM ip_resources WHERE source_entity_type = 'pool' AND source_entity_id IN (?, ?)", (left.id, right.id)).fetchall():`r`n            archive_ip_resource(connection, row["resource_uuid"], "POOL_MERGED", joined.id)`r`n        connection.execute("DELETE FROM ip_resources WHERE source_entity_type = 'pool' AND source_entity_id IN (?, ?)", (left.id, right.id))
         insert_pool(connection, joined)
         sync_pool_resource(connection, joined)
         record_audit(connection, "Pool Modification", "pool", joined.id, f"{left.cidr}; {right.cidr}", joined.model_dump_json())
@@ -9129,6 +9281,7 @@ def add_assignment(payload: AssignmentCreate) -> Assignment:
         if resource_requires_cst(resource):
             jobs = create_cst_assignment_create_jobs(connection, assignment, resource, "ASSIGNMENT_CREATE")
             assert_cst_business_flow_succeeded(jobs, "Assignment")
+        materialize_bulk_unassigned_fragments(connection)
         record_audit(connection, "Subnet Allocation", "assignment", assignment.id, "", assignment.model_dump_json())
     return assignment
 
@@ -9364,6 +9517,7 @@ def update_assignment_status(assignment_id: str, payload: StatusUpdate) -> Assig
             jobs = create_cst_sync_jobs(connection, [(resource, "UPDATE")], "ASSIGNMENT_STATUS_CHANGE")
             assert_cst_business_flow_succeeded(jobs, "Assignment status change")
         after = assignment_from_row(connection.execute("SELECT * FROM assignments WHERE id = ?", (assignment_id,)).fetchone())
+        materialize_bulk_unassigned_fragments(connection)
         record_audit(connection, "Assignment Changes", "assignment", assignment_id, before.model_dump_json(), after.model_dump_json())
     return after
 
@@ -9400,6 +9554,7 @@ def unassign(assignment_id: str) -> None:
         if resource:
             connection.execute("DELETE FROM assignment_details WHERE resource_uuid = ?", (resource.resource_uuid,))
             connection.execute("DELETE FROM ip_resources WHERE resource_uuid = ?", (resource.resource_uuid,))
+        materialize_bulk_unassigned_fragments(connection)
         record_audit(connection, audit_action, "assignment", assignment_id, assignment.model_dump_json(), audit_new_value)
 
 

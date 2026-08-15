@@ -6889,10 +6889,107 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[], persis
   );
   const persistedCstStatus = (resource: ResourceRecord | null, fallback: CstSyncStatus) => resource?.cst_sync_status ? normalizeCstSyncStatus(resource.cst_sync_status) : fallback;
   const persistedSuccessfulFreeFragment = (cidr: string) => persistedByCidr.get(cidr)?.find((resource) => resource.source_entity_type === "bulk_unassigned_fragment" && ["SUCCESS", "SYNCHRONIZED"].includes(normalizeCstSyncStatus(resource.cst_sync_status))) ?? null;
+  const persistedFreeFragments = persistedResources.filter((resource) => resource.source_entity_type === "bulk_unassigned_fragment");
+  const persistedFreeFragmentCidrs = new Set(persistedFreeFragments.map((resource) => resource.cidr));
+  const persistedRipeStatus = (value: string | undefined | null, fallback: RipeSyncStatus): RipeSyncStatus => {
+    const normalized = String(value || fallback).trim().toUpperCase();
+    const allowed: RipeSyncStatus[] = ["PENDING", "SUBMITTED", "SYNCHRONIZED", "SUCCESS", "FAILED", "DECOMMISSION_PENDING", "EXCLUDED", "NOT_REQUIRED"];
+    return allowed.includes(normalized as RipeSyncStatus) ? normalized as RipeSyncStatus : fallback;
+  };
+  const resourceRecordStatus = (resource: ResourceRecord): AdministrativeStatus => {
+    if (resource.status === "RESERVED") {
+      return "RESERVED";
+    }
+    if (resource.status === "RETIRED") {
+      return "RETIRED";
+    }
+    if (resource.status === "ASSIGNED_TO_BUSINESS") {
+      return "ASSIGNED";
+    }
+    return "AVAILABLE";
+  };
   const poolById = new Map(pools.map((pool) => [pool.id, pool]));
+  const poolByResourceUuid = new Map(pools.map((pool) => [resourceUuid("pool", pool.id, pool.cidr), pool]));
+  const managedFreeFragmentFromRecord = (record: ResourceRecord): ManagedResource | null => {
+    const range = safeRange(record.cidr);
+    if (!range) {
+      return null;
+    }
+    const parentPool = poolByResourceUuid.get(record.parent_resource_uuid) ?? poolByResourceUuid.get(record.root_pool_uuid) ?? null;
+    const status = resourceRecordStatus(record);
+    const classification = record.ip_type || classifyCidr(record.cidr);
+    const isPublic = classification === "PUBLIC";
+    const maintainer = record.maintainer || resourceMaintainerFromPool(parentPool);
+    const owner = record.owner || ipResourceOwnerFromMaintainer(maintainer);
+    return {
+      id: record.resource_uuid,
+      uuid: record.resource_uuid,
+      parentId: parentPool?.id || record.parent_resource_uuid || record.root_pool_uuid || "",
+      cidr: record.cidr,
+      serviceProviderId: record.service_provider_id || "5",
+      serviceProviderName: record.service_provider_name || "Salam",
+      asn: record.asn || parentPool?.asn || "AS35753",
+      assignmentStatusId: record.assignment_status_id || 1,
+      serviceId: record.service_id || "",
+      organizationName: record.organization_name || record.customer_name || "",
+      organizationId: record.organization_id || "",
+      customerTypeId: record.customer_type_id || "",
+      customerType: "NA",
+      subnetType: "NA",
+      productClass: "",
+      regionId: record.region_id || "",
+      cityId: record.city_id || "",
+      fullName: record.full_name || "",
+      mobileNumber: record.mobile_number || "",
+      idNumber: record.id_number || "",
+      email: record.email || "",
+      startIp: record.start_ip || range.firstUsable,
+      endIp: record.end_ip || range.lastUsable,
+      startNumber: range.start,
+      endNumber: range.end,
+      prefix: record.prefix || range.prefix,
+      totalIps: record.size || range.size,
+      usedIps: status === "ASSIGNED" ? record.size || range.size : 0,
+      reservedIps: status === "RESERVED" ? record.size || range.size : 0,
+      freeIps: status === "AVAILABLE" ? record.size || range.size : 0,
+      utilization: status === "ASSIGNED" ? 100 : 0,
+      type: "Subnet",
+      role: "Subnet",
+      classification,
+      owner,
+      status,
+      administrativeStatus: status,
+      ripeSyncRequired: false,
+      ripeSyncStatus: persistedRipeStatus(record.ripe_sync_status, "EXCLUDED"),
+      cstSyncStatus: isPublic ? persistedCstStatus(record, "PENDING") : "NOT_REQUIRED",
+      actionFlag: record.action_flag || "S",
+      accessTechnologyId: record.access_technology_id || "",
+      accessTechnology: record.access_technology || "",
+      serviceDescription: record.service_description || "",
+      transactionId: record.transaction_id || record.source_entity_id || record.resource_uuid,
+      sourceRegistry: "Local Registry",
+      lastUpdated: record.updated_at || record.created_at,
+      netname: record.description || parentPool?.name || "Unassigned fragment",
+      description: record.description || "Bulk migration remaining unassigned fragment",
+      country: "SA",
+      maintainer,
+      previousUuid: "",
+      sourceUuid: record.parent_resource_uuid || record.root_pool_uuid || "",
+      successorUuid: "",
+      operationType: "UNASSIGNED_FRAGMENT",
+      source: null,
+      allocatedPool: false
+    };
+  };
   const occupyingAssignments = assignments.filter((assignment) => !assignmentReleasedAfterRipeRemoval(assignment));
   const poolParentById = new Map(poolEntries.map(({ pool, range }) => [pool.id, nearestParentPoolIdForPool(pool, range, poolEntries)]));
   const assignmentParentById = new Map(occupyingAssignments.map((assignment) => [assignment.id, nearestParentPoolIdForAssignment(toRange(assignment), poolEntries)]));
+  for (const fragment of persistedFreeFragments) {
+    const resource = managedFreeFragmentFromRecord(fragment);
+    if (resource) {
+      resources.push(resource);
+    }
+  }
   for (const pool of pools) {
     const poolRange = toRange(pool);
     const childAssignments = occupyingAssignments.filter((assignment) => contains(poolRange, toRange(assignment)));
@@ -7043,6 +7140,9 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[], persis
       for (const range of calculateContinuousFreeRanges(pool, occupyingAssignments)) {
         for (const block of rangeToCidrs(range.start, range.end)) {
           if (block.cidr === pool.cidr) {
+            continue;
+          }
+          if (persistedFreeFragmentCidrs.has(block.cidr)) {
             continue;
           }
           const freeSourceId = `${poolResourceUuid}:${block.cidr}`;
