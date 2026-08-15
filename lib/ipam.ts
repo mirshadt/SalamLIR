@@ -104,7 +104,7 @@ function toContinuousRange(start: number, end: number): ContinuousFreeRange {
 export function rangeToCidrs(start: number, end: number): Range[] {
   const ranges: Range[] = [];
   let current = start;
-  while (current <= end && ranges.length < 256) {
+  while (current <= end) {
     let blockSize = largestAlignedBlock(current);
     const remaining = end - current + 1;
     while (blockSize > remaining) {
