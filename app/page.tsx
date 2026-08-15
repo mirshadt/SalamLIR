@@ -1276,10 +1276,10 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
               </span>
               <span className="min-w-0">
                 <span className="flex flex-wrap items-center gap-2">
-                  <span className="text-3xl font-black leading-none tracking-tight text-primary">salam</span>
+                  <span className="text-3xl font-black lowercase leading-none tracking-normal text-primary md:text-4xl" style={{ fontFamily: "Arial Rounded MT Bold, Trebuchet MS, Arial, sans-serif" }}>salam</span>
                   <span className="rounded-full border border-primary/25 bg-primary/10 px-2 py-0.5 text-xs font-bold uppercase tracking-wide text-foreground">LIR</span>
                 </span>
-                <span className="mt-1 block truncate text-xl font-semibold tracking-normal md:text-2xl">Salam Local Internet Registry</span>
+                <span className="mt-1 block truncate text-xl font-semibold tracking-normal md:text-2xl">Local Internet Registry</span>
               </span>
             </button>
             <div className="flex shrink-0 flex-wrap items-center justify-start gap-2 rounded-lg border bg-background/70 p-2 shadow-sm backdrop-blur md:justify-end">
@@ -8558,6 +8558,7 @@ function errorMessage(error: unknown) {
   }
   return error instanceof Error ? error.message : "Unknown error";
 }
+
 
 
 
