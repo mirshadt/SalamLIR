@@ -8371,7 +8371,9 @@ def join_pools(payload: JoinRequest) -> Pool:
     )
     with connect() as connection:
         connection.execute("DELETE FROM pools WHERE id IN (?, ?)", (left.id, right.id))
-        for row in connection.execute("SELECT resource_uuid FROM ip_resources WHERE source_entity_type = 'pool' AND source_entity_id IN (?, ?)", (left.id, right.id)).fetchall():`r`n            archive_ip_resource(connection, row["resource_uuid"], "POOL_MERGED", joined.id)`r`n        connection.execute("DELETE FROM ip_resources WHERE source_entity_type = 'pool' AND source_entity_id IN (?, ?)", (left.id, right.id))
+        for row in connection.execute("SELECT resource_uuid FROM ip_resources WHERE source_entity_type = 'pool' AND source_entity_id IN (?, ?)", (left.id, right.id)).fetchall():
+            archive_ip_resource(connection, row["resource_uuid"], "POOL_MERGED", joined.id)
+        connection.execute("DELETE FROM ip_resources WHERE source_entity_type = 'pool' AND source_entity_id IN (?, ?)", (left.id, right.id))
         insert_pool(connection, joined)
         sync_pool_resource(connection, joined)
         record_audit(connection, "Pool Modification", "pool", joined.id, f"{left.cidr}; {right.cidr}", joined.model_dump_json())
