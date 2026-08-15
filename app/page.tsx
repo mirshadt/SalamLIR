@@ -6879,6 +6879,7 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[], persis
     ?? null
   );
   const persistedCstStatus = (resource: ResourceRecord | null, fallback: CstSyncStatus) => resource?.cst_sync_status ? normalizeCstSyncStatus(resource.cst_sync_status) : fallback;
+  const persistedSuccessfulFreeFragment = (cidr: string) => persistedByCidr.get(cidr)?.find((resource) => resource.source_entity_type === "bulk_unassigned_fragment" && ["SUCCESS", "SYNCHRONIZED"].includes(normalizeCstSyncStatus(resource.cst_sync_status))) ?? null;
   const poolById = new Map(pools.map((pool) => [pool.id, pool]));
   const occupyingAssignments = assignments.filter((assignment) => !assignmentReleasedAfterRipeRemoval(assignment));
   const poolParentById = new Map(poolEntries.map(({ pool, range }) => [pool.id, nearestParentPoolIdForPool(pool, range, poolEntries)]));
@@ -7037,12 +7038,12 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[], persis
           }
           const freeSourceId = `${poolResourceUuid}:${block.cidr}`;
           const freeUuid = stableUuid(`bulk_unassigned_fragment:${freeSourceId}`);
-          const persistedFreeResource = persistedFor(freeUuid, "bulk_unassigned_fragment", freeSourceId, block.cidr);
+          const persistedFreeResource = persistedSuccessfulFreeFragment(block.cidr) ?? persistedFor(freeUuid, "bulk_unassigned_fragment", freeSourceId, block.cidr);
           const blockClassification = classifyCidr(block.cidr);
           const blockIsPublic = blockClassification === "PUBLIC";
           resources.push({
-            id: freeUuid,
-            uuid: freeUuid,
+            id: persistedFreeResource?.resource_uuid || freeUuid,
+            uuid: persistedFreeResource?.resource_uuid || freeUuid,
             parentId: pool.id,
             cidr: block.cidr,
             serviceProviderId: "5",
@@ -8559,6 +8560,8 @@ function errorMessage(error: unknown) {
   }
   return error instanceof Error ? error.message : "Unknown error";
 }
+
+
 
 
 

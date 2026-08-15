@@ -8240,6 +8240,8 @@ def list_assignments() -> JSONResponse:
 def list_resources() -> list[ResourceWithAssignment]:
     with connect() as connection:
         release_expired_reservations(connection)
+        materialize_bulk_unassigned_fragments(connection)
+        reconcile_cst_success_resource_statuses(connection)
         rows = connection.execute(
             """
             SELECT * FROM ip_resources
@@ -9710,6 +9712,8 @@ def init_db_with_retry(max_attempts: int = 6) -> None:
 
 
 init_db_with_retry()
+
+
 
 
 
