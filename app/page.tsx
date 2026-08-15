@@ -1344,7 +1344,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
 
           <section className="min-w-0">
             {view !== "executive" ? <BreadcrumbNavigation view={view} resource={selectedResource} onNavigate={navigateTo} /> : null}
-            {view === "executive" ? <ExecutiveDashboard stats={stats} resources={resources} summary={dashboardSummary} assignmentTotal={assignmentTotal} cstSummary={cstSummary} currentRole={signedInRole} onNavigate={navigateTo} /> : null}
+            {view === "executive" ? <ExecutiveDashboard stats={stats} resources={resources} summary={dashboardSummary} assignmentTotal={assignmentTotal} cstSummary={cstSummary} currentRole={signedInRole} onNavigate={navigateTo} registryCoverageLoaded={registryAssignmentsQuery.data !== undefined} /> : null}
             {view === "registry" ? (
               <ResourceRegistry
                 resources={resources}
@@ -2050,7 +2050,8 @@ function ExecutiveDashboard({
   assignmentTotal,
   cstSummary,
   currentRole,
-  onNavigate
+  onNavigate,
+  registryCoverageLoaded
 }: {
   stats: RegistryStats;
   resources: ManagedResource[];
@@ -2059,6 +2060,7 @@ function ExecutiveDashboard({
   cstSummary: CstSyncSummary | null;
   currentRole: User["role"];
   onNavigate: (view: ViewKey, registryPanel?: RegistryPanelId) => void;
+  registryCoverageLoaded: boolean;
 }) {
   const [metricOwnerMenuOpen, setMetricOwnerMenuOpen] = useState(false);
   const [metricOwnerSelection, setMetricOwnerSelection] = useState<Record<string, boolean>>({});
@@ -2086,7 +2088,7 @@ function ExecutiveDashboard({
   const poolAssignedIps = metricPools.reduce((sum, resource) => sum + resource.usedIps, 0);
   const poolAvailableIps = metricPools.reduce((sum, resource) => sum + resource.freeIps, 0);
   const poolTotalIps = metricPools.reduce((sum, resource) => sum + resource.totalIps, 0);
-  const hasRegistryMetricData = registeredMetricPools.length > 0;
+  const hasRegistryMetricData = registryCoverageLoaded && registeredMetricPools.length > 0;
   const assignedIps = hasRegistryMetricData || !allMetricOwnersSelected ? poolAssignedIps : summary?.assigned_ips ?? poolAssignedIps;
   const assignmentRecords = hasRegistryMetricData || !allMetricOwnersSelected ? fallbackAssignments.length : summary?.assignment_records ?? assignmentTotal;
   const totalPools = hasRegistryMetricData || !allMetricOwnersSelected ? metricPools.length : summary?.total_pools ?? stats.totalPools;
@@ -7002,6 +7004,9 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[], persis
     const poolIsPublic = poolClassification === "PUBLIC";
     const poolResourceUuid = resourceUuid("pool", pool.id, pool.cidr);
     const persistedPoolResource = persistedFor(poolResourceUuid, "pool", pool.id, pool.cidr);
+    const poolHasMaterializedFragments = persistedPoolResource
+      ? persistedFreeFragments.some((fragment) => fragment.root_pool_uuid === persistedPoolResource.resource_uuid || fragment.parent_resource_uuid === persistedPoolResource.resource_uuid)
+      : false;
     const poolMaintainer = persistedPoolResource?.maintainer || resourceMaintainerFromPool(pool);
     const poolOwner = persistedPoolResource?.owner || ipResourceOwnerFromMaintainer(poolMaintainer);
     resources.push({
@@ -7136,7 +7141,7 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[], persis
       });
     }
 
-    if (poolStatus !== "RETIRED" && poolStatus !== "HISTORICAL") {
+    if (poolStatus !== "RETIRED" && poolStatus !== "HISTORICAL" && !poolHasMaterializedFragments) {
       for (const range of calculateContinuousFreeRanges(pool, occupyingAssignments)) {
         for (const block of rangeToCidrs(range.start, range.end)) {
           if (block.cidr === pool.cidr) {
