@@ -4602,11 +4602,21 @@ def run_due_cst_daily_schedule() -> None:
 
 
 def cst_scheduler_loop() -> None:
+    iteration = 0
+    materialize_interval_iterations = 15
     while True:
         try:
             run_due_cst_daily_schedule()
         except Exception:
             pass
+        if iteration % materialize_interval_iterations == 0:
+            try:
+                with connect() as connection:
+                    materialize_bulk_unassigned_fragments(connection)
+                    reconcile_cst_success_resource_statuses(connection)
+            except Exception:
+                pass
+        iteration += 1
         time.sleep(60)
 
 
@@ -8402,8 +8412,6 @@ def list_assignments() -> JSONResponse:
 def list_resources() -> list[ResourceWithAssignment]:
     with connect() as connection:
         release_expired_reservations(connection)
-        materialize_bulk_unassigned_fragments(connection)
-        reconcile_cst_success_resource_statuses(connection)
         rows = connection.execute(
             """
             SELECT * FROM ip_resources
