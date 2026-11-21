@@ -2013,7 +2013,7 @@ ${errorMessage(error)}`
           void cstTransactionsQuery.refetch();
           setNotice({
             title: result.batch_id ? "Pending CST Migration Job Created" : "CST Migration Job Not Created",
-            detail: `${result.message}\nJob ID: ${result.batch_id || "-"}\nIncluded: ${result.included_transactions}\nRejected/skipped: ${result.rejected_count + result.skipped_count}\nCreated: ${result.created_at.slice(0, 19)}\nCreated by: ${result.created_by}${result.partial_reassignments?.length ? `\n\nPartial reassignments:\n${result.partial_reassignments.map((group) => `${group.container_cidr} - ${group.status}${group.reason ? `: ${group.reason}` : ""}${group.operations.length ? `\n  ${group.operations.join("\n  ")}` : ""}`).join("\n\n")}` : ""}${result.rejected.length ? `\n\nRejected:\n${result.rejected.map((item) => `${item.review_id} ${item.cidr}: ${item.reason}`).join("\n")}` : ""}`
+            detail: `${result.message}\nJob ID: ${result.batch_id || "-"}\nIncluded: ${result.included_transactions}\nRejected/skipped: ${result.rejected_count + result.skipped_count}\nCreated: ${result.created_at.slice(0, 19)}\nCreated by: ${result.created_by}${result.partial_reassignments?.length ? `\n\nComposite transactions (steps run in order):\n${result.partial_reassignments.map((group) => `${group.container_cidr} - ${group.status}${group.reason ? `: ${group.reason}` : ""}${group.operations.length ? `\n  ${group.operations.join("\n  ")}` : ""}`).join("\n\n")}` : ""}${result.rejected.length ? `\n\nRejected:\n${result.rejected.map((item) => `${item.review_id} ${item.cidr}: ${item.reason}`).join("\n")}` : ""}`
           });
         })}
       />
@@ -5568,6 +5568,7 @@ function CstMigrationReviewDialog(props: {
   const selectedSet = new Set(props.selectedIds);
   const excludedSet = new Set(props.excludedIds);
   const matchingIds = review?.all_matching_review_ids ?? [];
+  const [openComposites, setOpenComposites] = useState<Record<string, boolean>>({});
   const matchingSet = new Set(matchingIds);
   const includedIds = props.selectedIds.filter((id) => matchingSet.has(id) && !excludedSet.has(id));
   const visibleIds = review?.items.map((item) => item.review_id) ?? [];
@@ -5606,7 +5607,7 @@ function CstMigrationReviewDialog(props: {
             </label>
             <label className="grid gap-1">
               <span className="text-xs font-medium text-muted-foreground">Transaction type</span>
-              <Select value={props.filters.transaction_type} values={["all", "SEND", "UPDATE", "DELETE"]} labels={{ all: "All" }} onChange={(value) => setFilter("transaction_type", value)} />
+              <Select value={props.filters.transaction_type} values={["all", "SEND", "UPDATE", "DELETE", "PARTIAL_REASSIGNMENT", "RELEASE"]} labels={{ all: "All", PARTIAL_REASSIGNMENT: "Partial reassignment", RELEASE: "Assignment release" }} onChange={(value) => setFilter("transaction_type", value)} />
             </label>
             <label className="grid gap-1">
               <span className="text-xs font-medium text-muted-foreground">Validation</span>
@@ -5657,20 +5658,39 @@ function CstMigrationReviewDialog(props: {
                 ) : review?.items.length ? review.items.map((item) => {
                   const isSelected = selectedSet.has(item.review_id);
                   const isExcluded = excludedSet.has(item.review_id);
+                  const isComposite = Boolean(item.composite_type);
+                  const isOpen = Boolean(openComposites[item.review_id]);
                   return (
-                    <TableRow key={item.review_id} className={isExcluded ? "opacity-55" : ""}>
-                      <TableCell>
+                    <Fragment key={item.review_id}>
+                    <TableRow className={cn(isExcluded ? "opacity-55" : "", isComposite ? "cursor-pointer bg-muted/20 hover:bg-muted/40" : "")} onClick={isComposite ? () => setOpenComposites((current) => ({ ...current, [item.review_id]: !current[item.review_id] })) : undefined}>
+                      <TableCell onClick={(event) => event.stopPropagation()}>
                         <input type="checkbox" checked={isSelected} onChange={(event) => event.target.checked ? mergeSelected([item.review_id]) : removeSelected([item.review_id])} aria-label={`Select ${item.cidr}`} />
                       </TableCell>
                       <TableCell><Badge variant={isExcluded ? "warning" : isSelected ? "success" : "default"}>{isExcluded ? "Excluded" : isSelected ? "Selected" : "Pending"}</Badge></TableCell>
-                      <TableCell>{item.operation}</TableCell>
+                      <TableCell>
+                        {isComposite ? (
+                          <span className="flex items-center gap-1 font-medium">
+                            {isOpen ? <ChevronDown className="h-4 w-4 shrink-0" /> : <ChevronRight className="h-4 w-4 shrink-0" />}
+                            {item.composite_type}
+                            <span className="text-xs font-normal text-muted-foreground">({item.steps?.length ?? 0} steps)</span>
+                          </span>
+                        ) : item.operation}
+                      </TableCell>
                       <TableCell>{item.cidr}</TableCell>
                       <TableCell>{item.start_ip} - {item.end_ip}</TableCell>
                       <TableCell>{item.customer_name || item.customer_id || "-"}</TableCell>
                       <TableCell>{item.service_id || "-"}</TableCell>
                       <TableCell className="max-w-[180px] truncate" title={item.transaction_id}>{item.transaction_id}</TableCell>
-                      <TableCell><Badge variant={item.validation_status === "VALID" ? "success" : "danger"}>{item.validation_status}</Badge>{item.reason ? <p className="mt-1 max-w-[240px] text-xs text-muted-foreground">{item.reason}</p> : null}{item.partial_reassignment ? <p className="mt-1 max-w-[260px] text-xs font-medium text-amber-600" title={item.partial_reassignment}>{item.partial_reassignment}</p> : null}</TableCell>
+                      <TableCell><Badge variant={item.validation_status === "VALID" ? "success" : "danger"}>{item.validation_status}</Badge>{item.reason ? <p className="mt-1 max-w-[240px] text-xs text-muted-foreground">{item.reason}</p> : null}</TableCell>
                     </TableRow>
+                    {isComposite && isOpen ? (item.steps ?? []).map((step, index) => (
+                      <TableRow key={`${item.review_id}-${index}`} className="text-xs">
+                        <TableCell />
+                        <TableCell className="text-muted-foreground">Step {index + 1}</TableCell>
+                        <TableCell colSpan={7} className="font-mono">{step}</TableCell>
+                      </TableRow>
+                    )) : null}
+                    </Fragment>
                   );
                 }) : (
                   <TableRow><TableCell colSpan={9}>No matching CST transactions found.</TableCell></TableRow>
@@ -6005,12 +6025,12 @@ function CstIntegrationMonitor(props: CstMonitorProps) {
                             {expandedPartials[row.key] ? <ChevronDown className="mt-0.5 h-4 w-4 shrink-0" /> : <ChevronRight className="mt-0.5 h-4 w-4 shrink-0" />}
                             <div>
                               <p className="font-semibold">{row.replaced.join(", ")}</p>
-                              <p className="text-xs text-muted-foreground">into {row.created.join(", ") || "-"}</p>
+                              <p className="text-xs text-muted-foreground">{row.created.length ? `into ${row.created.join(", ")}` : "UpdateLIR to Unassigned, DeleteLIR"}</p>
                             </div>
                           </div>
                         </TableCell>
                         <TableCell>
-                          <p className="font-medium">Partial reassignment</p>
+                          <p className="font-medium">{row.steps.some((step) => step.operation === "SEND") ? "Partial reassignment" : "Assignment release"}</p>
                           <p className="text-xs text-muted-foreground">{row.steps.filter((step) => step.status === "SUCCESS").length}/{row.steps.length} steps done</p>
                         </TableCell>
                         <TableCell><Badge variant={cstStatusVariant(row.status)}>{row.status}</Badge></TableCell>

@@ -621,6 +621,8 @@ export type CstMigrationReviewItem = {
   eligible: boolean;
   reason: string;
   partial_reassignment?: string;
+  composite_type?: string;
+  steps?: string[];
 };
 
 export type CstMigrationReviewCounts = {

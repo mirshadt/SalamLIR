@@ -48,11 +48,11 @@ class CstPartialReassignmentTest(unittest.TestCase):
         app.DB_PATH = self.temp_dir / "ipam.test.db"
         app.init_db()
         self.calls: list[tuple[str, str, str, int | None]] = []
-        self.fail: set[tuple[str, str]] = set()  # (operation, cidr) pairs CST rejects
+        self.reject: set[tuple[str, str]] = set()  # (operation, cidr) pairs CST rejects
 
         def record(operation, cidr, transaction_id, status_id):
             self.calls.append((operation, cidr, transaction_id, status_id))
-            if (operation, cidr) in self.fail:
+            if (operation, cidr) in self.reject:
                 return "FAILED", f"CST {operation} rejected"
             return "SUCCESS", ""
 
@@ -147,6 +147,19 @@ class CstPartialReassignmentTest(unittest.TestCase):
         with app.connect() as connection:
             connection.execute("UPDATE cst_config SET auto_execute = 0")
 
+    def review(self, scope: str = "all"):
+        with app.connect() as connection:
+            if scope == "assigned":
+                return app.cst_assignment_review_response(connection, app.CstMigrationReviewRequest(page_size=500, resource_scope="assigned")).items
+            return app.cst_migration_review_items(connection, app.CstMigrationReviewRequest(page_size=500, resource_scope=scope))
+
+    def create_from_review(self, review_ids, scope: str = "all"):
+        return app.create_cst_migration_job_from_review(app.CstMigrationReviewCreateRequest(included_review_ids=review_ids, resource_scope=scope, final_confirmed=True))
+
+    def job_count(self) -> int:
+        with app.connect() as connection:
+            return connection.execute("SELECT COUNT(*) FROM cst_sync_jobs").fetchone()[0]
+
     # --- Create Migration Job ------------------------------------------------------------------
     def test_separate_split_endpoint_is_gone(self):
         self.assertNotIn("/cst/container-splits", {route.path for route in app.app.routes})
@@ -182,7 +195,7 @@ class CstPartialReassignmentTest(unittest.TestCase):
         self.cst_record("87.101.190.32/27")
         self.load_assignment()
         self.load_assignment("87.101.190.32/28", 16, "Second Customer")
-        self.fail = {("DELETE", CONTAINER)}
+        self.reject = {("DELETE", CONTAINER)}
         result = self.migration_job(execute=True)
         jobs = self.batch_jobs(result.batch_id)
         failed_chain = self.chain(jobs, CONTAINER)
@@ -217,25 +230,31 @@ class CstPartialReassignmentTest(unittest.TestCase):
         group = next(group for group in result.partial_reassignments if group.container_cidr == CONTAINER)
         self.assertFalse(any(line.startswith("UpdateLIR") for line in group.operations))
 
-    def test_review_offers_failed_overlap_subnet_again_and_creates_the_reassignment(self):
+    def test_review_shows_partial_reassignment_as_one_row_and_creates_one_batch(self):
         self.load_assignment()
         with app.connect() as connection:
             assignment_resource = app.find_resource_by_cidr(connection, ASSIGNED)
-            self.fail = {("SEND", ASSIGNED)}
+            self.reject = {("SEND", ASSIGNED)}
             failed = app.create_cst_sync_jobs(connection, [(assignment_resource, "SEND")], "MANUAL_LIR_MIGRATION")
         self.assertEqual(failed[0].status, "FAILED")
-        self.fail, self.calls = set(), []
-        with app.connect() as connection:
-            items = app.cst_migration_review_items(connection, app.CstMigrationReviewRequest(page_size=500, resource_scope="all"))
-        item = next(item for item in items if item.cidr == ASSIGNED)
-        self.assertIn(f"replaces CST record(s) {CONTAINER}", item.partial_reassignment)
-        result = app.create_cst_migration_job_from_review(app.CstMigrationReviewCreateRequest(
-            included_review_ids=[item.review_id], resource_scope="all", final_confirmed=True,
-        ))
+        self.reject, self.calls = set(), []
+        for scope in ("all", "assigned"):
+            items = self.review(scope)
+            row = next(item for item in items if item.review_id.startswith(app.CST_COMPOSITE_PREFIX) and CONTAINER in item.cidr)
+            self.assertEqual(row.composite_type, "Partial reassignment")
+            self.assertEqual(row.operation, app.CST_COMPOSITE_PARTIAL)
+            self.assertEqual(row.steps, [
+                f"DeleteLIR {CONTAINER} (Transaction ID {self.container_tx})",
+                "SendLIR 87.101.190.112/29 [Unassigned]",
+                f"SendLIR {ASSIGNED} [Business]",
+            ])
+            self.assertFalse(any(item.cidr in {ASSIGNED, "87.101.190.112/29"} for item in items), "parts are inside the composite row, not separate rows")
+        result = self.create_from_review([row.review_id])
         self.assertEqual(result.rejected, [])
-        self.assertIn("partial reassignment", result.message)
-        chain = self.chain(self.batch_jobs(result.batch_id), CONTAINER)
-        self.assertEqual([(job.operation, job.cidr) for job in chain], [("DELETE", CONTAINER), ("SEND", "87.101.190.112/29"), ("SEND", ASSIGNED)])
+        jobs = self.batch_jobs(result.batch_id)
+        self.assertEqual({job.batch_id for job in jobs}, {result.batch_id})
+        self.assertEqual([(job.operation, job.cidr) for job in self.chain(jobs, CONTAINER)], [("DELETE", CONTAINER), ("SEND", "87.101.190.112/29"), ("SEND", ASSIGNED)])
+        self.assertEqual(self.calls, [])
 
     def test_merged_free_block_replaces_smaller_cst_records(self):
         small_a = self.cst_record("87.101.190.0/30")
@@ -305,7 +324,7 @@ class CstPartialReassignmentTest(unittest.TestCase):
         self.assertEqual([tx for op, _cidr, tx, _status in self.calls if op != "SEND"], [old_tx, old_tx])
 
     def test_individual_assignment_saved_when_delete_succeeds_but_send_fails(self):
-        self.fail = {("SEND", ASSIGNED)}
+        self.reject = {("SEND", ASSIGNED)}
         with self.assertRaises(app.HTTPException) as raised:
             self.individual_assignment(ASSIGNED, 8)
         self.assertEqual(raised.exception.status_code, 502)
@@ -315,7 +334,7 @@ class CstPartialReassignmentTest(unittest.TestCase):
         self.assertNotEqual(self.ledger(self.container_tx)["retired_at"], "")
 
     def test_individual_assignment_rolled_back_when_delete_fails(self):
-        self.fail = {("DELETE", CONTAINER)}
+        self.reject = {("DELETE", CONTAINER)}
         with self.assertRaises(app.HTTPException):
             self.individual_assignment(ASSIGNED, 8)
         with app.connect() as connection:
@@ -323,34 +342,67 @@ class CstPartialReassignmentTest(unittest.TestCase):
         self.assertEqual(self.ledger(self.container_tx)["retired_at"], "")
 
     # --- controlled sync (auto-execute off) ----------------------------------------------------
-    def test_controlled_sync_individual_assignment_is_saved_and_queued(self):
+    def test_controlled_sync_individual_assignment_waits_for_migration_job(self):
         self.controlled_sync()
+        jobs_before = self.job_count()
         self.individual_assignment(ASSIGNED, 8)
         self.assertEqual(self.calls, [])
-        with app.connect() as connection:
-            batch_id = connection.execute("SELECT batch_id FROM cst_sync_jobs WHERE cidr = ? AND operation = 'DELETE'", (CONTAINER,)).fetchone()["batch_id"]
-        chain = self.chain(self.batch_jobs(batch_id), CONTAINER)
-        self.assertEqual([(job.operation, job.cidr, job.status) for job in chain], [
-            ("DELETE", CONTAINER, "PENDING"), ("SEND", "87.101.190.112/29", "PENDING"), ("SEND", ASSIGNED, "PENDING"),
-        ])
+        self.assertEqual(self.job_count(), jobs_before, "no batch per assignment")
+        row = next(item for item in self.review() if CONTAINER in item.cidr)
+        self.assertEqual(row.composite_type, "Partial reassignment")
+        result = self.create_from_review([row.review_id])
+        self.assertEqual([(job.operation, job.status) for job in self.chain(self.batch_jobs(result.batch_id), CONTAINER)], [("DELETE", "PENDING"), ("SEND", "PENDING"), ("SEND", "PENDING")])
 
-    def test_controlled_sync_release_queues_unassign_then_delete(self):
-        assignment = self.individual_assignment(ASSIGNED, 8)
-        sent_tx = next(tx for op, cidr, tx, _status in self.calls if op == "SEND" and cidr == ASSIGNED)
+    def test_controlled_sync_release_is_one_review_row_and_one_batch(self):
+        released = self.individual_assignment("87.101.190.64/27", 32, "Leaving Customer")
+        released_tx = next(tx for op, cidr, tx, _status in self.calls if op == "SEND" and cidr == "87.101.190.64/27")
         self.calls.clear()
         self.controlled_sync()
-        app.unassign(assignment.id)
+        jobs_before = self.job_count()
+        result = app.process_assignment_release_bulk("cidr\n87.101.190.64/27")
+        self.assertEqual(result.output_rows[0].processingStatus, "RELEASED", result.errors)
+        self.assertIn("Create Migration Job", result.output_rows[0].processingMessage)
+        self.assertEqual(self.job_count(), jobs_before, "no batch per release")
         self.assertEqual(self.calls, [])
-        with app.connect() as connection:
-            batch_id = connection.execute("SELECT batch_id FROM cst_sync_jobs WHERE transaction_id = ? AND operation = 'DELETE'", (sent_tx,)).fetchone()["batch_id"]
-            workflow = connection.execute("SELECT workflow_type FROM cst_sync_batches WHERE id = ?", (batch_id,)).fetchone()["workflow_type"]
-        self.assertEqual(workflow, app.CST_RELEASE_WORKFLOW)
-        self.assertEqual([(job.operation, job.status) for job in self.batch_jobs(batch_id)], [("UPDATE", "PENDING"), ("DELETE", "PENDING")])
-        with self.assertRaises(app.HTTPException) as raised:
-            self.individual_assignment(ASSIGNED, 8, "New Customer")
-        self.assertEqual(raised.exception.status_code, 409)
-        self.assertIn("push pending CST jobs first", raised.exception.detail)
+        row = next(item for item in self.review() if "87.101.190.64/27" in item.cidr)
+        self.assertEqual(row.composite_type, "Assignment release")
+        self.assertTrue(all(step.startswith("SendLIR") and step.endswith("[Unassigned]") for step in row.steps[2:]), "only free space may follow, as Unassigned")
+        self.assertEqual(row.steps[:2], [
+            f"UpdateLIR 87.101.190.64/27 to Unassigned (Transaction ID {released_tx})",
+            f"DeleteLIR 87.101.190.64/27 (Transaction ID {released_tx})",
+        ])
+        created = self.create_from_review([row.review_id])
+        chain = self.chain(self.batch_jobs(created.batch_id), "87.101.190.64/27")
+        self.assertEqual([job.operation for job in chain[:2]], ["UPDATE", "DELETE"])
+        app.process_cst_batch_pending_jobs(app.connect(), created.batch_id)  # push
+        self.assertEqual([op for op, cidr, *_ in self.calls if cidr == "87.101.190.64/27"], ["UPDATE", "DELETE"])
+        self.assertNotEqual(self.ledger(released_tx)["retired_at"], "")
+        self.assertIsNotNone(released)
 
+    def test_old_pending_release_batch_is_replaced_by_the_migration_job(self):
+        self.individual_assignment("87.101.190.64/27", 32, "Leaving Customer")
+        released_tx = next(tx for op, cidr, tx, _status in self.calls if op == "SEND" and cidr == "87.101.190.64/27")
+        self.controlled_sync()
+        app.process_assignment_release_bulk("cidr\n87.101.190.64/27")
+        with app.connect() as connection:  # a per-row release batch created by the previous version
+            ledger = connection.execute("SELECT * FROM cst_transaction_ledger WHERE transaction_id = ?", (released_tx,)).fetchone()
+            record = app.cst_unassigned_update_resource(app.cst_resource_from_ledger(ledger))
+            old = app.create_cst_sync_jobs(connection, [(record, "UPDATE"), (record, "DELETE")], app.CST_RELEASE_WORKFLOW, queue_only=True)
+        row = next(item for item in self.review() if "87.101.190.64/27" in item.cidr)
+        self.assertEqual(row.validation_status, "VALID", row.reason)
+        created = self.create_from_review([row.review_id])
+        with app.connect() as connection:
+            old_jobs = connection.execute("SELECT status, last_error FROM cst_sync_jobs WHERE batch_id = ?", (old[0].batch_id,)).fetchall()
+            old_batch = connection.execute("SELECT status FROM cst_sync_batches WHERE id = ?", (old[0].batch_id,)).fetchone()
+        self.assertEqual({job["status"] for job in old_jobs}, {"NOT_REQUIRED"})
+        self.assertIn(created.batch_id, old_jobs[0]["last_error"])
+        self.assertEqual(old_batch["status"], "SUCCESS")
+
+    def test_auto_execute_release_still_runs_immediately(self):
+        self.individual_assignment("87.101.190.64/27", 32, "Leaving Customer")
+        self.calls.clear()
+        app.process_assignment_release_bulk("cidr\n87.101.190.64/27")
+        self.assertEqual([op for op, cidr, *_ in self.calls if cidr == "87.101.190.64/27"], ["UPDATE", "DELETE"])
 
 if __name__ == "__main__":
     unittest.main()

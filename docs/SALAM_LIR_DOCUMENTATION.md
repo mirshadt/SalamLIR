@@ -425,7 +425,12 @@ A migration job is ONE batch. Plain SendLIRs come first; each partial reassignme
 
 A group is blocked, and nothing is changed in CST, when a record still belongs to an active local assignment (release it or use partial reassignment first), a DeleteLIR for it is already queued, the local subnets do not cover all of a record's addresses, or another subnet in the group is not CST-ready, has an unresolved conflict or is already queued. For Assignment Management the assignment is then refused with the reason. If CST accepted the DeleteLIR but a later SendLIR failed, the assignment is kept (CST no longer holds the old record) and the error names the batch to retry.
 
-With CST auto-execute off (controlled sync), changes are saved locally and their CST jobs are queued, then sent in order when pending jobs are pushed. Releases queue UpdateLIR to Unassigned and DeleteLIR in one ordered batch. While a DeleteLIR is still queued, CST still holds that record, so a new assignment over the same space is refused until pending jobs are pushed.
+With CST auto-execute off (controlled sync), assignments and releases do not create batches of their own. They are saved locally and wait in **Create Migration Job > Review Pending CST Transactions**, where each composite transaction is ONE row that expands into its steps:
+
+- **Partial reassignment**: (UpdateLIR to Unassigned if assigned), DeleteLIR, SendLIR reassigned and remaining portions.
+- **Assignment release**: UpdateLIR to Unassigned (if assigned), DeleteLIR; when the freed space exists as its own local block, a SendLIR reports it again as Unassigned with a new Transaction ID.
+
+Selected rows become one migration batch; each composite is a chain inside it, run in order when pending jobs are pushed. Old per-assignment release batches that never reached CST are marked NOT_REQUIRED ("Replaced by migration batch ...") when their record is included. With auto-execute on, assignments and releases still go to CST immediately.
 
 ### 11.5 CST Scheduling
 

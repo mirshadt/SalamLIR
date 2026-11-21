@@ -1097,6 +1097,8 @@ class CstMigrationReviewItem(BaseModel):
     eligible: bool = True
     reason: str = ""
     partial_reassignment: str = ""
+    composite_type: str = ""  # "Partial reassignment" / "Assignment release": one row for several CST steps
+    steps: list[str] = Field(default_factory=list)
 
 
 class CstMigrationReviewCounts(BaseModel):
@@ -3797,6 +3799,11 @@ def create_cst_assignment_create_jobs(
     Uses the same overlap rules as every other path: if CST already holds a record that overlaps
     the assignment, that record is deleted and the assigned and remaining portions are sent.
     """
+    if cst_controlled_sync(connection):
+        # Controlled sync: no batch per assignment; it waits in Create Migration Job (as a plain
+        # SendLIR or inside a partial reassignment row).
+        record_audit(connection, "CST Sync Pending Migration Job", "assignment", assignment.id, "", f"{assignment.cidr}: auto-execute is off; include it in a migration job")
+        return []
     outcome = cst_send_resources(connection, [assignment_resource], workflow_type, queue_only=False, exempt_uuids={assignment_resource.resource_uuid})
     if outcome.rejected:
         raise HTTPException(status_code=409, detail=f"{assignment.cidr} cannot be sent to CST: {outcome.rejected[0][2]}")
@@ -7283,8 +7290,16 @@ def cst_assignment_review_where(request: CstMigrationReviewRequest) -> tuple[str
 
 
 def cst_assignment_review_response(connection: sqlite3.Connection, request: CstMigrationReviewRequest) -> CstMigrationReviewResponse:
+    composites = cst_composites(connection)
+    composite_items = [
+        item for item in (cst_composite_review_item(connection, composite) for composite in composites)
+        if item.assignment_status_id in (2, 3, 4) and cst_review_matches_filter(item, request)
+    ]
+    member_uuids = sorted({member.resource_uuid for composite in composites for member in composite.members})
     where_sql, params, empty = cst_assignment_review_where(request)
-    if empty:
+    where_sql = f"({where_sql}) AND r.resource_uuid NOT IN (SELECT value FROM json_each(?))"
+    params = [*params, json.dumps(member_uuids)]
+    if empty and not composite_items:
         return CstMigrationReviewResponse(
             page=request.page,
             page_size=request.page_size,
@@ -7310,10 +7325,10 @@ def cst_assignment_review_response(connection: sqlite3.Connection, request: CstM
         """,
         params,
     ).fetchone()
-    total = int(total_row["total"] or 0)
-    valid_count = int(total_row["valid"] or 0)
-    invalid_count = int(total_row["invalid"] or 0)
-    all_ids = [
+    total = int(total_row["total"] or 0) + len(composite_items)
+    valid_count = int(total_row["valid"] or 0) + sum(1 for item in composite_items if item.validation_status == "VALID")
+    invalid_count = int(total_row["invalid"] or 0) + sum(1 for item in composite_items if item.validation_status != "VALID")
+    all_ids = [item.review_id for item in composite_items] + [
         str(row["review_id"])
         for row in connection.execute(
             f"""
@@ -7325,6 +7340,9 @@ def cst_assignment_review_response(connection: sqlite3.Connection, request: CstM
         ).fetchall()
     ]
     offset = (request.page - 1) * request.page_size
+    page_items = composite_items[offset:offset + request.page_size]
+    sql_offset = max(offset - len(composite_items), 0)
+    sql_limit = request.page_size - len(page_items)
     rows = connection.execute(
         f"""
         SELECT r.*
@@ -7332,9 +7350,9 @@ def cst_assignment_review_response(connection: sqlite3.Connection, request: CstM
         ORDER BY datetime(r.created_at) DESC, r.created_at DESC, r.prefix DESC, r.cidr
         LIMIT ? OFFSET ?
         """,
-        [*params, request.page_size, offset],
-    ).fetchall()
-    page_items = [cst_review_operation_item(connection, resource_from_row(row), "SEND") for row in rows]
+        [*params, sql_limit, sql_offset],
+    ).fetchall() if sql_limit > 0 else []
+    page_items = [*page_items, *[cst_review_operation_item(connection, resource_from_row(row), "SEND") for row in rows]]
     return CstMigrationReviewResponse(
         page=request.page,
         page_size=request.page_size,
@@ -7401,25 +7419,23 @@ def cst_migration_review_items(connection: sqlite3.Connection, request: CstMigra
         resource_scope=scope,
     )
     operations, _eligible_count, _parent_delete_count = cst_migration_resource_operations(connection, payload)
-    candidates = {resource.resource_uuid for resource in cst_partial_reassignment_candidates(connection)}
-    active = cst_active_ledger_intervals(connection)
+    composites = cst_composites(connection)
+    member_uuids = {member.resource_uuid for composite in composites for member in composite.members}
     items: list[CstMigrationReviewItem] = []
+    for composite in composites:
+        item = cst_composite_review_item(connection, composite)
+        in_scope = scope == "all" or (scope == "assigned") == (item.assignment_status_id in (2, 3, 4))
+        if in_scope and cst_review_matches_filter(item, request):
+            items.append(item)
     seen: set[str] = set()
     for resource, operation in operations:
         review_id = cst_review_id(operation, resource.resource_uuid)
-        if review_id in seen:
+        if review_id in seen or resource.resource_uuid in member_uuids:
             continue
         seen.add(review_id)
-        if resource.resource_uuid not in candidates and cst_resource_has_existing_job(connection, resource.resource_uuid):
+        if cst_resource_has_existing_job(connection, resource.resource_uuid):
             continue
         item = cst_review_operation_item(connection, resource, operation)
-        if operation == "SEND":
-            overlapping = cst_overlapping_ledger_rows(connection, resource, active)
-            if overlapping:
-                item.partial_reassignment = (
-                    "Partial reassignment: replaces CST record(s) " + ", ".join(str(row["cidr"]) for row in overlapping)
-                    + " (UpdateLIR to Unassigned if assigned, DeleteLIR, then SendLIR the reassigned and remaining portions)"
-                )
         if cst_review_matches_filter(item, request):
             items.append(item)
     return items
@@ -7778,10 +7794,7 @@ def cst_plan_overlap_group(
     )
     blockers: list[str] = []
     for row in rows:
-        queued_delete = connection.execute(
-            "SELECT batch_id FROM cst_sync_jobs WHERE transaction_id = ? AND operation = 'DELETE' AND status IN ('PENDING', 'RUNNING') LIMIT 1",
-            (str(row["transaction_id"]),),
-        ).fetchone()
+        queued_delete = cst_in_flight_job(connection, str(row["transaction_id"]), "DELETE")
         if queued_delete is not None:
             blockers.append(f"a DeleteLIR for {row['cidr']} is already queued in CST batch {queued_delete['batch_id']}; push pending CST jobs first")
             continue
@@ -7808,7 +7821,15 @@ def cst_plan_overlap_group(
         if not any(low <= start and end <= high for low, high in covered):
             blockers.append(f"local subnets do not cover all of {network}; that space would be left out of CST after DeleteLIR")
 
-    if len(rows) == 1 and len(members) == 1 and normalize_network(members[0].cidr) == normalize_network(str(rows[0]["cidr"])):
+    released_record = len(rows) == 1 and connection.execute(
+        "SELECT 1 FROM ip_resources WHERE resource_uuid = ?", (str(rows[0]["resource_uuid"]),)
+    ).fetchone() is None and len(members) == 1 and members[0].source_entity_type == BULK_UNASSIGNED_FRAGMENT_SOURCE
+    if (
+        len(rows) == 1 and len(members) == 1 and not released_record
+        and normalize_network(members[0].cidr) == normalize_network(str(rows[0]["cidr"]))
+    ):
+        # A new subnet that is exactly an existing record: one UpdateLIR. Not for a released
+        # assignment, whose record must be unassigned and deleted (Transaction ID retired).
         operations: list[tuple[ResourceRecord, str]] = [(members[0], "UPDATE")]
     else:
         operations = []
@@ -7840,6 +7861,139 @@ class CstSendOutcome(BaseModel):
     rejected: list[tuple[str, str, str]] = Field(default_factory=list)  # (resource_uuid, cidr, reason)
 
 
+CST_COMPOSITE_PREFIX = "COMPOSITE:"
+CST_COMPOSITE_PARTIAL = "PARTIAL_REASSIGNMENT"
+CST_COMPOSITE_RELEASE = "RELEASE"
+
+
+class CstComposite:
+    """Several CST steps that must run in order as one unit (one review row, one chain in a batch)."""
+
+    def __init__(self, kind: str, rows: list[sqlite3.Row], members: list[ResourceRecord], item: CstPartialReassignmentGroup, operations: list[tuple[ResourceRecord, str]]):
+        self.kind = kind
+        self.rows = rows
+        self.members = members
+        self.item = item
+        self.operations = operations
+        self.key = CST_COMPOSITE_PREFIX + stable_uuid("cst-composite", *sorted(str(row["transaction_id"]) for row in rows))
+
+    @property
+    def label(self) -> str:
+        return "Assignment release" if self.kind == CST_COMPOSITE_RELEASE else "Partial reassignment"
+
+
+def cst_controlled_sync(connection: sqlite3.Connection) -> bool:
+    """Auto-execute off: changes wait for a migration job instead of creating their own batches."""
+    config = ensure_cst_config(connection)
+    return bool(config.enabled and not config.auto_execute)
+
+
+def cst_supersedable_release_job_ids(connection: sqlite3.Connection, transaction_id: str) -> list[str]:
+    """Pending jobs of old per-assignment release batches that never reached CST: a migration job replaces them."""
+    rows = connection.execute(
+        """
+        SELECT j.id, j.batch_id FROM cst_sync_jobs j
+        INNER JOIN cst_sync_batches b ON b.id = j.batch_id
+        WHERE j.transaction_id = ? AND j.status = 'PENDING' AND b.workflow_type = ?
+          AND NOT EXISTS (
+            SELECT 1 FROM cst_sync_jobs other
+            WHERE other.batch_id = j.batch_id AND (other.status != 'PENDING' OR other.attempt_count > 0)
+          )
+        """,
+        (transaction_id, CST_RELEASE_WORKFLOW),
+    ).fetchall()
+    return [str(row["id"]) for row in rows]
+
+
+def cst_in_flight_job(connection: sqlite3.Connection, transaction_id: str, operation: str | None = None) -> sqlite3.Row | None:
+    """A queued/running job for the record that a migration job would not replace."""
+    supersedable = set(cst_supersedable_release_job_ids(connection, transaction_id))
+    query = "SELECT id, batch_id FROM cst_sync_jobs WHERE transaction_id = ? AND status IN ('PENDING', 'RUNNING')"
+    params: list[object] = [transaction_id]
+    if operation:
+        query += " AND operation = ?"
+        params.append(operation)
+    for row in connection.execute(query, params).fetchall():
+        if str(row["id"]) not in supersedable:
+            return row
+    return None
+
+
+def cst_plan_release(connection: sqlite3.Connection, row: sqlite3.Row) -> tuple[CstPartialReassignmentGroup, list[tuple[ResourceRecord, str]]]:
+    """Assignment release: UpdateLIR to Unassigned (if assigned), then DeleteLIR."""
+    status_id = cst_record_assignment_status(connection, row)
+    record = cst_unassigned_update_resource(cst_resource_from_ledger(row))
+    operations: list[tuple[ResourceRecord, str]] = []
+    if status_id != 1:
+        operations.append((record, "UPDATE"))
+    operations.append((record, "DELETE"))
+    item = CstPartialReassignmentGroup(
+        container_cidr=str(row["cidr"]),
+        container_transaction_id=str(row["transaction_id"]),
+        container_assignment_status_id=status_id,
+        status="PLANNED",
+        operations=[
+            f"UpdateLIR {record.cidr} to Unassigned (Transaction ID {record.transaction_id})" if operation == "UPDATE" else f"DeleteLIR {record.cidr} (Transaction ID {record.transaction_id})"
+            for _resource, operation in operations
+        ],
+    )
+    in_flight = cst_in_flight_job(connection, str(row["transaction_id"]))
+    if in_flight is not None:
+        item.status = "BLOCKED"
+        item.reason = f"a CST job for {row['cidr']} is already queued in batch {in_flight['batch_id']}; push pending CST jobs first"
+        operations = []
+    return item, operations
+
+
+def cst_composite_from_group(connection: sqlite3.Connection, rows: list[sqlite3.Row], members: list[ResourceRecord], exempt_uuids: set[str] | None = None) -> CstComposite:
+    item, operations = cst_plan_overlap_group(connection, rows, members, exempt_uuids)
+    released = all(
+        connection.execute("SELECT 1 FROM ip_resources WHERE resource_uuid = ?", (str(row["resource_uuid"]),)).fetchone() is None for row in rows
+    ) and all(member.source_entity_type == BULK_UNASSIGNED_FRAGMENT_SOURCE for member in members)
+    return CstComposite(CST_COMPOSITE_RELEASE if released else CST_COMPOSITE_PARTIAL, rows, members, item, operations)
+
+
+def cst_composites(connection: sqlite3.Connection) -> list[CstComposite]:
+    """Every composite CST transaction waiting for a migration job.
+
+    Partial reassignment: CST records overlapping local subnets that CST does not hold as-is.
+    Assignment release: CST records whose local subnet was released (no local resource any more) and
+    that no local subnet overlaps; replacing old pending per-assignment release batches.
+    """
+    materialize_bulk_unassigned_fragments(connection)
+    active = cst_active_ledger_intervals(connection)
+    seeds = cst_partial_reassignment_candidates(connection)
+    groups, _plain = cst_overlap_groups(connection, seeds)
+    composites = [cst_composite_from_group(connection, rows, members) for rows, members in groups]
+    grouped_transactions = {str(row["transaction_id"]) for composite in composites for row in composite.rows}
+    local_uuids = {str(row["resource_uuid"]) for row in connection.execute("SELECT resource_uuid FROM ip_resources").fetchall()}
+    for _start, _end, row in active:
+        if str(row["resource_uuid"]) in local_uuids or str(row["transaction_id"]) in grouped_transactions:
+            continue
+        item, operations = cst_plan_release(connection, row)
+        composites.append(CstComposite(CST_COMPOSITE_RELEASE, [row], [], item, operations))
+    composites.sort(key=lambda composite: int(normalize_network(str(composite.rows[0]["cidr"])).network_address))
+    return composites
+
+
+def cst_supersede_release_jobs(connection: sqlite3.Connection, composites: list[CstComposite], batch_id: str) -> int:
+    superseded = 0
+    batches: set[str] = set()
+    for composite in composites:
+        for row in composite.rows:
+            for job_id in cst_supersedable_release_job_ids(connection, str(row["transaction_id"])):
+                job_row = connection.execute("SELECT batch_id FROM cst_sync_jobs WHERE id = ?", (job_id,)).fetchone()
+                connection.execute(
+                    "UPDATE cst_sync_jobs SET status = 'NOT_REQUIRED', last_error = ?, updated_at = ? WHERE id = ?",
+                    (f"Replaced by migration batch {batch_id}", now_iso(), job_id),
+                )
+                batches.add(str(job_row["batch_id"]))
+                superseded += 1
+    for old_batch_id in batches:
+        finalize_cst_sync_batch(connection, old_batch_id, [cst_job_from_row(row) for row in connection.execute("SELECT * FROM cst_sync_jobs WHERE batch_id = ?", (old_batch_id,)).fetchall()])
+    return superseded
+
+
 def cst_send_resources(
     connection: sqlite3.Connection,
     resources: list[ResourceRecord],
@@ -7848,46 +8002,52 @@ def cst_send_resources(
     extra_operations: list[tuple[ResourceRecord, str]] | None = None,
     exempt_uuids: set[str] | None = None,
     ignore_ledger_resource_uuids: set[str] | None = None,
+    composites: list[CstComposite] | None = None,
 ) -> CstSendOutcome:
-    """Send new subnets to CST without overlapping records it already holds.
+    """Send subnets and composite transactions to CST in ONE batch.
 
-    Every path that adds subnets (migration job, individual assignment, partition, bootstrap) goes
-    through here and produces ONE batch: extra_operations and plain SendLIRs first, then one chained
-    partial reassignment per group of overlapping records (UpdateLIR to Unassigned if assigned,
-    DeleteLIR, SendLIR reassigned and remaining portions). Each chain step waits only for the
-    previous step of its own chain.
+    extra_operations and plain SendLIRs come first; then each composite (partial reassignment or
+    assignment release) as a chain whose steps wait only for the previous step of the same chain.
+    Subnets that overlap CST records become partial reassignments automatically, so every path
+    (migration job, Assignment Management, partition, bootstrap) produces the same CST steps.
     """
     materialize_bulk_unassigned_fragments(connection)
     outcome = CstSendOutcome()
     groups, plain = cst_overlap_groups(connection, resources, ignore_ledger_resource_uuids)
+    planned: dict[str, CstComposite] = {}
+    for rows, members in groups:
+        composite = cst_composite_from_group(connection, rows, members, exempt_uuids)
+        planned.setdefault(composite.key, composite)
+    for composite in composites or []:
+        planned.setdefault(composite.key, composite)
     operations = [*(extra_operations or []), *[(resource, "SEND") for resource in plain]]
     chains = [""] * len(operations)
     seed_uuids = {resource.resource_uuid for resource in resources}
-    planned: list[CstPartialReassignmentGroup] = []
-    for index, (rows, members) in enumerate(groups, start=1):
-        item, group_operations = cst_plan_overlap_group(connection, rows, members, exempt_uuids)
-        if group_operations:
-            operations.extend(group_operations)
-            chains.extend([f"partial-reassignment-{index}"] * len(group_operations))
-            planned.append(item)
+    included: list[CstComposite] = []
+    for index, composite in enumerate(planned.values(), start=1):
+        if composite.operations:
+            operations.extend(composite.operations)
+            chains.extend([f"composite-{index}"] * len(composite.operations))
+            included.append(composite)
         else:
             outcome.rejected.extend(
-                (member.resource_uuid, member.cidr, f"Overlaps CST record(s) {item.container_cidr}: {item.reason}")
-                for member in members if member.resource_uuid in seed_uuids
+                (member.resource_uuid, member.cidr, f"Overlaps CST record(s) {composite.item.container_cidr}: {composite.item.reason}")
+                for member in composite.members if member.resource_uuid in seed_uuids
             )
-        outcome.groups.append(item)
+        outcome.groups.append(composite.item)
     if operations:
         jobs = create_cst_sync_jobs(connection, operations, workflow_type, queue_only=queue_only, chains=chains)
         outcome.jobs.extend(jobs)
         outcome.plain_batch_id = jobs[0].batch_id if jobs else ""
-        for item in planned:
-            cidrs = {line.split()[1] for line in item.operations}
-            item.status = "CREATED"
-            item.batch_id = outcome.plain_batch_id
-            item.job_statuses = [
+        for composite in included:
+            cidrs = {line.split()[1] for line in composite.item.operations}
+            composite.item.status = "CREATED"
+            composite.item.batch_id = outcome.plain_batch_id
+            composite.item.job_statuses = [
                 f"{job.operation} {job.cidr}: {job.status}{' - ' + job.last_error if job.last_error else ''}"
                 for job in jobs if job.depends_on_job_id and job.cidr in cidrs
             ]
+        cst_supersede_release_jobs(connection, included, outcome.plain_batch_id)
     return outcome
 
 
@@ -7906,6 +8066,56 @@ def cst_partial_reassignment_candidates(connection: sqlite3.Connection) -> list[
             "SELECT 1 FROM cst_sync_jobs WHERE resource_uuid = ? AND status IN ('PENDING', 'RUNNING') LIMIT 1", (resource.resource_uuid,)
         ).fetchone() is None
     ]
+
+
+def cst_composite_review_item(connection: sqlite3.Connection, composite: CstComposite) -> CstMigrationReviewItem:
+    networks = [normalize_network(str(row["cidr"])) for row in composite.rows]
+    assigned = next((member for member in composite.members if int(member.assignment_status_id or 1) in (2, 3, 4)), None)
+    recorded_payload = connection.execute(
+        "SELECT payload_json FROM cst_sync_jobs WHERE transaction_id = ? AND operation IN ('SEND', 'UPDATE') AND status = 'SUCCESS' ORDER BY updated_at DESC LIMIT 1",
+        (str(composite.rows[0]["transaction_id"]),),
+    ).fetchone()
+    payload = json.loads(str(recorded_payload["payload_json"] or "{}")) if recorded_payload else {}
+    status_id = int(assigned.assignment_status_id) if assigned else int(composite.item.container_assignment_status_id or 1)
+    blocked = composite.item.status == "BLOCKED"
+    return CstMigrationReviewItem(
+        review_id=composite.key,
+        resource_uuid="",
+        operation=composite.kind,
+        cidr=", ".join(str(network) for network in networks),
+        start_ip=str(min(networks, key=lambda network: int(network.network_address)).network_address),
+        end_ip=str(max(networks, key=lambda network: int(network.broadcast_address)).broadcast_address),
+        customer_name=(assigned.organization_name or assigned.customer_name) if assigned else str(cst_status_from_payload_value(payload, "organizationName") or ""),
+        customer_id=assigned.organization_id if assigned else str(cst_status_from_payload_value(payload, "organizationId") or ""),
+        service_id=assigned.service_id if assigned else str(cst_status_from_payload_value(payload, "serviceId") or ""),
+        transaction_id=composite.item.container_transaction_id,
+        assignment_status_id=status_id,
+        assignment_status=assignment_status_id_name(status_id),
+        validation_status="INVALID" if blocked else "VALID",
+        validation_errors=[composite.item.reason] if blocked else [],
+        source_entity_type="composite",
+        created_at=str(composite.rows[0]["first_used_at"] or ""),
+        eligible=not blocked,
+        reason=composite.item.reason,
+        composite_type=composite.label,
+        steps=composite.item.operations,
+    )
+
+
+def cst_status_from_payload_value(value: object, key: str) -> object:
+    if isinstance(value, dict):
+        if key in value:
+            return value[key]
+        for item in value.values():
+            found = cst_status_from_payload_value(item, key)
+            if found not in (None, ""):
+                return found
+    elif isinstance(value, list):
+        for item in value:
+            found = cst_status_from_payload_value(item, key)
+            if found not in (None, ""):
+                return found
+    return None
 
 
 def cst_migration_resource_operations(
@@ -8074,6 +8284,17 @@ def create_cst_migration_job_from_review(request: CstMigrationReviewCreateReques
             validation_status="all",
         )
         candidate_uuids = {resource.resource_uuid for resource in cst_partial_reassignment_candidates(connection)}
+        composites_by_key = {composite.key: composite for composite in cst_composites(connection)}
+        selected_composites: list[CstComposite] = []
+        for review_id in [item for item in included_ids if item.startswith(CST_COMPOSITE_PREFIX)]:
+            composite = composites_by_key.get(review_id)
+            if composite is None:
+                rejected.append(CstMigrationReviewRejectedItem(review_id=review_id, operation="COMPOSITE", reason="No longer pending (already sent or changed); refresh the review"))
+            elif not composite.operations:
+                rejected.append(CstMigrationReviewRejectedItem(review_id=review_id, cidr=composite.item.container_cidr, operation=composite.kind, reason=composite.item.reason))
+            else:
+                selected_composites.append(composite)
+        included_ids = [item for item in included_ids if not item.startswith(CST_COMPOSITE_PREFIX)]
         if request.resource_scope == "assigned":
             current_items = cst_assignment_review_items_for_ids(connection, included_ids)
             for review_id in included_ids:
@@ -8111,7 +8332,7 @@ def create_cst_migration_job_from_review(request: CstMigrationReviewCreateReques
             operations.append((resource, operation))
             review_id_by_resource[resource.resource_uuid] = review_id
         partial_reassignments: list[CstPartialReassignmentGroup] = []
-        if operations:
+        if operations or selected_composites:
             sends = [resource for resource, operation in operations if operation == "SEND"]
             outcome = cst_send_resources(
                 connection,
@@ -8120,6 +8341,7 @@ def create_cst_migration_job_from_review(request: CstMigrationReviewCreateReques
                 queue_only=True,
                 extra_operations=[(resource, operation) for resource, operation in operations if operation != "SEND"],
                 exempt_uuids={resource.resource_uuid for resource in sends},
+                composites=selected_composites,
             )
             jobs = outcome.jobs
             partial_reassignments = outcome.groups
@@ -8145,7 +8367,7 @@ def create_cst_migration_job_from_review(request: CstMigrationReviewCreateReques
         )
         message = (
             f"Migration job {batch_id} created with {len(jobs)} transaction(s)"
-            + (f", including {sum(1 for group in partial_reassignments if group.status == 'CREATED')} partial reassignment(s) (UpdateLIR to Unassigned if assigned, DeleteLIR, SendLIR)" if any(group.status == "CREATED" for group in partial_reassignments) else "")
+            + (f", including {sum(1 for group in partial_reassignments if group.status == 'CREATED')} composite transaction(s) (partial reassignment / assignment release) that run their steps in order" if any(group.status == "CREATED" for group in partial_reassignments) else "")
             + "."
         ) if batch_id else "No CST migration job was created because all selected transactions were rejected."
         return CstMigrationReviewCreateResult(
@@ -8185,6 +8407,7 @@ def create_manual_cst_migration_job(payload: CstManualMigrationRequest | None = 
                 extra_operations=deletes,
                 exempt_uuids={resource.resource_uuid for resource in sends},
                 ignore_ledger_resource_uuids={resource.resource_uuid for resource, _operation in deletes},
+                composites=[composite for composite in cst_composites(connection) if composite.kind == CST_COMPOSITE_RELEASE],
             )
             jobs = outcome.jobs
             batch_id = outcome.plain_batch_id
@@ -10067,6 +10290,11 @@ def unassign_assignment_record(connection: sqlite3.Connection, assignment: Assig
     in_cst = cst_resource_reported_to_cst(connection, resource) and not cst_resource_deleted_from_cst(connection, resource)
     audit_new_value = "Released; subnet removed locally (not held in CST)"
 
+    if in_cst and cst_controlled_sync(connection):
+        # Controlled sync: no batch per release; the CST record shows up in Create Migration Job as an
+        # "Assignment release" row (UpdateLIR to Unassigned if assigned, then DeleteLIR).
+        in_cst = False
+        audit_new_value = f"Released locally; CST release of Transaction ID {resource.transaction_id if resource else ''} waits for a migration job (auto-execute is off)"
     if in_cst:
         connection.execute(
             "UPDATE assignments SET status = ?, action_flag = ? WHERE id = ?",
@@ -10172,6 +10400,10 @@ def process_assignment_release_bulk(csv_text: object, dry_run: bool = False) -> 
                         assert_resource_can_change(connection, "assignment", assignment.id)
                     status = "WOULD_RELEASE"
                     message = ("Would send " + cst_steps if cst_required else "Not held in CST; no CST call") + " and remove the subnet locally"
+                elif cst_required and cst_controlled_sync(connection):
+                    unassign_assignment_record(connection, assignment, materialize=False)
+                    status = "RELEASED"
+                    message = f"Released locally; CST UpdateLIR to Unassigned and DeleteLIR (Transaction ID {transaction_id}) wait in Create Migration Job as an Assignment release row"
                 else:
                     unassign_assignment_record(connection, assignment, materialize=False)
                     status = "RELEASED"
