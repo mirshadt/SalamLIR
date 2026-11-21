@@ -594,7 +594,7 @@ This keeps business assignment data fresh before business hours and reduces load
 | `GET` | `/assignments` | List assignments |
 | `POST` | `/assignments` | Create assignment |
 | `POST` | `/assignments/bulk` | Bulk assignment import |
-| `POST` | `/assignments/bulk-delete` | Bulk release assignments by CIDR or assignmentId (`dry_run: true` previews without changes). Use with `/assignments/bulk` for two-step reassignment. |
+| `POST` | `/assignments/bulk-release` | Bulk release subnets from their customer/service by CIDR or assignmentId (`dry_run: true` previews without changes). The subnet is kept as AVAILABLE with the same resource UUID; the previous version is archived to `ip_resource_history`. Use with `/assignments/bulk` for two-step reassignment. |
 | `PATCH` | `/assignments/{assignment_id}/status` | Suspend/resume/retire assignment |
 | `DELETE` | `/assignments/{assignment_id}` | Release assignment |
 

@@ -338,7 +338,7 @@ const CST_BULK_ASSIGNMENT_TEMPLATE = [
   "BUSINESS,5.42.224.0/30,,,4,3,2026-06-03,Example Enterprise,Example Enterprise LLC,1010112916,1010112916,,2,CORP,LAN1,14,41,Primary Contact,+966501234567,1234567890,contact@example.com,Primary Contact,+966501234567,contact@example.com,CUST-10001,SVC-10001,Enterprise L3 service,1,Business Customer,Customer L3 service,Riyadh HQ,Riyadh,Riyadh,Ready business example",
   "INTERNAL,5.42.224.4/30,,,4,2,2026-06-03,,,,,,,,,,,,,,,,,,,,Internal firewall management,,,,,,,Ready internal example"
 ].join("\n");
-const BULK_DELETE_ASSIGNMENT_TEMPLATE = [
+const BULK_RELEASE_ASSIGNMENT_TEMPLATE = [
   "cidr,assignmentId,customerName,serviceId,reason",
   "87.101.152.0/30,,Example Customer,SVC-1,Migration cleanup"
 ].join("\n");
@@ -937,8 +937,8 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   const [ripeReportStatus, setRipeReportStatus] = useState<"idle" | "running" | "complete">("idle");
   const [bulkPoolFileName, setBulkPoolFileName] = useState("");
   const [bulkAssignmentFileName, setBulkAssignmentFileName] = useState("");
-  const [bulkDeleteCsv, setBulkDeleteCsv] = useState("");
-  const [bulkDeleteFileName, setBulkDeleteFileName] = useState("");
+  const [bulkReleaseCsv, setBulkReleaseCsv] = useState("");
+  const [bulkReleaseFileName, setBulkReleaseFileName] = useState("");
   const [newUser, setNewUser] = useState({ username: "", password: "", role: "operator" as User["role"] });
   const [passwordReset, setPasswordReset] = useState({ userId: "", password: "" });
   const [confirm, setConfirm] = useState<{ title: string; detail: string; action: () => void; destructive?: boolean } | null>(null);
@@ -1831,17 +1831,17 @@ ${errorMessage(error)}`
                   const { data } = await api.post<BulkBatch>("/assignments/bulk", { csv_text: bulkAssignmentCsv, file_name: bulkAssignmentFileName, allow_conflicts: bulkAssignmentAllowConflicts }, { timeout: 15 * 60 * 1000 });
                   setNotice({ title: "Bulk transaction started", detail: `${data.id} is processing ${data.total_rows} assignment rows. Track status in Bulk Transaction History.` });
                 })}
-                deleteCsv={bulkDeleteCsv}
-                deleteFileName={bulkDeleteFileName}
-                onDeleteCsv={setBulkDeleteCsv}
-                onDeleteFileName={setBulkDeleteFileName}
-                onDeleteAssignments={(dryRun) => run(async () => {
-                  const rows = bulkDeleteCsv.split(/\r?\n/).filter(Boolean).length - 1;
-                  if (!dryRun && !window.confirm(`Release ${rows} assignment(s) to the free pool? Assignments already reported to CST will be set to Unassigned in CST. Run Preview first if you have not.`)) {
+                releaseCsv={bulkReleaseCsv}
+                releaseFileName={bulkReleaseFileName}
+                onReleaseCsv={setBulkReleaseCsv}
+                onReleaseFileName={setBulkReleaseFileName}
+                onReleaseAssignments={(dryRun) => run(async () => {
+                  const rows = bulkReleaseCsv.split(/\r?\n/).filter(Boolean).length - 1;
+                  if (!dryRun && !window.confirm(`Release ${rows} subnet(s) from their customer/service? The subnets are kept as available. Assignments already reported to CST will be set to Unassigned in CST. Run Preview first if you have not.`)) {
                     return;
                   }
-                  const { data } = await api.post<BulkBatch>("/assignments/bulk-delete", { csv_text: bulkDeleteCsv, file_name: bulkDeleteFileName, dry_run: dryRun }, { timeout: 15 * 60 * 1000 });
-                  setNotice({ title: dryRun ? "Bulk delete preview started" : "Bulk delete started", detail: `${data.id} is processing ${data.total_rows} rows${dryRun ? " without changing data" : ""}. Open Details in Bulk Transaction History for per-row results.` });
+                  const { data } = await api.post<BulkBatch>("/assignments/bulk-release", { csv_text: bulkReleaseCsv, file_name: bulkReleaseFileName, dry_run: dryRun }, { timeout: 15 * 60 * 1000 });
+                  setNotice({ title: dryRun ? "Bulk release preview started" : "Bulk release started", detail: `${data.id} is processing ${data.total_rows} rows${dryRun ? " without changing data" : ""}. Open Details in Bulk Transaction History for per-row results.` });
                   void bulkBatchesQuery.refetch();
                 })}
               />
@@ -4060,11 +4060,11 @@ function BulkOperations(props: {
   onRefresh: () => void;
   onImportPools: () => void;
   onImportAssignments: () => void;
-  deleteCsv: string;
-  deleteFileName: string;
-  onDeleteCsv: (value: string) => void;
-  onDeleteFileName: (value: string) => void;
-  onDeleteAssignments: (dryRun: boolean) => void;
+  releaseCsv: string;
+  releaseFileName: string;
+  onReleaseCsv: (value: string) => void;
+  onReleaseFileName: (value: string) => void;
+  onReleaseAssignments: (dryRun: boolean) => void;
 }) {
   function loadCsv(file: File | undefined, onLoad: (value: string) => void, onFileName: (value: string) => void, normalize?: (value: string) => string) {
     if (!file) {
@@ -4175,30 +4175,30 @@ function BulkOperations(props: {
         </Card>
         <Card>
           <CardHeader>
-            <CardTitle>Bulk Delete: Assignments</CardTitle>
-            <CardDescription>Release assignments back to the free pool. For a reassignment, run this delete first, then import the new assignment.</CardDescription>
+            <CardTitle>Bulk Release: Assignments</CardTitle>
+            <CardDescription>Release subnets from their customer/service. The subnet is kept as available with its UUID and history. For a reassignment, run this release first, then import the new assignment.</CardDescription>
           </CardHeader>
           <CardContent className="grid gap-3">
             <input
               className="block w-full rounded-md border bg-muted/40 px-3 py-2 text-sm"
               type="file"
               accept=".csv,text/csv"
-              onChange={(event) => loadCsv(event.target.files?.[0], props.onDeleteCsv, props.onDeleteFileName)}
+              onChange={(event) => loadCsv(event.target.files?.[0], props.onReleaseCsv, props.onReleaseFileName)}
             />
             <p className="text-sm text-muted-foreground">
-              {props.deleteCsv ? `${props.deleteCsv.split(/\r?\n/).filter(Boolean).length - 1} data rows loaded${props.deleteFileName ? ` from ${props.deleteFileName}` : ""}` : "No file loaded"}
+              {props.releaseCsv ? `${props.releaseCsv.split(/\r?\n/).filter(Boolean).length - 1} data rows loaded${props.releaseFileName ? ` from ${props.releaseFileName}` : ""}` : "No file loaded"}
             </p>
             <div className="rounded-md border bg-muted/20 p-3">
               <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
                 <div>
-                  <p className="text-sm font-semibold">Delete template</p>
+                  <p className="text-sm font-semibold">Release template</p>
                   <p className="text-xs text-muted-foreground">cidr is required (or assignmentId when a CIDR has duplicates). customerName and serviceId are optional safety checks: the row is rejected if they do not match. Each row is independent; a CST failure leaves that assignment unchanged.</p>
                 </div>
                 <div className="flex flex-wrap gap-2">
-                  <Button size="sm" variant="outline" onClick={() => { props.onDeleteCsv(BULK_DELETE_ASSIGNMENT_TEMPLATE); props.onDeleteFileName("bulk-delete-assignment-template.csv"); }}>
+                  <Button size="sm" variant="outline" onClick={() => { props.onReleaseCsv(BULK_RELEASE_ASSIGNMENT_TEMPLATE); props.onReleaseFileName("bulk-release-assignment-template.csv"); }}>
                     Load Template
                   </Button>
-                  <Button size="sm" variant="outline" onClick={() => downloadBlob(`bulk-delete-assignment-template-${today()}.csv`, "text/csv;charset=utf-8", BULK_DELETE_ASSIGNMENT_TEMPLATE)}>
+                  <Button size="sm" variant="outline" onClick={() => downloadBlob(`bulk-release-assignment-template-${today()}.csv`, "text/csv;charset=utf-8", BULK_RELEASE_ASSIGNMENT_TEMPLATE)}>
                     <FileDown className="h-4 w-4" />
                     Download Template
                   </Button>
@@ -4206,11 +4206,11 @@ function BulkOperations(props: {
               </div>
             </div>
             <div className="flex flex-wrap gap-2">
-              <Button variant="outline" className="w-fit" onClick={() => props.onDeleteAssignments(true)} disabled={!props.deleteCsv.trim()}>
+              <Button variant="outline" className="w-fit" onClick={() => props.onReleaseAssignments(true)} disabled={!props.releaseCsv.trim()}>
                 Preview (Dry Run)
               </Button>
-              <Button variant="destructive" className="w-fit" onClick={() => props.onDeleteAssignments(false)} disabled={!props.deleteCsv.trim()}>
-                Delete Assignments
+              <Button variant="destructive" className="w-fit" onClick={() => props.onReleaseAssignments(false)} disabled={!props.releaseCsv.trim()}>
+                Release Assignments
               </Button>
             </div>
           </CardContent>
@@ -4349,11 +4349,11 @@ function bulkOperationLabel(value: string) {
   if (value === "ASSIGNMENT_IMPORT") {
     return "Assignments / Reservations";
   }
-  if (value === "ASSIGNMENT_DELETE") {
-    return "Assignment Delete";
+  if (value === "ASSIGNMENT_RELEASE") {
+    return "Assignment Release";
   }
-  if (value === "ASSIGNMENT_DELETE_PREVIEW") {
-    return "Assignment Delete (Preview)";
+  if (value === "ASSIGNMENT_RELEASE_PREVIEW") {
+    return "Assignment Release (Preview)";
   }
   return value;
 }
@@ -6965,6 +6965,8 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[], persis
   const persistedCstStatus = (resource: ResourceRecord | null, fallback: CstSyncStatus) => resource?.cst_sync_status ? normalizeCstSyncStatus(resource.cst_sync_status) : fallback;
   const persistedSuccessfulFreeFragment = (cidr: string) => persistedByCidr.get(cidr)?.find((resource) => resource.source_entity_type === "bulk_unassigned_fragment" && ["SUCCESS", "SYNCHRONIZED"].includes(normalizeCstSyncStatus(resource.cst_sync_status))) ?? null;
   const persistedFreeFragments = persistedResources.filter((resource) => resource.source_entity_type === "bulk_unassigned_fragment");
+  // Subnets released from a customer/service keep their own CIDR; they occupy space in client-side free-range calculation.
+  const releasedSubnets = persistedFreeFragments.filter((resource) => String(resource.source_entity_id || "").startsWith("released:") && resource.status !== "RETIRED");
   const persistedFreeFragmentCidrs = new Set(persistedFreeFragments.map((resource) => resource.cidr));
   const persistedRipeStatus = (value: string | undefined | null, fallback: RipeSyncStatus): RipeSyncStatus => {
     const normalized = String(value || fallback).trim().toUpperCase();
@@ -7078,7 +7080,7 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[], persis
     const poolResourceUuid = resourceUuid("pool", pool.id, pool.cidr);
     const persistedPoolResource = persistedFor(poolResourceUuid, "pool", pool.id, pool.cidr);
     const poolHasMaterializedFragments = persistedPoolResource
-      ? persistedFreeFragments.some((fragment) => fragment.root_pool_uuid === persistedPoolResource.resource_uuid || fragment.parent_resource_uuid === persistedPoolResource.resource_uuid)
+      ? persistedFreeFragments.some((fragment) => !releasedSubnets.includes(fragment) && (fragment.root_pool_uuid === persistedPoolResource.resource_uuid || fragment.parent_resource_uuid === persistedPoolResource.resource_uuid))
       : false;
     const poolMaintainer = persistedPoolResource?.maintainer || resourceMaintainerFromPool(pool);
     const poolOwner = persistedPoolResource?.owner || ipResourceOwnerFromMaintainer(poolMaintainer);
@@ -7215,7 +7217,7 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[], persis
     }
 
     if (poolStatus !== "RETIRED" && poolStatus !== "HISTORICAL" && !poolHasMaterializedFragments) {
-      for (const range of calculateContinuousFreeRanges(pool, occupyingAssignments)) {
+      for (const range of calculateContinuousFreeRanges(pool, [...occupyingAssignments, ...releasedSubnets.map((released) => ({ cidr: released.cidr }) as Assignment)])) {
         for (const block of rangeToCidrs(range.start, range.end)) {
           if (block.cidr === pool.cidr) {
             continue;

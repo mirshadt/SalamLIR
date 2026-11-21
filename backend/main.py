@@ -74,6 +74,9 @@ BACKEND_LOG_PATH = Path(os.environ.get("BACKEND_LOG_FILE") or Path(__file__).wit
 BACKEND_LOG_LEVEL = os.environ.get("BACKEND_LOG_LEVEL", "INFO").strip().upper()
 CST_LOG_SENSITIVE_KEYS = {"authorization", "x-gateway-apikey", "apikey", "api_key", "access_token", "token", "refresh_token", "client_secret", "password"}
 BULK_UNASSIGNED_FRAGMENT_SOURCE = "bulk_unassigned_fragment"
+# Free-fragment resources whose source_entity_id starts with this prefix are subnets released from a
+# customer/service. They keep their own CIDR and resource UUID instead of being merged into larger free blocks.
+RELEASED_SUBNET_SOURCE_PREFIX = "released:"
 AUDIT_SERVICE = AuditService(lambda: now_iso())
 
 
@@ -3340,6 +3343,14 @@ def active_public_assignment_networks_all(connection: sqlite3.Connection) -> lis
     return networks
 
 
+def active_assignment_networks_any(connection: sqlite3.Connection) -> list[IPv4Network]:
+    return [
+        network_of(assignment)
+        for assignment in (assignment_from_row(row) for row in connection.execute("SELECT * FROM assignments").fetchall())
+        if assignment_active_for_conflict(assignment)
+    ]
+
+
 def materialize_bulk_unassigned_fragments(connection: sqlite3.Connection) -> tuple[int, int]:
     roots = top_level_public_pool_resources(connection)
     active_assignment_networks = active_public_assignment_networks_all(connection)
@@ -3354,9 +3365,25 @@ def materialize_bulk_unassigned_fragments(connection: sqlite3.Connection) -> tup
 
     desired: dict[str, ResourceRecord] = {}
     existing_fragment_uuids: set[str] = set()
+    released_networks: list[IPv4Network] = []
+    occupied_any = active_assignment_networks_any(connection)
+    for row in connection.execute(
+        "SELECT * FROM ip_resources WHERE source_entity_type = ? AND source_entity_id LIKE ? AND status != 'RETIRED'",
+        (BULK_UNASSIGNED_FRAGMENT_SOURCE, f"{RELEASED_SUBNET_SOURCE_PREFIX}%"),
+    ).fetchall():
+        released = resource_from_row(row)
+        released_network = normalize_network(released.cidr)
+        if any(released_network.overlaps(network) for network in occupied_any):
+            # A new assignment now uses part or all of this released subnet: let the free space be re-fragmented.
+            archive_ip_resource(connection, released.resource_uuid, "RELEASED_SUBNET_REUSED")
+            continue
+        released_networks.append(released_network)
+        existing_fragment_uuids.add(released.resource_uuid)
+        desired[released.resource_uuid] = released
+
     for root in roots:
         root_network = normalize_network(root.cidr)
-        assigned_networks = [network for network in active_assignment_networks if network.subnet_of(root_network)]
+        assigned_networks = [network for network in [*active_assignment_networks, *released_networks] if network.subnet_of(root_network)]
         if not assigned_networks:
             continue
         for fragment in subtract_allocated_networks(root_network, assigned_networks):
@@ -8115,10 +8142,10 @@ def run_bulk_batch(batch_id: str, operation_type: str, csv_text: str, allocated_
                 result = process_pool_bulk(csv_text, allocated_pool=allocated_pool)
             elif operation_type == "ASSIGNMENT_IMPORT":
                 result = process_assignment_bulk(csv_text, allow_conflicts=allow_conflicts)
-            elif operation_type == "ASSIGNMENT_DELETE":
-                result = process_assignment_delete_bulk(csv_text)
-            elif operation_type == "ASSIGNMENT_DELETE_PREVIEW":
-                result = process_assignment_delete_bulk(csv_text, dry_run=True)
+            elif operation_type == "ASSIGNMENT_RELEASE":
+                result = process_assignment_release_bulk(csv_text)
+            elif operation_type == "ASSIGNMENT_RELEASE_PREVIEW":
+                result = process_assignment_release_bulk(csv_text, dry_run=True)
             else:
                 raise ValueError(f"Unsupported bulk operation type: {operation_type}")
         complete_bulk_batch(batch_id, result, started)
@@ -9541,8 +9568,40 @@ def unassign(assignment_id: str) -> None:
         unassign_assignment_record(connection, assignment)
 
 
+def released_subnet_resource(resource: ResourceRecord, assignment: Assignment, cst_reported: bool) -> ResourceRecord:
+    """The same subnet (same resource UUID and CIDR) with the customer/service link removed."""
+    timestamp = now_iso()
+    released_by = assignment.customer_name or assignment.internal_application_name or assignment.assignment_name or assignment.id
+    return cst_unassigned_update_resource(resource).model_copy(update={
+        "version_uuid": new_version_uuid(),
+        "service_id": "",
+        "region_id": resource.region_id,
+        "access_technology_id": "",
+        "access_technology": "",
+        "description": f"Released from {released_by} on {timestamp[:10]}",
+        "action_flag": "U" if cst_reported else "N",
+        "cst_sync_status": resource.cst_sync_status if cst_reported else ("PENDING" if resource.ip_type == "PUBLIC" else "NOT_REQUIRED"),
+        "cst_sync_ready": True,
+        "cst_validation_status": "READY",
+        "cst_validation_errors": "",
+        "cst_validation_warnings": "",
+        "migration_conflict_status": "",
+        "migration_conflict_reason": "",
+        "migration_conflict_group": "",
+        "update_date": timestamp[:10],
+        "updated_at": timestamp,
+        "source_entity_type": BULK_UNASSIGNED_FRAGMENT_SOURCE,
+        "source_entity_id": f"{RELEASED_SUBNET_SOURCE_PREFIX}{assignment.id}",
+    })
+
+
 def unassign_assignment_record(connection: sqlite3.Connection, assignment: Assignment, materialize: bool = True) -> bool:
-    """Release one assignment. Returns True when a CST unassign update was sent.
+    """Release one assignment from its customer/service. Returns True when a CST unassign update was sent.
+
+    The subnet itself is kept: its ip_resources row (same resource UUID and CIDR) becomes an
+    AVAILABLE, unassigned (assignmentStatusId 1) subnet, and the previous version is archived to
+    ip_resource_history. Only the assignment and its customer/service details are removed.
+    Retired resources keep the old behaviour and are deleted.
 
     Raises HTTPException on any blocking condition; the caller's connection context
     rolls the row back so a failed CST update never leaves a half-released CIDR.
@@ -9550,13 +9609,14 @@ def unassign_assignment_record(connection: sqlite3.Connection, assignment: Assig
     assignment_id = assignment.id
     resource = find_resource_by_source(connection, "assignment", assignment_id)
     cst_delete_required = cst_resource_reported_to_cst(connection, resource)
-    if resource and resource.status == "RETIRED":
+    retired = bool(resource and resource.status == "RETIRED")
+    if retired:
         audit_action = "Retired Resource Deletion" if not cst_delete_required else "CST Assignment Status Update"
         audit_new_value = "Deleted retired resource" if not cst_delete_required else "Set CST LIR assignmentStatusId to 1 Unassigned and released locally"
     else:
         assert_resource_can_change(connection, "assignment", assignment_id)
         audit_action = "Subnet Release"
-        audit_new_value = "Released to free pool"
+        audit_new_value = "Released from customer/service; subnet kept as available"
 
     if cst_delete_required:
         connection.execute(
@@ -9568,14 +9628,20 @@ def unassign_assignment_record(connection: sqlite3.Connection, assignment: Assig
         jobs = create_cst_sync_jobs(connection, [(cst_unassigned_update_resource(resource), "UPDATE")], "ASSIGNMENT_UNASSIGN")
         assert_cst_business_flow_succeeded(jobs, "Unassign")
         audit_action = "CST Assignment Status Update"
-        audit_new_value = "Set CST LIR assignmentStatusId to 1 Unassigned and released locally"
+        audit_new_value = "Set CST LIR assignmentStatusId to 1 Unassigned; subnet kept as available"
 
     result = connection.execute("DELETE FROM assignments WHERE id = ?", (assignment_id,))
     if result.rowcount == 0:
         raise HTTPException(status_code=404, detail="Assignment not found")
     if resource:
         connection.execute("DELETE FROM assignment_details WHERE resource_uuid = ?", (resource.resource_uuid,))
-        connection.execute("DELETE FROM ip_resources WHERE resource_uuid = ?", (resource.resource_uuid,))
+        if retired:
+            connection.execute("DELETE FROM ip_resources WHERE resource_uuid = ?", (resource.resource_uuid,))
+        else:
+            # Re-read: a CST job may have updated sync status on the row.
+            current = find_resource_by_source(connection, "assignment", assignment_id) or resource
+            archive_ip_resource(connection, current.resource_uuid, "ASSIGNMENT_RELEASED")
+            upsert_resource_record(connection, released_subnet_resource(current, assignment, cst_delete_required))
     if materialize:
         materialize_bulk_unassigned_fragments(connection)
     record_audit(connection, audit_action, "assignment", assignment_id, assignment.model_dump_json(), audit_new_value)
@@ -9583,7 +9649,7 @@ def unassign_assignment_record(connection: sqlite3.Connection, assignment: Assig
 
 
 
-def bulk_delete_target(connection: sqlite3.Connection, row: dict[str, str]) -> Assignment:
+def bulk_release_target(connection: sqlite3.Connection, row: dict[str, str]) -> Assignment:
     """Resolve the assignment a bulk-delete row points at, with safety checks."""
     assignment_id = csv_value(row, "assignmentId", "assignment_id", "id")
     cidr_text = csv_value(row, "cidr")
@@ -9617,8 +9683,8 @@ def bulk_delete_target(connection: sqlite3.Connection, row: dict[str, str]) -> A
     return assignment
 
 
-def process_assignment_delete_bulk(csv_text: object, dry_run: bool = False) -> BulkImportResult:
-    """Bulk unassign. Each row is its own transaction: one failure never blocks the others."""
+def process_assignment_release_bulk(csv_text: object, dry_run: bool = False) -> BulkImportResult:
+    """Bulk release from customer/service; subnets are kept. Each row is its own transaction."""
     deleted = 0
     errors: list[str] = []
     output_rows: list[BulkOutputRow] = []
@@ -9632,7 +9698,7 @@ def process_assignment_delete_bulk(csv_text: object, dry_run: bool = False) -> B
             if row_key in seen_ids:
                 raise HTTPException(status_code=409, detail=f"{row_key} is listed more than once in this file")
             with connect() as connection:
-                assignment = bulk_delete_target(connection, row)
+                assignment = bulk_release_target(connection, row)
                 if assignment.id in seen_ids or assignment.cidr in seen_ids:
                     raise HTTPException(status_code=409, detail=f"{assignment.cidr} is listed more than once in this file")
                 seen_ids.update({row_key, assignment.id, assignment.cidr})
@@ -9641,15 +9707,15 @@ def process_assignment_delete_bulk(csv_text: object, dry_run: bool = False) -> B
                 if dry_run:
                     if not (resource and resource.status == "RETIRED"):
                         assert_resource_can_change(connection, "assignment", assignment.id)
-                    status = "WOULD_DELETE"
-                    message = "Would release to free pool" + (" and send CST unassign (status 1)" if cst_required else "; no CST update needed")
+                    status = "WOULD_RELEASE"
+                    message = "Would release from customer/service (subnet kept as available)" + (" and send CST unassign (status 1)" if cst_required else "; no CST update needed")
                 else:
                     unassign_assignment_record(connection, assignment, materialize=False)
-                    status = "DELETED"
-                    message = "Released to free pool" + ("; CST set to Unassigned" if cst_required else "")
+                    status = "RELEASED"
+                    message = "Released from customer/service; subnet kept as available" + ("; CST set to Unassigned" if cst_required else "")
                     reason = csv_value(row, "reason", "notes")
                     if reason:
-                        record_audit(connection, "Bulk Assignment Delete Reason", "assignment", assignment.id, "", reason)
+                        record_audit(connection, "Bulk Assignment Release Reason", "assignment", assignment.id, "", reason)
             deleted += 1
             output_rows.append(
                 BulkOutputRow(
@@ -9696,9 +9762,9 @@ def process_assignment_delete_bulk(csv_text: object, dry_run: bool = False) -> B
     return BulkImportResult(imported=deleted, blocked=len(errors), errors=errors, output_rows=output_rows)
 
 
-@app.post("/assignments/bulk-delete", response_model=BulkBatch, status_code=202)
-def bulk_delete_assignments(payload: BulkCsvRequest, background_tasks: BackgroundTasks) -> BulkBatch:
-    operation_type = "ASSIGNMENT_DELETE_PREVIEW" if payload.dry_run else "ASSIGNMENT_DELETE"
+@app.post("/assignments/bulk-release", response_model=BulkBatch, status_code=202)
+def bulk_release_assignments(payload: BulkCsvRequest, background_tasks: BackgroundTasks) -> BulkBatch:
+    operation_type = "ASSIGNMENT_RELEASE_PREVIEW" if payload.dry_run else "ASSIGNMENT_RELEASE"
     batch = create_bulk_batch(operation_type, payload)
     background_tasks.add_task(run_bulk_batch, batch.id, batch.operation_type, payload.csv_text)
     return batch
