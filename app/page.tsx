@@ -333,6 +333,12 @@ const SEARCH_FILTER_FIELDS: Array<{ value: SearchFilterField; label: string; mod
 ];
 
 
+// Same layout as scripts/templates/new_ip_assignment_iptool_template.csv (IP Tool export + CST columns).
+const NEW_IP_ASSIGNMENT_TEMPLATE = [
+  "Ip Address,Order Number,Product Type,CustomerSpecific,ProductClass,CustomerName,CustomerNumber,CustomerType,Subnet Type,Number of IpAddress,Status,Subnet Mask,Category,Previous CustomerNumber,Previous CustomerName,CR Number,Unified Number,Contact Name,Mobile Number,Email,ID Number,City,Region,Assignment Date",
+  "87.101.192.16,11211621,BDI,,BDI(1:1),Example Customer Company,33945,CORP,LAN1,8,Reserved,255.255.255.248,New IP,,,1010123456,7001234567,Network Contact,0501234567,noc@example.com,1012345678,Riyadh,Riyadh,2026-11-21"
+].join("\n");
+
 const CST_BULK_ASSIGNMENT_TEMPLATE = [
   "assignmentType,cidr,startIp,endIp,size,status,assignmentDate,customerName,organizationName,organizationId,commercialRegId,unifiedNumber,customerTypeId,customerType,subnetType,productClass,regionId,cityId,fullName,mobileNumber,idNumber,email,contactName,contactNumber,contactEmail,customerId,serviceId,serviceDescription,accessTechnologyId,owner,assignmentPurpose,site,city,region,notes",
   "BUSINESS,5.42.224.0/30,,,4,3,2026-06-03,Example Enterprise,Example Enterprise LLC,1010112916,1010112916,,2,CORP,LAN1,14,41,Primary Contact,+966501234567,1234567890,contact@example.com,Primary Contact,+966501234567,contact@example.com,CUST-10001,SVC-10001,Enterprise L3 service,1,Business Customer,Customer L3 service,Riyadh HQ,Riyadh,Riyadh,Ready business example",
@@ -882,7 +888,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   const [bulkPoolCsv, setBulkPoolCsv] = useState(BULK_SUBNET_TEMPLATE);
   const [bulkPoolAllocated, setBulkPoolAllocated] = useState(false);
   const [bulkAssignmentAllowConflicts, setBulkAssignmentAllowConflicts] = useState(false);
-  const [bulkAssignmentCsv, setBulkAssignmentCsv] = useState(CST_BULK_ASSIGNMENT_TEMPLATE);
+  const [bulkAssignmentCsv, setBulkAssignmentCsv] = useState(NEW_IP_ASSIGNMENT_TEMPLATE);
   const [ripeConfigForm, setRipeConfigForm] = useState<RipeConfigPayload>({ base_url: "https://rest.db.ripe.net", auth_type: "Basic Authentication", username: "", password: "", connection_timeout: 10, read_timeout: 30, default_maintainer: "ITC-NOC-MNT" });
   const [siebelConfigForm, setSiebelConfigForm] = useState<SiebelConfigPayload>({ username: "LIR_USER", password: "", dsn: "172.31.23.101:1525/SIDB", connection_timeout: 10, query_sql: DEFAULT_SIEBEL_QUERY });
   const [databaseConnectionForm, setDatabaseConnectionForm] = useState<DatabaseConnectionPayload>({ host: "localhost", port: 5432, database: "lir", username: "lir_app", password: "", ssl_mode: "prefer", connect_timeout: 10 });
@@ -4149,16 +4155,23 @@ function BulkOperations(props: {
             <div className="rounded-md border bg-muted/20 p-3">
               <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
                 <div>
-                  <p className="text-sm font-semibold">CST assignment data template</p>
-                  <p className="text-xs text-muted-foreground">Includes Business and Internal rows. Internal rows only need the assignment basics and serviceDescription; customer/contact/address fields are optional.</p>
+                  <p className="text-sm font-semibold">New IP assignment template</p>
+                  <p className="text-xs text-muted-foreground">IP Tool layout (Ip Address, Order Number, CustomerName, Subnet Mask, ...) plus CR Number, Unified Number, contact, City, Region and Assignment Date. It is converted on upload. In Excel, format Order Number, CR Number, Unified Number, Mobile Number and ID Number as Text. The CST format (assignmentType, cidr, ...) is still accepted.</p>
                 </div>
                 <div className="flex flex-wrap gap-2">
-                  <Button size="sm" variant="outline" onClick={() => { props.onAssignmentCsv(CST_BULK_ASSIGNMENT_TEMPLATE); props.onAssignmentFileName("cst-lir-assignment-template.csv"); }}>
-                    Load CST Template
+                  <Button size="sm" variant="outline" onClick={() => { props.onAssignmentCsv(NEW_IP_ASSIGNMENT_TEMPLATE); props.onAssignmentFileName("new-ip-assignment-template.csv"); }}>
+                    Load Template
                   </Button>
-                  <Button size="sm" variant="outline" onClick={() => downloadBlob(`cst-lir-assignment-template-${today()}.csv`, "text/csv;charset=utf-8", CST_BULK_ASSIGNMENT_TEMPLATE)}>
+                  <Button size="sm" variant="outline" onClick={() => downloadBlob(`new-ip-assignment-template-${today()}.csv`, "text/csv;charset=utf-8", NEW_IP_ASSIGNMENT_TEMPLATE)}>
                     <FileDown className="h-4 w-4" />
                     Download Template
+                  </Button>
+                  <Button size="sm" variant="ghost" onClick={() => { props.onAssignmentCsv(CST_BULK_ASSIGNMENT_TEMPLATE); props.onAssignmentFileName("cst-lir-assignment-template.csv"); }}>
+                    Load CST Template
+                  </Button>
+                  <Button size="sm" variant="ghost" onClick={() => downloadBlob(`cst-lir-assignment-template-${today()}.csv`, "text/csv;charset=utf-8", CST_BULK_ASSIGNMENT_TEMPLATE)}>
+                    <FileDown className="h-4 w-4" />
+                    Download CST Format
                   </Button>
                 </div>
               </div>
@@ -8209,12 +8222,115 @@ function normalizePoolImportCsv(csvText: string) {
   );
 }
 
+const CST_IMPORT_COLUMNS = [
+  "assignmentType", "cidr", "size", "status", "assignmentDate", "customerName", "organizationName", "organizationId",
+  "commercialRegId", "unifiedNumber", "customerTypeId", "customerType", "subnetType", "productClass", "regionId", "cityId",
+  "fullName", "mobileNumber", "idNumber", "email", "contactName", "contactNumber", "contactEmail", "customerId", "serviceId",
+  "serviceDescription", "owner", "assignmentPurpose", "city", "region", "notes"
+];
+
+function isIpToolAssignmentLayout(row: Record<string, string>) {
+  return "ip address" in row && ("subnet mask" in row || "number of ipaddress" in row);
+}
+
+function maskToPrefix(mask: string) {
+  const bits = mask.split(".").map((part) => Number.parseInt(part, 10));
+  if (bits.length !== 4 || bits.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) {
+    return null;
+  }
+  const binary = bits.map((part) => part.toString(2).padStart(8, "0")).join("");
+  return /^1*0*$/.test(binary) ? binary.indexOf("0") === -1 ? 32 : binary.indexOf("0") : null;
+}
+
+/**
+ * New-IP template (IP Tool layout: Ip Address, Order Number, ..., Subnet Mask, CR Number, ...) converted to the
+ * CST import layout, the same mapping as scripts/generate_assignment_bulk_from_iptool_siebel.py --legacy-iptool-only.
+ */
+function convertIpToolAssignmentCsv(csvText: string) {
+  const rows = parseCsvRows(csvText).map(normalizeCsvRecord);
+  const tenDigits = (value: string) => (/^\d{10}$/.test(value.replace(/\D/g, "")) && value.replace(/\D/g, "").length === 10 ? value.replace(/\D/g, "") : "");
+  const output = rows.map((row, index) => {
+    const rowNumber = index + 2;
+    const ip = row["ip address"] ?? "";
+    const prefix = row["subnet mask"] ? maskToPrefix(row["subnet mask"]) : row["number of ipaddress"] ? 32 - Math.log2(Number.parseInt(row["number of ipaddress"], 10)) : null;
+    if (!ip || prefix === null || !Number.isInteger(prefix)) {
+      throw new Error(`row ${rowNumber}: Ip Address and a valid Subnet Mask (or Number of IpAddress) are required.`);
+    }
+    const cidr = `${ip}/${prefix}`;
+    const range = parseCidr(cidr);
+    if (numberToIp(range.start) !== ip) {
+      throw new Error(`row ${rowNumber}: ${cidr} is not aligned; the network address is ${numberToIp(range.start)}.`);
+    }
+    const declaredSize = Number.parseInt(row["number of ipaddress"] ?? "", 10);
+    if (Number.isInteger(declaredSize) && declaredSize !== range.size) {
+      throw new Error(`row ${rowNumber}: Number of IpAddress ${declaredSize} does not match ${cidr} (${range.size}).`);
+    }
+    const orderNumber = row["order number"] ?? "";
+    if (/^\s*\d+(\.\d+)?e\+?\d+\s*$/i.test(orderNumber)) {
+      throw new Error(`row ${rowNumber}: Order Number ${orderNumber} was shortened by Excel and its digits are lost. Format the Order Number column as Text and enter the full number.`);
+    }
+    if (!orderNumber) {
+      throw new Error(`row ${rowNumber}: Order Number is required (it becomes the CST serviceId).`);
+    }
+    const customerName = row["customername"] || row["customer name"] || "";
+    if (!customerName) {
+      throw new Error(`row ${rowNumber}: CustomerName is required.`);
+    }
+    const commercialRegId = tenDigits(row["cr number"] ?? "");
+    const unifiedNumber = tenDigits(row["unified number"] ?? "");
+    const contactName = row["contact name"] || "Business Contact";
+    const mobile = row["mobile number"] || "";
+    const email = row["email"] || "NA@NA.com";
+    const customerType = (row["customertype"] || row["customer type"] || "").toUpperCase();
+    const notes = [row["category"], row["previous customername"] ? `Previous customer: ${row["previous customername"]} (${row["previous customernumber"] || "-"})` : ""].filter(Boolean).join("; ");
+    const values: Record<string, string> = {
+      assignmentType: "BUSINESS",
+      cidr,
+      size: String(range.size),
+      status: "3",
+      assignmentDate: row["assignment date"] || today(),
+      customerName,
+      organizationName: customerName,
+      organizationId: commercialRegId || unifiedNumber,
+      commercialRegId,
+      unifiedNumber,
+      customerTypeId: ["GOV", "GOVERNMENT", "GOVERNMENTAL"].includes(customerType) ? "1" : "2",
+      customerType,
+      subnetType: row["subnet type"] || "",
+      productClass: row["productclass"] || row["product class"] || "",
+      regionId: "",
+      cityId: "",
+      fullName: contactName,
+      mobileNumber: mobile,
+      idNumber: tenDigits(row["id number"] ?? "") || "0000000000",
+      email,
+      contactName,
+      contactNumber: mobile,
+      contactEmail: email,
+      customerId: row["customernumber"] || row["customer number"] || "",
+      serviceId: orderNumber,
+      serviceDescription: row["product type"] || row["productclass"] || "",
+      owner: "Business Customer",
+      assignmentPurpose: row["product type"] || "",
+      city: row["city"] || "",
+      region: row["region"] || "",
+      notes: notes || "New IP assignment"
+    };
+    return CST_IMPORT_COLUMNS.map((column) => values[column] ?? "");
+  });
+  return buildSimpleCsv(CST_IMPORT_COLUMNS, output);
+}
+
 function normalizeAssignmentImportCsv(csvText: string) {
   const rows = parseCsvRows(csvText);
   if (!rows.length) {
     throw new Error("CSV file is empty.");
   }
   const firstRow = normalizeCsvRecord(rows[0]);
+  if (isIpToolAssignmentLayout(firstRow)) {
+    // Converted rows carry what the sheet has; the backend applies CST defaults and reports readiness per row.
+    return convertIpToolAssignmentCsv(csvText);
+  }
   const hasCidr = "cidr" in firstRow;
   const hasRange = "startip" in firstRow || "start_ip" in firstRow || "start" in firstRow || "endip" in firstRow || "end_ip" in firstRow || "end" in firstRow;
   if (!hasCidr && !hasRange) {

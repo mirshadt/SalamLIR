@@ -148,7 +148,9 @@ Assignment Management supports:
 
 ### 8.2.1 Loading New IP Assignments in Bulk
 
-Template: `scripts/templates/new_ip_assignment_iptool_template.csv`. It is the IP Tool export layout plus optional columns that make each row ready for CST without a Siebel export: `CR Number`, `Unified Number`, `Contact Name`, `Mobile Number`, `Email`, `ID Number`, `City`, `Region`.
+Template: **Bulk Operations > Bulk Import: Assignments / Reservations > Download Template** (same file as `scripts/templates/new_ip_assignment_iptool_template.csv`). It is the IP Tool export layout plus optional columns that make each row ready for CST without a Siebel export: `CR Number`, `Unified Number`, `Contact Name`, `Mobile Number`, `Email`, `ID Number`, `City`, `Region`, `Assignment Date` (defaults to today).
+
+Upload the filled sheet directly on that card: it is converted to the CST import format in the browser (same mapping as the script below), and rows with a missing or Excel-shortened Order Number, a misaligned IP or a size mismatch are rejected before import. Use the script instead when Siebel data should fill in CR/contact details.
 
 1. Fill one row per subnet. In Excel, format `Order Number`, `CR Number`, `Unified Number`, `Mobile Number` and `ID Number` as **Text** before pasting. Otherwise Excel turns long numbers into values like `1.00001E+12` and the real digits are lost; the script rejects such rows.
 2. Convert to the bulk assignment CSV:
