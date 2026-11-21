@@ -398,18 +398,23 @@ operation = UPDATE
 
 The job is then handled by the existing CST sync process.
 
-### 11.4.1 Splitting CST Records (Partial Reassignment)
+### 11.4.1 Overlapping CST Records (Partial Reassignment)
 
-CST rejects a SendLIR whose CIDR overlaps a record it already holds ("This IP CIDR overlaps with an existing allocation"). This happens when a block was sent to CST as one Unassigned record (for example `87.101.190.112/28`) and new assignments were later loaded inside it (for example `87.101.190.120/29`).
+CST rejects a SendLIR whose CIDR overlaps a record it already holds ("This IP CIDR overlaps with an existing allocation"). Two cases occur:
 
-Per the CST LIR partial reassignment workflow, the covering record is replaced:
+- Split: a block was sent as one Unassigned record (e.g. `87.101.190.112/28`) and an assignment is later made inside it (e.g. `87.101.190.120/29`).
+- Merge: free space grows (e.g. after a release) into a block that contains smaller Unassigned records already in CST.
 
-1. DeleteLIR the covering record. It must be Unassigned in CST; its Transaction ID is retired and never reused.
-2. SendLIR every local subnet inside it: the assigned portions and the remaining unassigned portions, each with a new Transaction ID.
+Every path that sends new subnets to CST applies the same rule, so the result does not depend on how the subnet was created: Assignment Management, pool partition, bulk load (when its migration job is created), manual migration and initial bootstrap. Before sending, the overlapping CST records and every unsent local subnet sharing their space are grouped, and per group:
 
-Use **CST Sync Monitor > Split CST Records** (or `POST /cst/container-splits` with `dry_run`). It previews every affected record, then creates one strictly sequenced batch per record, so no SendLIR runs unless the DeleteLIR succeeded. A record is blocked, and never deleted, when it is assigned in CST, its CST status is unknown, the local subnets inside it are not CST-ready or do not cover all of its addresses, or they are already queued in another job.
+1. DeleteLIR each overlapping record. It must be Unassigned in CST; its Transaction ID is retired and never reused.
+2. SendLIR every local subnet in the group: the assigned portions and the remaining unassigned portions, each with a new Transaction ID. The remaining portions are the saved local unassigned blocks, so they are not sent twice later.
 
-Migration jobs no longer send subnets that sit inside a record CST still holds; review rejects them with a pointer to Split CST Records.
+When one local subnet has exactly the CIDR of one record, an UpdateLIR is sent instead. Each group is its own strictly sequenced batch: no SendLIR runs unless the DeleteLIRs succeeded.
+
+A group is blocked, and nothing is deleted, when a record is assigned in CST or its CST status is unknown here, the local subnets do not cover all of a record's addresses, or another subnet in the group is not CST-ready, has an unresolved conflict or is already queued. For Assignment Management the assignment is then refused with the reason. If CST accepted the DeleteLIR but a later SendLIR failed, the assignment is kept (CST no longer holds the old record) and the error names the batch to retry.
+
+**CST Sync Monitor > Split CST Records** (`POST /cst/container-splits`, `dry_run` to preview) applies the same rule to subnets whose earlier SendLIR already failed with an overlap.
 
 ### 11.5 CST Scheduling
 

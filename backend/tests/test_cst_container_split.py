@@ -112,13 +112,78 @@ class CstContainerSplitTest(unittest.TestCase):
         self.assertIn("DeleteLIR needs Unassigned", blocked[0].reason)
         self.assertNotIn(("DELETE", "87.101.190.32/27"), {(op, cidr) for op, cidr, *_ in self.calls})
 
-    def test_manual_migration_no_longer_sends_overlapping_subnet(self):
-        self.load_assignment()
+    def individual_assignment(self, cidr: str, size: int, customer: str = "Walk-in Customer"):
+        """Assignment Management path: one assignment, sent to CST straight away."""
+        import csv
+        from io import StringIO
+        row = next(csv.DictReader(StringIO("\n".join([HEADER, business_row(cidr, size, customer, "SVC-9")]))))
+        payload = app.assignment_payload_from_bulk_row(row, ip_network(cidr), 3, "Active", 2)
+        return app.add_assignment(payload)
+
+    def operations(self):
+        return [(op, cidr) for op, cidr, _tx, _status in self.calls]
+
+    def test_individual_assignment_inside_cst_record_deletes_then_sends_portions(self):
+        self.individual_assignment(ASSIGNED, 8)
+        self.assertEqual(self.operations(), [("DELETE", CONTAINER), ("SEND", "87.101.190.112/29"), ("SEND", ASSIGNED)])
+        self.assertNotEqual(self.ledger(self.container_tx)["retired_at"], "")
         with app.connect() as connection:
-            operations, _eligible, _deletes = app.cst_migration_resource_operations(connection, app.CstManualMigrationRequest())
-        sent = {resource.cidr for resource, operation in operations if operation == "SEND"}
-        self.assertNotIn(ASSIGNED, sent)
-        self.assertNotIn("87.101.190.112/29", sent)
+            fragment = app.find_resource_by_cidr(connection, "87.101.190.112/29")
+            self.assertTrue(app.cst_resource_reported_to_cst(connection, fragment), "remaining portion is a saved local record held in CST")
+        self.assertEqual(app.run_cst_container_split(app.CstContainerSplitRequest(dry_run=True)).containers, [])
+
+    def test_bulk_and_individual_paths_produce_the_same_cst_operations(self):
+        self.load_assignment()
+        result = app.create_manual_cst_migration_job(app.CstManualMigrationRequest())
+        self.assertEqual(len(result.split_batch_ids), 1, result.message)
+        with app.connect() as connection:
+            batch = connection.execute("SELECT workflow_type FROM cst_sync_batches WHERE id = ?", (result.split_batch_ids[0],)).fetchone()
+            queued = [(row["operation"], row["cidr"]) for row in connection.execute(
+                "SELECT operation, cidr FROM cst_sync_jobs WHERE batch_id = ? ORDER BY sequence_no", (result.split_batch_ids[0],)
+            )]
+        self.assertTrue(batch["workflow_type"].startswith("PARTIAL_REASSIGNMENT"), "strictly sequenced batch")
+        self.assertEqual(queued, [("DELETE", CONTAINER), ("SEND", "87.101.190.112/29"), ("SEND", ASSIGNED)])
+        self.assertEqual(self.calls, [], "queued only; CST is called when pending jobs are pushed")
+
+    def test_individual_assignment_also_sends_unsent_bulk_neighbour_in_same_record(self):
+        self.load_assignment("87.101.190.112/30", 4)
+        self.individual_assignment(ASSIGNED, 8)
+        self.assertEqual(self.operations(), [
+            ("DELETE", CONTAINER), ("SEND", "87.101.190.112/30"), ("SEND", "87.101.190.116/30"), ("SEND", ASSIGNED),
+        ])
+
+    def test_individual_assignment_saved_when_delete_succeeds_but_send_fails(self):
+        self.fail_operations = {"SEND"}
+        with self.assertRaises(app.HTTPException) as raised:
+            self.individual_assignment(ASSIGNED, 8)
+        self.assertEqual(raised.exception.status_code, 502)
+        self.assertIn("Retry failed jobs", raised.exception.detail)
+        with app.connect() as connection:
+            self.assertIsNotNone(connection.execute("SELECT 1 FROM assignments WHERE cidr = ?", (ASSIGNED,)).fetchone())
+        self.assertNotEqual(self.ledger(self.container_tx)["retired_at"], "", "CST deleted the record, so it stays retired locally")
+
+    def test_individual_assignment_rolled_back_when_delete_fails(self):
+        self.fail_operations = {"DELETE"}
+        with self.assertRaises(app.HTTPException):
+            self.individual_assignment(ASSIGNED, 8)
+        with app.connect() as connection:
+            self.assertIsNone(connection.execute("SELECT 1 FROM assignments WHERE cidr = ?", (ASSIGNED,)).fetchone())
+        self.assertEqual(self.ledger(self.container_tx)["retired_at"], "")
+
+    def test_larger_free_block_replaces_smaller_cst_records(self):
+        """Reverse overlap, e.g. after a release merges free space: the new block contains CST records."""
+        with app.connect() as connection:
+            root = app.find_resource_by_cidr(connection, ROOT)
+        small_a = self.send_unassigned_fragment("87.101.190.0/30", root)
+        small_b = self.send_unassigned_fragment("87.101.190.4/30", root)
+        self.load_assignment("87.101.190.128/25", 128)
+        result = app.run_cst_container_split(app.CstContainerSplitRequest(dry_run=True))
+        group = next(item for item in result.containers if "87.101.190.0/30" in item.container_cidr)
+        self.assertEqual(group.status, "PLANNED", group.reason)
+        self.assertIn(small_a, group.container_transaction_id)
+        self.assertIn(small_b, group.container_transaction_id)
+        self.assertIn(CONTAINER, group.container_cidr)
+        self.assertEqual(group.operations[-1], "SendLIR 87.101.190.0/25 [Unassigned]")
 
 
 if __name__ == "__main__":

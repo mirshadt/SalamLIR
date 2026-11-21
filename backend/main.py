@@ -1145,6 +1145,7 @@ class CstMigrationReviewCreateResult(BaseModel):
     message: str = ""
     rejected: list[CstMigrationReviewRejectedItem] = Field(default_factory=list)
     jobs: list[CstSyncJob] = Field(default_factory=list)
+    split_batch_ids: list[str] = Field(default_factory=list)
 
 class CstMigrationJobStats(BaseModel):
     batch_id: str
@@ -1173,6 +1174,8 @@ class CstManualMigrationResult(BaseModel):
     message: str = ""
     stats: CstMigrationJobStats | None = None
     jobs: list[CstSyncJob] = Field(default_factory=list)
+    split_batch_ids: list[str] = Field(default_factory=list)
+    blocked_resources: list[str] = Field(default_factory=list)
 
 class CstContainerSplitRequest(BaseModel):
     dry_run: bool = True
@@ -3821,31 +3824,32 @@ def create_cst_assignment_create_jobs(
     assignment_resource: ResourceRecord,
     workflow_type: str,
 ) -> list[CstSyncJob]:
-    assigned_network = network_of(assignment)
-    operations: list[tuple[ResourceRecord, str]] = []
-    for row in active_cst_containers_for_network(connection, assigned_network):
-        container_resource = cst_resource_from_ledger(row)
-        container_network = normalize_network(str(row["cidr"]))
-        if container_network == assigned_network:
-            operations.append((assignment_resource, "UPDATE"))
-            return create_cst_sync_jobs(connection, operations, workflow_type)
-        operations.append((container_resource, "DELETE"))
-        for fragment in remaining_networks_after_subtract(container_network, assigned_network):
-            fragment_uuid = stable_uuid("cst-fragment", str(row["transaction_id"]), assignment.id, str(fragment))
-            operations.append(
-                (
-                    cst_resource_from_network(
-                        fragment,
-                        fragment_uuid,
-                        "cst_remaining_fragment",
-                        f"{assignment.id}:{fragment}",
-                        f"Remaining unassigned CST fragment after assigning {assignment.cidr}",
-                    ),
-                    "SEND",
-                )
-            )
-    operations.append((assignment_resource, "SEND"))
-    return create_cst_sync_jobs(connection, operations, workflow_type)
+    """Send a newly created assignment to CST right away (Assignment Management, partition).
+
+    Uses the same overlap rules as every other path: if CST already holds a record that overlaps
+    the assignment, that record is deleted and the assigned and remaining portions are sent.
+    """
+    outcome = cst_send_resources(connection, [assignment_resource], workflow_type, queue_only=False, exempt_uuids={assignment_resource.resource_uuid})
+    if outcome.rejected:
+        raise HTTPException(status_code=409, detail=f"{assignment.cidr} cannot be sent to CST: {outcome.rejected[0][2]}")
+    deleted_in_cst = [job for job in outcome.jobs if job.operation == "DELETE" and job.status == "SUCCESS"]
+    unfinished = [job for job in outcome.jobs if job.status != "SUCCESS"]
+    if deleted_in_cst and unfinished:
+        # CST no longer holds the deleted record, so keep the local state that matches it.
+        failed = unfinished[0]
+        batch_id = failed.batch_id
+        record_audit(connection, "Subnet Allocation", "assignment", assignment.id, "", assignment.model_dump_json())
+        record_audit(connection, "CST Partial Reassignment Incomplete", "cst_batch", batch_id, "", json.dumps({"assignment": assignment.cidr, "failedJob": failed.id, "error": failed.last_error}))
+        connection.commit()
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"{assignment.cidr} was saved and CST record(s) {', '.join(job.cidr for job in deleted_in_cst)} were deleted, "
+                f"but {failed.operation} {failed.cidr} did not complete: {failed.last_error or failed.status}. "
+                f"Retry failed jobs in CST batch {batch_id}."
+            ),
+        )
+    return outcome.jobs
 
 def cst_waiting_for_prior_delete_message() -> str:
     return "Waiting for earlier CST operation in this batch to succeed before continuing dependent LIR changes"
@@ -7109,7 +7113,7 @@ def cst_resource_has_existing_job(connection: sqlite3.Connection, resource_uuid:
         FROM cst_sync_jobs j
         INNER JOIN cst_sync_batches b ON b.id = j.batch_id
         WHERE j.resource_uuid = ?
-          AND b.workflow_type IN ('MANUAL_LIR_MIGRATION', 'INITIAL_MIGRATION')
+          AND b.workflow_type IN ('MANUAL_LIR_MIGRATION', 'INITIAL_MIGRATION', 'INITIAL_LIR_MIGRATION', 'PARTIAL_REASSIGNMENT_CONTAINER_SPLIT')
           AND j.status IN ('PENDING', 'RUNNING', 'SUCCESS', 'FAILED', 'NOT_REQUIRED')
         LIMIT 1
         """,
@@ -7197,7 +7201,7 @@ def cst_assignment_review_where(request: CstMigrationReviewRequest) -> tuple[str
           FROM cst_sync_jobs j
           INNER JOIN cst_sync_batches b ON b.id = j.batch_id
           WHERE j.resource_uuid = r.resource_uuid
-            AND b.workflow_type IN ('MANUAL_LIR_MIGRATION', 'INITIAL_MIGRATION')
+            AND b.workflow_type IN ('MANUAL_LIR_MIGRATION', 'INITIAL_MIGRATION', 'INITIAL_LIR_MIGRATION', 'PARTIAL_REASSIGNMENT_CONTAINER_SPLIT')
             AND j.status IN ('PENDING', 'RUNNING', 'SUCCESS', 'FAILED', 'NOT_REQUIRED')
         )
         """,
@@ -7352,7 +7356,7 @@ def cst_assignment_review_items_for_ids(connection: sqlite3.Connection, review_i
             FROM cst_sync_jobs j
             INNER JOIN cst_sync_batches b ON b.id = j.batch_id
             WHERE j.resource_uuid = r.resource_uuid
-              AND b.workflow_type IN ('MANUAL_LIR_MIGRATION', 'INITIAL_MIGRATION')
+              AND b.workflow_type IN ('MANUAL_LIR_MIGRATION', 'INITIAL_MIGRATION', 'INITIAL_LIR_MIGRATION', 'PARTIAL_REASSIGNMENT_CONTAINER_SPLIT')
               AND j.status IN ('PENDING', 'RUNNING', 'SUCCESS', 'FAILED', 'NOT_REQUIRED')
           )
         """,
@@ -7486,9 +7490,14 @@ def cst_migration_parent_delete_operations(connection: sqlite3.Connection, resou
 CST_CONTAINER_SPLIT_WORKFLOW = "PARTIAL_REASSIGNMENT_CONTAINER_SPLIT"
 
 
-def cst_active_ledger_by_network(connection: sqlite3.Connection) -> dict[IPv4Network, sqlite3.Row]:
-    """Records currently held in CST (sent successfully and not deleted), keyed by CIDR."""
-    active: dict[IPv4Network, sqlite3.Row] = {}
+def resource_interval(resource: ResourceRecord) -> tuple[int, int]:
+    return int(IPv4Address(resource.start_ip)), int(IPv4Address(resource.end_ip))
+
+
+def cst_active_ledger_intervals(connection: sqlite3.Connection) -> list[tuple[int, int, sqlite3.Row]]:
+    """Records CST currently holds (sent successfully, not deleted), as address intervals."""
+    seen: set[str] = set()
+    intervals: list[tuple[int, int, sqlite3.Row]] = []
     for row in connection.execute(
         "SELECT * FROM cst_transaction_ledger WHERE retired_at = '' AND last_status = 'SUCCESS' ORDER BY first_used_at DESC"
     ).fetchall():
@@ -7496,17 +7505,11 @@ def cst_active_ledger_by_network(connection: sqlite3.Connection) -> dict[IPv4Net
             network = normalize_network(str(row["cidr"]))
         except HTTPException:
             continue
-        active.setdefault(network, row)
-    return active
-
-
-def cst_container_for_network(active: dict[IPv4Network, sqlite3.Row], network: IPv4Network, own_resource_uuid: str) -> sqlite3.Row | None:
-    """Smallest active CST record covering network that belongs to another resource (same CIDR included)."""
-    for prefix in range(network.prefixlen, -1, -1):
-        row = active.get(network.supernet(new_prefix=prefix) if prefix < network.prefixlen else network)
-        if row is not None and str(row["resource_uuid"]) != own_resource_uuid:
-            return row
-    return None
+        if str(network) in seen:
+            continue
+        seen.add(str(network))
+        intervals.append((int(network.network_address), int(network.broadcast_address), row))
+    return intervals
 
 
 def cst_status_from_payload(value: object) -> int | None:
@@ -7543,8 +7546,8 @@ def cst_recorded_assignment_status(connection: sqlite3.Connection, transaction_i
         return None
 
 
-def cst_split_candidate_resources(connection: sqlite3.Connection) -> list[ResourceRecord]:
-    """Local public resources not yet held in CST: new assignments and unassigned fragments."""
+def cst_unsent_local_resources(connection: sqlite3.Connection) -> list[ResourceRecord]:
+    """Local public assignments and unassigned fragments that CST does not hold yet."""
     rows = connection.execute(
         """
         SELECT * FROM ip_resources
@@ -7557,131 +7560,226 @@ def cst_split_candidate_resources(connection: sqlite3.Connection) -> list[Resour
     return [resource for resource in resources if not cst_resource_reported_to_cst(connection, resource)]
 
 
-def cst_resource_inside_active_container(
-    connection: sqlite3.Connection, resource: ResourceRecord, active: dict[IPv4Network, sqlite3.Row] | None = None
-) -> sqlite3.Row | None:
-    """The active CST record a SendLIR for this resource would overlap, if any."""
+def cst_overlapping_ledger_rows(
+    connection: sqlite3.Connection,
+    resource: ResourceRecord,
+    active: list[tuple[int, int, sqlite3.Row]] | None = None,
+) -> list[sqlite3.Row]:
+    """Records CST holds that a SendLIR for this resource would overlap (either direction)."""
     if resource.ip_type != "PUBLIC" or cst_resource_reported_to_cst(connection, resource):
-        return None
-    try:
-        network = normalize_network(resource.cidr)
-    except HTTPException:
-        return None
-    return cst_container_for_network(active if active is not None else cst_active_ledger_by_network(connection), network, resource.resource_uuid)
+        return []
+    start, end = resource_interval(resource)
+    active = active if active is not None else cst_active_ledger_intervals(connection)
+    return [row for row_start, row_end, row in active if row_start <= end and start <= row_end and str(row["resource_uuid"]) != resource.resource_uuid]
 
 
-def cst_assignment_split_blocker(connection: sqlite3.Connection, resource: ResourceRecord) -> str:
-    if resource.source_entity_type != "assignment":
-        return ""
-    row = connection.execute("SELECT * FROM assignments WHERE id = ?", (resource.source_entity_id,)).fetchone()
-    if row is None:
-        return f"{resource.cidr}: assignment record missing"
-    assignment = assignment_from_row(row)
-    if str(assignment.migration_conflict_status or "").upper() not in {"", "ACCEPTED"}:
-        return f"{resource.cidr}: unresolved overlap conflict ({assignment.migration_conflict_status})"
-    if not assignment.cst_sync_ready:
-        return f"{resource.cidr}: not CST-ready ({assignment.cst_validation_errors or assignment.cst_validation_status})"
+def cst_resource_send_blocker(connection: sqlite3.Connection, resource: ResourceRecord) -> str:
+    """Why a subnet pulled into a replacement group cannot be sent now."""
+    if connection.execute(
+        "SELECT 1 FROM cst_sync_jobs WHERE resource_uuid = ? AND status IN ('PENDING', 'RUNNING') LIMIT 1", (resource.resource_uuid,)
+    ).fetchone():
+        return f"{resource.cidr}: already queued in another CST job"
+    if resource.source_entity_type == "assignment":
+        row = connection.execute("SELECT * FROM assignments WHERE id = ?", (resource.source_entity_id,)).fetchone()
+        if row is None:
+            return f"{resource.cidr}: assignment record missing"
+        assignment = assignment_from_row(row)
+        if str(assignment.migration_conflict_status or "").upper() not in {"", "ACCEPTED"}:
+            return f"{resource.cidr}: unresolved overlap conflict ({assignment.migration_conflict_status})"
+    issues = cst_resource_integrity_issues(connection, resource)
+    if issues:
+        return f"{resource.cidr}: {'; '.join(issues)}"
+    payload = cst_payload_for_resource(resource, "SEND", resource.transaction_id or resource.resource_uuid, "overlap-check")
+    quality = cst_data_quality_issues(resource, "SEND", payload)
+    if quality:
+        return f"{resource.cidr}: not CST-ready ({cst_quality_message(quality)})"
     return ""
 
 
-def cst_container_split_plans(connection: sqlite3.Connection, cidr_filter: set[str] | None = None) -> list[tuple[CstContainerSplitItem, list[tuple[ResourceRecord, str]]]]:
-    """Partial reassignment plans for CST records that now contain new local subnets.
+def cst_overlap_groups(
+    connection: sqlite3.Connection,
+    seeds: list[ResourceRecord],
+    ignore_ledger_resource_uuids: set[str] | None = None,
+) -> tuple[list[tuple[list[sqlite3.Row], list[ResourceRecord]]], list[ResourceRecord]]:
+    """Split seeds into plain SendLIRs and replacement groups.
 
-    For each Unassigned CST record covering local resources that are not in CST yet:
-    DeleteLIR the record, then SendLIR every local resource inside it (assigned and remaining
-    portions). A local resource with exactly the record's CIDR becomes an UpdateLIR instead.
+    A group is every CST record overlapping the seeds plus every unsent local subnet overlapping
+    those records, closed transitively. Sending the group means: DeleteLIR its records, then
+    SendLIR its local subnets. This is the same whether the seed came from a bulk load, an
+    individual assignment, a release or a partition.
+    """
+    ignore = ignore_ledger_resource_uuids or set()
+    active = [item for item in cst_active_ledger_intervals(connection) if str(item[2]["resource_uuid"]) not in ignore]
+    unsent = {resource.resource_uuid: resource for resource in cst_unsent_local_resources(connection)}
+    for seed in seeds:
+        unsent.setdefault(seed.resource_uuid, seed)
+    plain: list[ResourceRecord] = []
+    groups: list[tuple[list[sqlite3.Row], list[ResourceRecord]]] = []
+    grouped_uuids: set[str] = set()
+    for seed in seeds:
+        if seed.resource_uuid in grouped_uuids:
+            continue
+        if not cst_overlapping_ledger_rows(connection, seed, active):
+            plain.append(seed)
+            continue
+        rows: dict[str, sqlite3.Row] = {}
+        members: dict[str, ResourceRecord] = {seed.resource_uuid: seed}
+        frontier = [seed]
+        while frontier:
+            current = frontier.pop()
+            for row in cst_overlapping_ledger_rows(connection, current, active):
+                transaction_id = str(row["transaction_id"])
+                if transaction_id in rows:
+                    continue
+                rows[transaction_id] = row
+                row_network = normalize_network(str(row["cidr"]))
+                row_start, row_end = int(row_network.network_address), int(row_network.broadcast_address)
+                for candidate in unsent.values():
+                    candidate_start, candidate_end = resource_interval(candidate)
+                    if candidate.resource_uuid not in members and candidate_start <= row_end and row_start <= candidate_end:
+                        members[candidate.resource_uuid] = candidate
+                        frontier.append(candidate)
+        grouped_uuids.update(members)
+        groups.append((sorted(rows.values(), key=lambda row: int(normalize_network(str(row["cidr"])).network_address)), sorted(members.values(), key=lambda item: resource_interval(item)[0])))
+    return groups, plain
+
+
+def cst_plan_overlap_group(
+    connection: sqlite3.Connection,
+    rows: list[sqlite3.Row],
+    members: list[ResourceRecord],
+    exempt_uuids: set[str] | None = None,
+) -> tuple[CstContainerSplitItem, list[tuple[ResourceRecord, str]]]:
+    """DeleteLIR the CST records, then SendLIR the local subnets (UpdateLIR when one subnet equals one record)."""
+    exempt = exempt_uuids or set()
+    statuses = {str(row["transaction_id"]): cst_recorded_assignment_status(connection, str(row["transaction_id"])) for row in rows}
+    item = CstContainerSplitItem(
+        container_cidr=", ".join(str(row["cidr"]) for row in rows),
+        container_transaction_id=", ".join(str(row["transaction_id"]) for row in rows),
+        container_assignment_status_id=next(iter(statuses.values())) if len(statuses) == 1 else None,
+        status="PLANNED",
+    )
+    blockers: list[str] = []
+    for row in rows:
+        status_id = statuses[str(row["transaction_id"])]
+        if status_id is None:
+            blockers.append(f"CST status of {row['cidr']} is unknown (no successful SendLIR/UpdateLIR recorded here); confirm it is Unassigned in CST first")
+        elif status_id != 1:
+            blockers.append(f"{row['cidr']} is {assignment_status_id_name(status_id)} in CST (assignmentStatusId {status_id}); DeleteLIR needs Unassigned. Release it or use partial reassignment first")
+    blockers.extend(blocker for blocker in (cst_resource_send_blocker(connection, member) for member in members if member.resource_uuid not in exempt) if blocker)
+
+    previous_end = -1
+    covered: list[tuple[int, int]] = []
+    for member in members:
+        start, end = resource_interval(member)
+        if start <= previous_end:
+            blockers.append(f"local subnets overlap each other at {member.cidr}")
+            break
+        if covered and covered[-1][1] + 1 == start:
+            covered[-1] = (covered[-1][0], end)
+        else:
+            covered.append((start, end))
+        previous_end = end
+    for row in rows:
+        network = normalize_network(str(row["cidr"]))
+        start, end = int(network.network_address), int(network.broadcast_address)
+        if not any(low <= start and end <= high for low, high in covered):
+            blockers.append(f"local subnets do not cover all of {network}; that space would be left out of CST after DeleteLIR")
+
+    if len(rows) == 1 and len(members) == 1 and normalize_network(members[0].cidr) == normalize_network(str(rows[0]["cidr"])):
+        operations: list[tuple[ResourceRecord, str]] = [(members[0], "UPDATE")]
+    else:
+        operations = [
+            *[(cst_resource_from_ledger(row).model_copy(update={"assignment_status_id": 1}), "DELETE") for row in rows],
+            *[(member, "SEND") for member in members],
+        ]
+    item.operations = [
+        f"{'DeleteLIR' if operation == 'DELETE' else 'UpdateLIR' if operation == 'UPDATE' else 'SendLIR'} {resource.cidr}"
+        + (f" (Transaction ID {resource.transaction_id})" if operation == "DELETE" else f" [{assignment_status_id_name(resource.assignment_status_id)}]")
+        for resource, operation in operations
+    ]
+    if blockers:
+        item.status = "BLOCKED"
+        item.reason = "; ".join(dict.fromkeys(blockers))
+        operations = []
+    return item, operations
+
+
+class CstSendOutcome(BaseModel):
+    jobs: list[CstSyncJob] = Field(default_factory=list)
+    plain_batch_id: str = ""
+    groups: list[CstContainerSplitItem] = Field(default_factory=list)
+    rejected: list[tuple[str, str, str]] = Field(default_factory=list)  # (resource_uuid, cidr, reason)
+
+
+def cst_send_resources(
+    connection: sqlite3.Connection,
+    resources: list[ResourceRecord],
+    workflow_type: str,
+    queue_only: bool,
+    extra_operations: list[tuple[ResourceRecord, str]] | None = None,
+    exempt_uuids: set[str] | None = None,
+    ignore_ledger_resource_uuids: set[str] | None = None,
+) -> CstSendOutcome:
+    """Send new subnets to CST without overlapping records it already holds.
+
+    Every path that adds subnets (bulk load push, individual assignment, partition, migration,
+    bootstrap) goes through here. Subnets clear of CST records are sent as plain SendLIRs in one
+    batch (after extra_operations). Overlapping ones are replaced per group in their own strictly
+    sequenced batch: DeleteLIR the CST records, then SendLIR the assigned and remaining portions.
     """
     materialize_bulk_unassigned_fragments(connection)
-    active = cst_active_ledger_by_network(connection)
-    grouped: dict[str, list[ResourceRecord]] = defaultdict(list)
-    container_rows: dict[str, sqlite3.Row] = {}
-    for resource in cst_split_candidate_resources(connection):
-        row = cst_resource_inside_active_container(connection, resource, active)
-        if row is None:
-            continue
-        transaction_id = str(row["transaction_id"])
-        grouped[transaction_id].append(resource)
-        container_rows[transaction_id] = row
-
-    plans: list[tuple[CstContainerSplitItem, list[tuple[ResourceRecord, str]]]] = []
-    for transaction_id, inside in grouped.items():
-        row = container_rows[transaction_id]
-        container_network = normalize_network(str(row["cidr"]))
-        if cidr_filter and str(container_network) not in cidr_filter:
-            continue
-        inside.sort(key=lambda item: int(IPv4Address(item.start_ip)))
-        status_id = cst_recorded_assignment_status(connection, transaction_id)
-        item = CstContainerSplitItem(
-            container_cidr=str(container_network),
-            container_transaction_id=transaction_id,
-            container_assignment_status_id=status_id,
-            status="PLANNED",
-        )
-        blockers: list[str] = []
-        if status_id is None:
-            blockers.append("CST assignment status of this record is unknown (no successful SendLIR/UpdateLIR recorded here); confirm it is Unassigned in CST first")
-        elif status_id != 1:
-            blockers.append(f"record is {assignment_status_id_name(status_id)} in CST (assignmentStatusId {status_id}); DeleteLIR needs Unassigned. Release it or use partial reassignment first")
-        blockers.extend(blocker for blocker in (cst_assignment_split_blocker(connection, resource) for resource in inside) if blocker)
-        queued = [resource.cidr for resource in inside if connection.execute(
-            "SELECT 1 FROM cst_sync_jobs WHERE resource_uuid = ? AND status IN ('PENDING', 'RUNNING') LIMIT 1", (resource.resource_uuid,)
-        ).fetchone()]
-        if queued:
-            blockers.append(f"already queued in another CST job: {', '.join(queued[:10])}")
-
-        exact = [resource for resource in inside if normalize_network(resource.cidr) == container_network]
-        operations: list[tuple[ResourceRecord, str]] = []
-        if exact:
-            if len(inside) > 1:
-                blockers.append("local inventory has overlapping resources inside this record")
-            operations = [(exact[0], "UPDATE")]
+    outcome = CstSendOutcome()
+    groups, plain = cst_overlap_groups(connection, resources, ignore_ledger_resource_uuids)
+    operations = [*(extra_operations or []), *[(resource, "SEND") for resource in plain]]
+    if operations:
+        jobs = create_cst_sync_jobs(connection, operations, workflow_type, queue_only=queue_only)
+        outcome.jobs.extend(jobs)
+        outcome.plain_batch_id = jobs[0].batch_id if jobs else ""
+    seed_uuids = {resource.resource_uuid for resource in resources}
+    for rows, members in groups:
+        item, group_operations = cst_plan_overlap_group(connection, rows, members, exempt_uuids)
+        if group_operations:
+            jobs = create_cst_sync_jobs(connection, group_operations, CST_CONTAINER_SPLIT_WORKFLOW, queue_only=queue_only)
+            item.status = "CREATED"
+            item.batch_id = jobs[0].batch_id if jobs else ""
+            item.job_statuses = [f"{job.operation} {job.cidr}: {job.status}{' - ' + job.last_error if job.last_error else ''}" for job in jobs]
+            outcome.jobs.extend(jobs)
         else:
-            covered = 0
-            previous_end = -1
-            for resource in inside:
-                start, end = int(IPv4Address(resource.start_ip)), int(IPv4Address(resource.end_ip))
-                if start <= previous_end:
-                    blockers.append("local inventory has overlapping resources inside this record")
-                    break
-                covered += end - start + 1
-                previous_end = end
-            if covered != container_network.num_addresses and not any("overlapping" in blocker for blocker in blockers):
-                blockers.append(f"local subnets cover {covered} of {container_network.num_addresses} addresses; the rest would be left out of CST after DeleteLIR")
-            container_resource = cst_resource_from_ledger(row).model_copy(update={"assignment_status_id": 1})
-            operations = [(container_resource, "DELETE"), *[(resource, "SEND") for resource in inside]]
-
-        item.operations = [
-            f"{'DeleteLIR' if operation == 'DELETE' else 'UpdateLIR' if operation == 'UPDATE' else 'SendLIR'} {resource.cidr}"
-            + (f" (Transaction ID {transaction_id})" if operation == "DELETE" else f" [{assignment_status_id_name(resource.assignment_status_id)}]")
-            for resource, operation in operations
-        ]
-        if blockers:
-            item.status = "BLOCKED"
-            item.reason = "; ".join(dict.fromkeys(blockers))
-            operations = []
-        plans.append((item, operations))
-    plans.sort(key=lambda plan: int(normalize_network(plan[0].container_cidr).network_address))
-    return plans
+            outcome.rejected.extend(
+                (member.resource_uuid, member.cidr, f"Overlaps CST record(s) {item.container_cidr}: {item.reason}")
+                for member in members if member.resource_uuid in seed_uuids
+            )
+        outcome.groups.append(item)
+    return outcome
 
 
 def run_cst_container_split(payload: CstContainerSplitRequest) -> CstContainerSplitResult:
+    """Replace CST records that overlap unsent local subnets (e.g. after earlier SendLIR overlap failures)."""
     cidr_filter = {str(normalize_network(cidr)) for cidr in payload.container_cidrs if str(cidr or "").strip()} or None
     with connect() as connection:
-        plans = cst_container_split_plans(connection, cidr_filter)
+        materialize_bulk_unassigned_fragments(connection)
+        active = cst_active_ledger_intervals(connection)
+        seeds = [resource for resource in cst_unsent_local_resources(connection) if cst_overlapping_ledger_rows(connection, resource, active)]
         result = CstContainerSplitResult(dry_run=payload.dry_run)
-        for item, operations in plans:
-            if item.status == "PLANNED" and not payload.dry_run:
-                # One batch per record: its strict sequence holds every SendLIR until the DeleteLIR has succeeded.
+        groups, _plain = cst_overlap_groups(connection, seeds)
+        for rows, members in groups:
+            if cidr_filter and not cidr_filter & {str(normalize_network(str(row["cidr"]))) for row in rows}:
+                continue
+            item, operations = cst_plan_overlap_group(connection, rows, members)
+            if operations and not payload.dry_run:
+                # One batch per group: its strict sequence holds every SendLIR until the DeleteLIRs succeed.
                 jobs = create_cst_sync_jobs(connection, operations, CST_CONTAINER_SPLIT_WORKFLOW, queue_only=not payload.execute_immediately)
                 item.batch_id = jobs[0].batch_id if jobs else ""
                 item.job_statuses = [f"{job.operation} {job.cidr}: {job.status}{' - ' + job.last_error if job.last_error else ''}" for job in jobs]
                 item.status = "CREATED"
                 result.created_batches += 1
             result.containers.append(item)
+        result.containers.sort(key=lambda item: int(normalize_network(item.container_cidr.split(",")[0]).network_address))
         result.planned = sum(1 for item in result.containers if item.status in {"PLANNED", "CREATED"})
         result.blocked = sum(1 for item in result.containers if item.status == "BLOCKED")
         if payload.dry_run:
-            result.message = f"Preview: {result.planned} CST record(s) can be split, {result.blocked} blocked. Nothing was sent."
+            result.message = f"Preview: {result.planned} CST record group(s) can be replaced, {result.blocked} blocked. Nothing was sent."
         else:
             result.message = (
                 f"Created {result.created_batches} partial reassignment batch(es); {result.blocked} blocked. "
@@ -7697,14 +7795,6 @@ def cst_migration_resource_operations(
 ) -> tuple[list[tuple[ResourceRecord, str]], int, int]:
     resources, eligible_count = cst_migration_resource_rows(connection, payload)
     delete_operations = cst_migration_parent_delete_operations(connection, payload.resource_scope)
-    deleting = {resource.resource_uuid for resource, _operation in delete_operations}
-    active = cst_active_ledger_by_network(connection)
-    # A SendLIR inside a record CST still holds is rejected as an overlap; those go through the container split.
-    resources = [
-        resource for resource in resources
-        if (container := cst_resource_inside_active_container(connection, resource, active)) is None
-        or str(container["resource_uuid"]) in deleting
-    ]
     operations = [*delete_operations, *[(resource, "SEND") for resource in resources]]
     return operations, eligible_count, len(delete_operations)
 
@@ -7861,6 +7951,7 @@ def create_cst_migration_job_from_review(request: CstMigrationReviewCreateReques
         else:
             current_items = {item.review_id: item for item in cst_migration_review_items(connection, review_request)}
         operations: list[tuple[ResourceRecord, str]] = []
+        review_id_by_resource: dict[str, str] = {}
         for review_id in included_ids:
             operation, resource_uuid = parse_cst_review_id(review_id)
             item = current_items.get(review_id)
@@ -7875,13 +7966,6 @@ def create_cst_migration_job_from_review(request: CstMigrationReviewCreateReques
             if cst_resource_has_existing_job(connection, resource_uuid):
                 rejected.append(CstMigrationReviewRejectedItem(review_id=review_id, resource_uuid=resource_uuid, cidr=resource.cidr, operation=operation, reason="Already assigned to an active or completed CST migration job"))
                 continue
-            container = cst_resource_inside_active_container(connection, resource) if operation == "SEND" else None
-            if container is not None:
-                rejected.append(CstMigrationReviewRejectedItem(
-                    review_id=review_id, resource_uuid=resource_uuid, cidr=resource.cidr, operation=operation,
-                    reason=f"Inside CST record {container['cidr']} (Transaction ID {container['transaction_id']}); SendLIR would overlap. Use CST Container Split (DeleteLIR then SendLIR).",
-                ))
-                continue
             validation_payload = cst_payload_for_resource(resource, "SEND" if operation not in {"SEND", "UPDATE"} else operation, resource.transaction_id or resource_uuid, "migration-review-create")
             integrity_issues = cst_resource_integrity_issues(connection, resource)
             data_quality_warnings = cst_data_quality_issues(resource, operation, validation_payload)
@@ -7891,9 +7975,23 @@ def create_cst_migration_job_from_review(request: CstMigrationReviewCreateReques
             if data_quality_warnings:
                 record_audit(connection, "CST Migration Defaults Applied", "ip_resource", resource.resource_uuid, "", json.dumps({"reviewId": review_id, "cidr": resource.cidr, "operation": operation, "warnings": data_quality_warnings}))
             operations.append((resource, operation))
+            review_id_by_resource[resource.resource_uuid] = review_id
+        split_batch_ids: list[str] = []
         if operations:
-            jobs = create_cst_sync_jobs(connection, operations, "MANUAL_LIR_MIGRATION", queue_only=True)
-            batch_id = jobs[0].batch_id if jobs else ""
+            sends = [resource for resource, operation in operations if operation == "SEND"]
+            outcome = cst_send_resources(
+                connection,
+                sends,
+                "MANUAL_LIR_MIGRATION",
+                queue_only=True,
+                extra_operations=[(resource, operation) for resource, operation in operations if operation != "SEND"],
+                exempt_uuids={resource.resource_uuid for resource in sends},
+            )
+            jobs = outcome.jobs
+            split_batch_ids = [group.batch_id for group in outcome.groups if group.batch_id]
+            batch_id = outcome.plain_batch_id or (split_batch_ids[0] if split_batch_ids else "")
+            for resource_uuid, cidr, reason in outcome.rejected:
+                rejected.append(CstMigrationReviewRejectedItem(review_id=review_id_by_resource.get(resource_uuid, resource_uuid), resource_uuid=resource_uuid, cidr=cidr, operation="SEND", reason=reason))
         stats = cst_batch_job_stats(connection, batch_id) if batch_id else None
         record_audit(
             connection,
@@ -7911,7 +8009,11 @@ def create_cst_migration_job_from_review(request: CstMigrationReviewCreateReques
                 "createdAt": created_at,
             }),
         )
-        message = f"Migration job {batch_id} created with {len(jobs)} transaction(s)." if batch_id else "No CST migration job was created because all selected transactions were rejected."
+        message = (
+            f"Migration job {batch_id} created with {len(jobs)} transaction(s)"
+            + (f", including {len(split_batch_ids)} partial reassignment batch(es) (DeleteLIR then SendLIR) for subnets overlapping existing CST records" if split_batch_ids else "")
+            + "."
+        ) if batch_id else "No CST migration job was created because all selected transactions were rejected."
         return CstMigrationReviewCreateResult(
             batch_id=batch_id,
             created_jobs=len(jobs),
@@ -7923,6 +8025,7 @@ def create_cst_migration_job_from_review(request: CstMigrationReviewCreateReques
             message=message,
             rejected=rejected,
             jobs=jobs,
+            split_batch_ids=split_batch_ids,
         )
 
 @app.post("/cst/container-splits", response_model=CstContainerSplitResult)
@@ -7943,14 +8046,28 @@ def create_manual_cst_migration_job(payload: CstManualMigrationRequest | None = 
         with connect() as connection:
             operations, eligible_count, parent_delete_count = cst_migration_resource_operations(connection, payload)
             send_count = sum(1 for _resource, operation in operations if operation == "SEND")
-            jobs = create_cst_sync_jobs(connection, operations, "MANUAL_LIR_MIGRATION", queue_only=True)
-            batch_id = jobs[0].batch_id if jobs else ""
+            deletes = [(resource, operation) for resource, operation in operations if operation != "SEND"]
+            sends = [resource for resource, operation in operations if operation == "SEND"]
+            outcome = cst_send_resources(
+                connection,
+                sends,
+                "MANUAL_LIR_MIGRATION",
+                queue_only=True,
+                extra_operations=deletes,
+                exempt_uuids={resource.resource_uuid for resource in sends},
+                ignore_ledger_resource_uuids={resource.resource_uuid for resource, _operation in deletes},
+            )
+            jobs = outcome.jobs
+            split_batch_ids = [group.batch_id for group in outcome.groups if group.batch_id]
+            batch_id = outcome.plain_batch_id or (split_batch_ids[0] if split_batch_ids else "")
             processed_jobs: list[CstSyncJob] = []
-            if payload.execute_immediately and batch_id:
-                processed_jobs = process_cst_batch_pending_jobs(connection, batch_id, force_api_override=payload.force_api_override)
-                jobs = [cst_job_from_row(row) for row in connection.execute(
+            if payload.execute_immediately:
+                all_batches = list(dict.fromkeys(item for item in [outcome.plain_batch_id, *split_batch_ids] if item))
+                for run_batch_id in all_batches:
+                    processed_jobs.extend(process_cst_batch_pending_jobs(connection, run_batch_id, force_api_override=payload.force_api_override))
+                jobs = [cst_job_from_row(row) for run_batch_id in all_batches for row in connection.execute(
                     "SELECT * FROM cst_sync_jobs WHERE batch_id = ? ORDER BY sequence_no, id",
-                    (batch_id,),
+                    (run_batch_id,),
                 ).fetchall()]
             stats = cst_batch_job_stats(connection, batch_id) if batch_id else None
             message = (
@@ -7985,6 +8102,8 @@ def create_manual_cst_migration_job(payload: CstManualMigrationRequest | None = 
                 message=message,
                 stats=stats,
                 jobs=jobs,
+                split_batch_ids=split_batch_ids,
+                blocked_resources=[f"{cidr}: {reason}" for _uuid, cidr, reason in outcome.rejected],
             )
     finally:
         if lock_acquired:
@@ -8023,7 +8142,8 @@ def bootstrap_current_cst_resources() -> list[CstSyncJob]:
                 """
             ).fetchall()
         ]
-        jobs = create_cst_sync_jobs(connection, [(resource, "SEND") for resource in resources], "INITIAL_LIR_MIGRATION", queue_only=True)
+        outcome = cst_send_resources(connection, resources, "INITIAL_LIR_MIGRATION", queue_only=True, exempt_uuids={resource.resource_uuid for resource in resources})
+        jobs = outcome.jobs
         record_audit(connection, "CST Initial Migration Jobs Created", "cst_batch", jobs[0].batch_id if jobs else "", "", json.dumps({"jobs": len(jobs)}))
     return jobs
 
