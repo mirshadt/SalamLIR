@@ -158,6 +158,10 @@ Template: `scripts/templates/new_ip_assignment_iptool_template.csv`. It is the I
    ```
 
    With a Siebel export, use `--siebel siebel.csv` instead of `--legacy-iptool-only`; Siebel supplies CR/unified number and contact details.
+
+   Siebel join rules:
+   - `Order Number` is matched to `SERIAL_NUM`, with or without the product prefix (`BDI1000010114916` matches `1000010114916`). A match supplies the serviceId and customer details.
+   - Otherwise the row is joined by `CustomerNumber` -> `ACCOUNT_NUMBER` for customer details only. The serviceId is then the row's own `Order Number`; if that is blank or in Excel scientific notation, it is the account's only active `SERIAL_NUM`. When the account has several active services the row is rejected with the candidate serials listed, because one service cannot be told from another.
 3. Check `rejected_rows.csv` (`missingReason` column), then upload `bulk_assignments.csv` in Bulk Operations > Bulk Import: Assignments / Reservations.
 
 Mapping: `Order Number` becomes `serviceId`; `Status` "Reserved" is loaded as assignmentStatusId 3 (Business); `CustomerType` GOV maps to customerTypeId 1, otherwise 2. CST requires a valid 10-digit `CR Number` or `Unified Number`; without one the row imports but is not ready for CST sync. Missing contact fields fall back to placeholders (`Business Contact`, `0000000000`, `NA@NA.com`).
