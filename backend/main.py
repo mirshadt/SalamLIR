@@ -2705,7 +2705,8 @@ def cst_jobs_succeeded(jobs: list[CstSyncJob], operation: str) -> bool:
 def assert_cst_business_flow_succeeded(jobs: list[CstSyncJob], action: str) -> None:
     if not jobs:
         return
-    failed = next((job for job in jobs if job.status != "SUCCESS"), None)
+    # With auto-execute off (controlled sync) jobs are queued and sent when pending jobs are pushed.
+    failed = next((job for job in jobs if job.status != "SUCCESS" and not cst_job_is_queued(job)), None)
     if failed:
         reason = failed.last_error or f"CST job remained {failed.status}"
         raise HTTPException(status_code=502, detail=f"{action} failed because CST sync did not complete for {failed.cidr}: {reason}")
@@ -3284,28 +3285,6 @@ def network_difference(container: IPv4Network, removed: IPv4Network) -> list[IPv
     return normalize_network_list(remaining_networks_after_subtract(container, removed))
 
 
-def active_cst_containers_for_network(connection: sqlite3.Connection, network: IPv4Network) -> list[sqlite3.Row]:
-    rows = connection.execute(
-        """
-        SELECT *
-        FROM cst_transaction_ledger
-        WHERE retired_at = ''
-          AND last_status = 'SUCCESS'
-        ORDER BY first_used_at DESC
-        """
-    ).fetchall()
-    containers: list[tuple[int, sqlite3.Row]] = []
-    for row in rows:
-        try:
-            ledger_network = normalize_network(str(row["cidr"]))
-        except HTTPException:
-            continue
-        if network.subnet_of(ledger_network):
-            containers.append((ledger_network.prefixlen, row))
-    containers.sort(key=lambda item: item[0], reverse=True)
-    return [row for _prefix, row in containers[:1]]
-
-
 def subtract_allocated_networks(container: IPv4Network, allocated_networks: list[IPv4Network]) -> list[IPv4Network]:
     free_blocks = [container]
     ordered = sorted(allocated_networks, key=lambda item: (int(item.network_address), item.prefixlen))
@@ -3851,6 +3830,19 @@ def create_cst_assignment_create_jobs(
         )
     return outcome.jobs
 
+CST_RELEASE_WORKFLOW = "ASSIGNMENT_RELEASE"
+
+
+def cst_workflow_is_strict(workflow_type: str) -> bool:
+    """Batches whose jobs must run in order: each waits until every earlier job succeeded."""
+    return workflow_type.startswith("PARTIAL_REASSIGNMENT") or workflow_type == CST_RELEASE_WORKFLOW
+
+
+def cst_job_is_queued(job: CstSyncJob) -> bool:
+    """Saved for a controlled push (auto-execute off), or waiting behind such a job; not a failure."""
+    return job.status == "PENDING" and (not job.last_error or job.last_error == cst_waiting_for_prior_delete_message())
+
+
 def cst_waiting_for_prior_delete_message() -> str:
     return "Waiting for earlier CST operation in this batch to succeed before continuing dependent LIR changes"
 
@@ -3858,7 +3850,7 @@ def cst_waiting_for_prior_delete_message() -> str:
 def cst_batch_requires_strict_sequence(connection: sqlite3.Connection, batch_id: str) -> bool:
     row = connection.execute("SELECT workflow_type FROM cst_sync_batches WHERE id = ?", (batch_id,)).fetchone()
     workflow_type = str(row["workflow_type"] or "") if row else ""
-    return workflow_type.startswith("PARTIAL_REASSIGNMENT")
+    return cst_workflow_is_strict(workflow_type)
 
 
 def cst_job_waiting_for_prior_delete(connection: sqlite3.Connection, job: CstSyncJob) -> bool:
@@ -4034,7 +4026,7 @@ def create_cst_sync_jobs(
 
     jobs: list[CstSyncJob] = []
     prior_delete_unresolved = False
-    strict_sequence = workflow_type.startswith("PARTIAL_REASSIGNMENT")
+    strict_sequence = cst_workflow_is_strict(workflow_type)
     prior_sequence_unresolved = False
     send_batch_size = cst_send_payload_batch_size(config) if cst_workflow_uses_send_payload_batch(workflow_type) else 1
     can_batch_all_send = send_batch_size > 1 and all(operation == "SEND" for _resource, operation in eligible)
@@ -7495,11 +7487,26 @@ def resource_interval(resource: ResourceRecord) -> tuple[int, int]:
 
 
 def cst_active_ledger_intervals(connection: sqlite3.Connection) -> list[tuple[int, int, sqlite3.Row]]:
-    """Records CST currently holds (sent successfully, not deleted), as address intervals."""
+    """Records CST currently holds (sent successfully, not deleted), as address intervals.
+
+    last_status alone is not enough: a queued job (e.g. a release waiting for a controlled push)
+    overwrites it, yet CST still holds the record until a DeleteLIR succeeds and retires it.
+    """
     seen: set[str] = set()
     intervals: list[tuple[int, int, sqlite3.Row]] = []
     for row in connection.execute(
-        "SELECT * FROM cst_transaction_ledger WHERE retired_at = '' AND last_status = 'SUCCESS' ORDER BY first_used_at DESC"
+        """
+        SELECT l.* FROM cst_transaction_ledger l
+        WHERE l.retired_at = ''
+          AND (
+            l.last_status = 'SUCCESS'
+            OR EXISTS (
+              SELECT 1 FROM cst_sync_jobs j
+              WHERE j.transaction_id = l.transaction_id AND j.operation IN ('SEND', 'UPDATE') AND j.status = 'SUCCESS'
+            )
+          )
+        ORDER BY l.first_used_at DESC
+        """
     ).fetchall():
         try:
             network = normalize_network(str(row["cidr"]))
@@ -7661,6 +7668,13 @@ def cst_plan_overlap_group(
     )
     blockers: list[str] = []
     for row in rows:
+        queued_delete = connection.execute(
+            "SELECT batch_id FROM cst_sync_jobs WHERE transaction_id = ? AND operation = 'DELETE' AND status IN ('PENDING', 'RUNNING') LIMIT 1",
+            (str(row["transaction_id"]),),
+        ).fetchone()
+        if queued_delete is not None:
+            blockers.append(f"a DeleteLIR for {row['cidr']} is already queued in CST batch {queued_delete['batch_id']}; push pending CST jobs first")
+            continue
         status_id = statuses[str(row["transaction_id"])]
         if status_id is None:
             blockers.append(f"CST status of {row['cidr']} is unknown (no successful SendLIR/UpdateLIR recorded here); confirm it is Unassigned in CST first")
@@ -9948,12 +9962,14 @@ def unassign_assignment_record(connection: sqlite3.Connection, assignment: Assig
         )
         retiring_assignment = assignment_from_row(connection.execute("SELECT * FROM assignments WHERE id = ?", (assignment_id,)).fetchone())
         resource = sync_assignment_resource(connection, retiring_assignment)
-        update_jobs = create_cst_sync_jobs(connection, [(cst_unassigned_update_resource(resource), "UPDATE")], "ASSIGNMENT_RELEASE_UNASSIGN")
+        unassigned = cst_unassigned_update_resource(resource)
+        # One strictly ordered batch, so a controlled push still sends UpdateLIR before DeleteLIR.
+        jobs = create_cst_sync_jobs(connection, [(unassigned, "UPDATE"), (unassigned, "DELETE")], CST_RELEASE_WORKFLOW)
+        update_jobs = [job for job in jobs if job.operation == "UPDATE"]
+        delete_jobs = [job for job in jobs if job.operation == "DELETE"]
         assert_cst_business_flow_succeeded(update_jobs, "Release (CST UpdateLIR to Unassigned)")
-
-        unassigned = find_resource_by_source(connection, "assignment", assignment_id) or resource
-        delete_jobs = create_cst_sync_jobs(connection, [(cst_unassigned_update_resource(unassigned), "DELETE")], "ASSIGNMENT_RELEASE_DELETE")
-        delete_error = cst_release_failure_detail(delete_jobs)
+        queued = any(cst_job_is_queued(job) for job in jobs)
+        delete_error = "" if queued else cst_release_failure_detail(delete_jobs)
         if delete_error:
             record_audit(connection, "CST DeleteLIR Failed", "assignment", assignment_id, "", f"Record is Unassigned in CST; DeleteLIR failed: {delete_error}")
             connection.commit()
@@ -9962,7 +9978,11 @@ def unassign_assignment_record(connection: sqlite3.Connection, assignment: Assig
                 detail=f"CST record set to Unassigned, but DeleteLIR failed: {delete_error}. The assignment is left in Retiring status; release it again to retry DeleteLIR.",
             )
         transaction_id = (find_resource_by_source(connection, "assignment", assignment_id) or unassigned).transaction_id
-        audit_new_value = f"CST UpdateLIR to Unassigned, then DeleteLIR; Transaction ID {transaction_id} retired; subnet removed locally"
+        audit_new_value = (
+            f"Queued for CST (batch {jobs[0].batch_id}): UpdateLIR to Unassigned, then DeleteLIR retiring Transaction ID {transaction_id}; subnet removed locally"
+            if queued else
+            f"CST UpdateLIR to Unassigned, then DeleteLIR; Transaction ID {transaction_id} retired; subnet removed locally"
+        )
 
     result = connection.execute("DELETE FROM assignments WHERE id = ?", (assignment_id,))
     if result.rowcount == 0:

@@ -170,6 +170,55 @@ class CstContainerSplitTest(unittest.TestCase):
             self.assertIsNone(connection.execute("SELECT 1 FROM assignments WHERE cidr = ?", (ASSIGNED,)).fetchone())
         self.assertEqual(self.ledger(self.container_tx)["retired_at"], "")
 
+    def controlled_sync(self):
+        """auto_execute off: changes are saved and CST jobs queued until pending jobs are pushed."""
+        with app.connect() as connection:
+            connection.execute("UPDATE cst_config SET auto_execute = 0")
+
+    def batch_jobs(self, batch_id: str):
+        with app.connect() as connection:
+            workflow = connection.execute("SELECT workflow_type FROM cst_sync_batches WHERE id = ?", (batch_id,)).fetchone()["workflow_type"]
+            jobs = [(row["operation"], row["cidr"], row["status"]) for row in connection.execute(
+                "SELECT operation, cidr, status FROM cst_sync_jobs WHERE batch_id = ? ORDER BY sequence_no", (batch_id,)
+            )]
+        return workflow, jobs
+
+    def test_controlled_sync_individual_assignment_is_saved_and_queued(self):
+        self.controlled_sync()
+        assignment = self.individual_assignment(ASSIGNED, 8)
+        self.assertEqual(assignment.cidr, ASSIGNED)
+        self.assertEqual(self.calls, [])
+        with app.connect() as connection:
+            batch_id = connection.execute(
+                "SELECT batch_id FROM cst_sync_jobs WHERE cidr = ? AND operation = 'DELETE' AND status = 'PENDING'", (CONTAINER,)
+            ).fetchone()["batch_id"]
+        workflow, jobs = self.batch_jobs(batch_id)
+        self.assertTrue(app.cst_workflow_is_strict(workflow))
+        self.assertEqual([(op, cidr) for op, cidr, _status in jobs], [("DELETE", CONTAINER), ("SEND", "87.101.190.112/29"), ("SEND", ASSIGNED)])
+        self.assertEqual({status for *_rest, status in jobs}, {"PENDING"})
+        self.assertEqual(self.ledger(self.container_tx)["retired_at"], "", "nothing changes in CST until the push")
+
+    def test_controlled_sync_release_queues_unassign_then_delete(self):
+        assignment = self.individual_assignment(ASSIGNED, 8)
+        sent_tx = next(tx for op, cidr, tx, _status in self.calls if op == "SEND" and cidr == ASSIGNED)
+        self.calls.clear()
+        self.controlled_sync()
+        app.unassign(assignment.id)
+        self.assertEqual(self.calls, [])
+        with app.connect() as connection:
+            self.assertIsNone(connection.execute("SELECT 1 FROM assignments WHERE id = ?", (assignment.id,)).fetchone())
+            batch_id = connection.execute("SELECT batch_id FROM cst_sync_jobs WHERE transaction_id = ? AND operation = 'DELETE'", (sent_tx,)).fetchone()["batch_id"]
+        workflow, jobs = self.batch_jobs(batch_id)
+        self.assertEqual(workflow, app.CST_RELEASE_WORKFLOW)
+        self.assertEqual(jobs, [("UPDATE", ASSIGNED, "PENDING"), ("DELETE", ASSIGNED, "PENDING")])
+        self.assertEqual(self.ledger(sent_tx)["retired_at"], "")
+
+        with self.assertRaises(app.HTTPException) as raised:
+            self.individual_assignment(ASSIGNED, 8, "New Customer")
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("already queued", raised.exception.detail)
+        self.assertIn("push pending CST jobs first", raised.exception.detail)
+
     def test_larger_free_block_replaces_smaller_cst_records(self):
         """Reverse overlap, e.g. after a release merges free space: the new block contains CST records."""
         with app.connect() as connection:
