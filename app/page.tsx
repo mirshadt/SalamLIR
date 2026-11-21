@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState, type UIEvent } from "react";
+import { Fragment, useEffect, useMemo, useState, type UIEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
@@ -5687,6 +5687,60 @@ function CstMigrationReviewDialog(props: {
     </Dialog>
   );
 }
+const CST_CHAIN_HEAD_PREFIX = "chain-head:";
+
+type CstBatchRow =
+  | { kind: "job"; key: string; job: CstSyncJob }
+  | { kind: "partial"; key: string; steps: CstSyncJob[]; status: string; replaced: string[]; created: string[] };
+
+const cstStepLabel = (job: CstSyncJob) => (job.operation === "DELETE" ? "DeleteLIR" : job.operation === "UPDATE" ? "UpdateLIR" : job.operation === "SEND" ? "SendLIR" : job.operation);
+
+function cstStatusVariant(status: string) {
+  return status === "SUCCESS" ? "success" : status === "FAILED" || status === "BLOCKED" ? "danger" : status === "PENDING" || status === "RUNNING" ? "warning" : "default";
+}
+
+/** One row per partial reassignment (its chained steps), plus one row per plain job. */
+function groupCstBatchJobs(jobs: CstSyncJob[]): CstBatchRow[] {
+  const nextByDependency = new Map(jobs.filter((job) => job.depends_on_job_id && !job.depends_on_job_id.startsWith(CST_CHAIN_HEAD_PREFIX)).map((job) => [job.depends_on_job_id, job]));
+  const inChain = new Set<string>();
+  const rows: CstBatchRow[] = [];
+  for (const job of [...jobs].sort((left, right) => left.sequence_no - right.sequence_no)) {
+    if (inChain.has(job.id)) {
+      continue;
+    }
+    if (!job.depends_on_job_id.startsWith(CST_CHAIN_HEAD_PREFIX)) {
+      if (!job.depends_on_job_id) {
+        rows.push({ kind: "job", key: job.id, job });
+      }
+      continue;
+    }
+    const steps = [job];
+    let current: CstSyncJob | undefined = job;
+    while (current && nextByDependency.has(current.id)) {
+      current = nextByDependency.get(current.id);
+      if (current) {
+        steps.push(current);
+      }
+    }
+    steps.forEach((step) => inChain.add(step.id));
+    const statuses = steps.map((step) => step.status);
+    const status = statuses.some((item) => item === "FAILED" || item === "BLOCKED")
+      ? "FAILED"
+      : statuses.some((item) => item === "PENDING" || item === "RUNNING")
+        ? "PENDING"
+        : statuses.every((item) => item === "SUCCESS" || item === "NOT_REQUIRED") ? "SUCCESS" : statuses[statuses.length - 1];
+    rows.push({
+      kind: "partial",
+      key: job.depends_on_job_id,
+      steps,
+      status,
+      replaced: [...new Set(steps.filter((step) => step.operation !== "SEND").map((step) => step.cidr))],
+      created: steps.filter((step) => step.operation === "SEND").map((step) => step.cidr)
+    });
+  }
+  return rows;
+}
+
 function CstIntegrationMonitor(props: CstMonitorProps) {
   const [pendingPushLimit, setPendingPushLimit] = useState("0");
   const [selectedBatchId, setSelectedBatchId] = useState(props.cstBatches[0]?.id ?? "");
@@ -5711,13 +5765,39 @@ function CstIntegrationMonitor(props: CstMonitorProps) {
     });
   }, [batchSearch, batchStatusFilter, props.cstBatches]);
   const batchJobsQuery = useQuery({
-    queryKey: ["cst-batch-jobs", selectedBatchId, batchJobStatusFilter],
-    queryFn: () => getCstBatchJobs(selectedBatchId, batchJobStatusFilter),
+    queryKey: ["cst-batch-jobs", selectedBatchId],
+    queryFn: () => getCstBatchJobs(selectedBatchId, "all"),
     enabled: Boolean(selectedBatchId),
     staleTime: 5000,
     refetchOnWindowFocus: false
   });
   const selectedBatchJobs = batchJobsQuery.data ?? [];
+  const [expandedPartials, setExpandedPartials] = useState<Record<string, boolean>>({});
+  const [retryingPartial, setRetryingPartial] = useState("");
+  const batchRows = useMemo(() => groupCstBatchJobs(selectedBatchJobs).filter((row) => (
+    batchJobStatusFilter === "all"
+      || (row.kind === "job" ? row.job.status === batchJobStatusFilter : row.status === batchJobStatusFilter || row.steps.some((step) => step.status === batchJobStatusFilter))
+  )), [selectedBatchJobs, batchJobStatusFilter]);
+  const retryPartialReassignment = async (row: Extract<CstBatchRow, { kind: "partial" }>) => {
+    // Retry from the first unfinished step; stop at the first step that does not succeed.
+    setRetryingPartial(row.key);
+    try {
+      for (const step of row.steps) {
+        if (step.status === "SUCCESS" || step.status === "NOT_REQUIRED") {
+          continue;
+        }
+        const result = await retryCstJob(step.id);
+        if (result.status !== "SUCCESS") {
+          break;
+        }
+      }
+    } catch (error) {
+      window.alert(errorMessage(error));
+    } finally {
+      setRetryingPartial("");
+      void batchJobsQuery.refetch();
+    }
+  };
   const retryableStatuses = new Set(["FAILED", "BLOCKED", "PENDING"]);
   const openBatch = (batch: CstSyncBatch) => {
     setSelectedBatchId(batch.id);
@@ -5892,21 +5972,66 @@ function CstIntegrationMonitor(props: CstMonitorProps) {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {selectedBatchJobs.map((job) => (
-                    <TableRow key={job.id}>
+                  {batchRows.map((row) => row.kind === "job" ? (
+                    <TableRow key={row.key}>
                       <TableCell>
-                        <p className="font-semibold">{job.cidr}</p>
-                        <p className="font-mono text-xs text-muted-foreground">{job.transaction_id}</p>
-                        <p className="font-mono text-xs text-muted-foreground">{job.id}</p>
+                        <p className="font-semibold">{row.job.cidr}</p>
+                        <p className="font-mono text-xs text-muted-foreground">{row.job.transaction_id}</p>
+                        <p className="font-mono text-xs text-muted-foreground">{row.job.id}</p>
                       </TableCell>
-                      <TableCell>{job.operation}</TableCell>
-                      <TableCell><Badge variant={job.status === "SUCCESS" ? "success" : job.status === "FAILED" || job.status === "BLOCKED" ? "danger" : job.status === "PENDING" ? "warning" : "default"}>{job.status}</Badge></TableCell>
-                      <TableCell className="max-w-[360px] text-xs text-muted-foreground">{job.last_error || "-"}</TableCell>
-                      <TableCell>{retryableStatuses.has(job.status) ? <Button size="sm" variant="outline" onClick={() => retryJobFromBatch(job)}>Retry</Button> : null}</TableCell>
+                      <TableCell>{row.job.operation}</TableCell>
+                      <TableCell><Badge variant={cstStatusVariant(row.job.status)}>{row.job.status}</Badge></TableCell>
+                      <TableCell className="max-w-[360px] text-xs text-muted-foreground">{row.job.last_error || "-"}</TableCell>
+                      <TableCell>{retryableStatuses.has(row.job.status) ? <Button size="sm" variant="outline" onClick={() => retryJobFromBatch(row.job)}>Retry</Button> : null}</TableCell>
                     </TableRow>
+                  ) : (
+                    <Fragment key={row.key}>
+                      <TableRow className="cursor-pointer bg-muted/20 hover:bg-muted/40" onClick={() => setExpandedPartials((current) => ({ ...current, [row.key]: !current[row.key] }))}>
+                        <TableCell>
+                          <div className="flex items-start gap-2">
+                            {expandedPartials[row.key] ? <ChevronDown className="mt-0.5 h-4 w-4 shrink-0" /> : <ChevronRight className="mt-0.5 h-4 w-4 shrink-0" />}
+                            <div>
+                              <p className="font-semibold">{row.replaced.join(", ")}</p>
+                              <p className="text-xs text-muted-foreground">into {row.created.join(", ") || "-"}</p>
+                            </div>
+                          </div>
+                        </TableCell>
+                        <TableCell>
+                          <p className="font-medium">Partial reassignment</p>
+                          <p className="text-xs text-muted-foreground">{row.steps.filter((step) => step.status === "SUCCESS").length}/{row.steps.length} steps done</p>
+                        </TableCell>
+                        <TableCell><Badge variant={cstStatusVariant(row.status)}>{row.status}</Badge></TableCell>
+                        <TableCell className="max-w-[360px] text-xs text-muted-foreground">{row.steps.find((step) => step.status !== "SUCCESS" && step.last_error)?.last_error || "-"}</TableCell>
+                        <TableCell onClick={(event) => event.stopPropagation()}>
+                          {row.status !== "SUCCESS" ? (
+                            <Button size="sm" variant="outline" disabled={retryingPartial === row.key} onClick={() => void retryPartialReassignment(row)}>
+                              {retryingPartial === row.key ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                              Retry
+                            </Button>
+                          ) : null}
+                        </TableCell>
+                      </TableRow>
+                      {expandedPartials[row.key] ? row.steps.map((step, index) => (
+                        <TableRow key={step.id} className="text-sm">
+                          <TableCell className="pl-10">
+                            <p className="font-medium">Step {index + 1}: {step.cidr}</p>
+                            <p className="font-mono text-xs text-muted-foreground">{step.transaction_id}</p>
+                            <p className="font-mono text-xs text-muted-foreground">{step.id}</p>
+                          </TableCell>
+                          <TableCell>{cstStepLabel(step)}{step.operation === "UPDATE" && index === 0 && row.steps.some((other) => other.operation === "DELETE" && other.cidr === step.cidr) ? " to Unassigned" : ""}</TableCell>
+                          <TableCell><Badge variant={cstStatusVariant(step.status)}>{step.status}</Badge></TableCell>
+                          <TableCell className="max-w-[360px] text-xs text-muted-foreground">
+                            {step.status === "PENDING" && index > 0 && row.steps[index - 1].status !== "SUCCESS"
+                              ? `Waiting for step ${index} (${cstStepLabel(row.steps[index - 1])} ${row.steps[index - 1].cidr}) to succeed`
+                              : step.last_error || "-"}
+                          </TableCell>
+                          <TableCell />
+                        </TableRow>
+                      )) : null}
+                    </Fragment>
                   ))}
                   {selectedBatchId && batchJobsQuery.isFetching ? <TableRow><TableCell colSpan={5} className="py-6 text-center text-muted-foreground">Loading batch jobs...</TableCell></TableRow> : null}
-                  {selectedBatchId && !batchJobsQuery.isFetching && !selectedBatchJobs.length ? <TableRow><TableCell colSpan={5} className="py-6 text-center text-muted-foreground">No jobs match this batch/status filter.</TableCell></TableRow> : null}
+                  {selectedBatchId && !batchJobsQuery.isFetching && !batchRows.length ? <TableRow><TableCell colSpan={5} className="py-6 text-center text-muted-foreground">No jobs match this batch/status filter.</TableCell></TableRow> : null}
                   {!selectedBatchId ? <TableRow><TableCell colSpan={5} className="py-6 text-center text-muted-foreground">Select a batch to view failed jobs and retry individual transactions.</TableCell></TableRow> : null}
                 </TableBody>
               </Table>
