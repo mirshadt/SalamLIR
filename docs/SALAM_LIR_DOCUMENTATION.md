@@ -594,6 +594,7 @@ This keeps business assignment data fresh before business hours and reduces load
 | `GET` | `/assignments` | List assignments |
 | `POST` | `/assignments` | Create assignment |
 | `POST` | `/assignments/bulk` | Bulk assignment import |
+| `POST` | `/assignments/bulk-release` | Bulk release by CIDR or assignmentId (`dry_run: true` previews without changes). Per CST LIR rules: UpdateLIR to Unassigned, then DeleteLIR, which retires the Transaction ID permanently; the subnet is removed locally (archived to `ip_resource_history`). Use with `/assignments/bulk` for two-step reassignment; the new assignment gets a new Transaction ID. |
 | `PATCH` | `/assignments/{assignment_id}/status` | Suspend/resume/retire assignment |
 | `DELETE` | `/assignments/{assignment_id}` | Release assignment |
 

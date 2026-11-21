@@ -449,6 +449,7 @@ class BulkCsvRequest(BaseModel):
     file_name: str = ""
     allocated_pool: bool = False
     allow_conflicts: bool = False
+    dry_run: bool = False
 
 
 class BulkOutputRow(BaseModel):
@@ -8114,6 +8115,10 @@ def run_bulk_batch(batch_id: str, operation_type: str, csv_text: str, allocated_
                 result = process_pool_bulk(csv_text, allocated_pool=allocated_pool)
             elif operation_type == "ASSIGNMENT_IMPORT":
                 result = process_assignment_bulk(csv_text, allow_conflicts=allow_conflicts)
+            elif operation_type == "ASSIGNMENT_RELEASE":
+                result = process_assignment_release_bulk(csv_text)
+            elif operation_type == "ASSIGNMENT_RELEASE_PREVIEW":
+                result = process_assignment_release_bulk(csv_text, dry_run=True)
             else:
                 raise ValueError(f"Unsupported bulk operation type: {operation_type}")
         complete_bulk_batch(batch_id, result, started)
@@ -9533,36 +9538,192 @@ def update_assignment_status(assignment_id: str, payload: StatusUpdate) -> Assig
 def unassign(assignment_id: str) -> None:
     assignment = find_assignment(assignment_id)
     with connect() as connection:
-        resource = find_resource_by_source(connection, "assignment", assignment_id)
-        cst_delete_required = cst_resource_reported_to_cst(connection, resource)
-        if resource and resource.status == "RETIRED":
-            audit_action = "Retired Resource Deletion" if not cst_delete_required else "CST Assignment Status Update"
-            audit_new_value = "Deleted retired resource" if not cst_delete_required else "Set CST LIR assignmentStatusId to 1 Unassigned and released locally"
-        else:
-            assert_resource_can_change(connection, "assignment", assignment_id)
-            audit_action = "Subnet Release"
-            audit_new_value = "Released to free pool"
+        unassign_assignment_record(connection, assignment)
 
-        if cst_delete_required:
-            connection.execute(
-                "UPDATE assignments SET status = ?, action_flag = ? WHERE id = ?",
-                ("Retiring", "U", assignment_id),
+
+def cst_release_failure_detail(jobs: list[CstSyncJob]) -> str:
+    failed = next((job for job in jobs if job.status != "SUCCESS"), None)
+    return (failed.last_error or f"CST job remained {failed.status}") if failed else ""
+
+
+def unassign_assignment_record(connection: sqlite3.Connection, assignment: Assignment, materialize: bool = True) -> bool:
+    """Release one assignment following the CST LIR rules. Returns True when CST was updated.
+
+    For a record held in CST:
+      1. UpdateLIR to Unassigned (assignmentStatusId 1) - DeleteLIR is rejected unless the record is Unassigned.
+      2. DeleteLIR - on success the Transaction ID is retired in cst_transaction_ledger and is never reused.
+    Then the subnet is removed locally (the previous version is archived to ip_resource_history) and the
+    freed space is re-materialized as new unassigned fragments, which get new Transaction IDs when sent.
+
+    If step 1 fails nothing changes. If step 2 fails, the Unassigned state is committed (CST already has it),
+    the assignment is left in Retiring status, and an HTTPException is raised; releasing it again retries.
+    """
+    assignment_id = assignment.id
+    resource = find_resource_by_source(connection, "assignment", assignment_id)
+    retired = bool(resource and resource.status == "RETIRED")
+    if not retired:
+        assert_resource_can_change(connection, "assignment", assignment_id)
+    in_cst = cst_resource_reported_to_cst(connection, resource) and not cst_resource_deleted_from_cst(connection, resource)
+    audit_new_value = "Released; subnet removed locally (not held in CST)"
+
+    if in_cst:
+        connection.execute(
+            "UPDATE assignments SET status = ?, action_flag = ? WHERE id = ?",
+            ("Retiring", "U", assignment_id),
+        )
+        retiring_assignment = assignment_from_row(connection.execute("SELECT * FROM assignments WHERE id = ?", (assignment_id,)).fetchone())
+        resource = sync_assignment_resource(connection, retiring_assignment)
+        update_jobs = create_cst_sync_jobs(connection, [(cst_unassigned_update_resource(resource), "UPDATE")], "ASSIGNMENT_RELEASE_UNASSIGN")
+        assert_cst_business_flow_succeeded(update_jobs, "Release (CST UpdateLIR to Unassigned)")
+
+        unassigned = find_resource_by_source(connection, "assignment", assignment_id) or resource
+        delete_jobs = create_cst_sync_jobs(connection, [(cst_unassigned_update_resource(unassigned), "DELETE")], "ASSIGNMENT_RELEASE_DELETE")
+        delete_error = cst_release_failure_detail(delete_jobs)
+        if delete_error:
+            record_audit(connection, "CST DeleteLIR Failed", "assignment", assignment_id, "", f"Record is Unassigned in CST; DeleteLIR failed: {delete_error}")
+            connection.commit()
+            raise HTTPException(
+                status_code=502,
+                detail=f"CST record set to Unassigned, but DeleteLIR failed: {delete_error}. The assignment is left in Retiring status; release it again to retry DeleteLIR.",
             )
-            retiring_assignment = assignment_from_row(connection.execute("SELECT * FROM assignments WHERE id = ?", (assignment_id,)).fetchone())
-            resource = sync_assignment_resource(connection, retiring_assignment)
-            jobs = create_cst_sync_jobs(connection, [(cst_unassigned_update_resource(resource), "UPDATE")], "ASSIGNMENT_UNASSIGN")
-            assert_cst_business_flow_succeeded(jobs, "Unassign")
-            audit_action = "CST Assignment Status Update"
-            audit_new_value = "Set CST LIR assignmentStatusId to 1 Unassigned and released locally"
+        transaction_id = (find_resource_by_source(connection, "assignment", assignment_id) or unassigned).transaction_id
+        audit_new_value = f"CST UpdateLIR to Unassigned, then DeleteLIR; Transaction ID {transaction_id} retired; subnet removed locally"
 
-        result = connection.execute("DELETE FROM assignments WHERE id = ?", (assignment_id,))
-        if result.rowcount == 0:
-            raise HTTPException(status_code=404, detail="Assignment not found")
-        if resource:
-            connection.execute("DELETE FROM assignment_details WHERE resource_uuid = ?", (resource.resource_uuid,))
-            connection.execute("DELETE FROM ip_resources WHERE resource_uuid = ?", (resource.resource_uuid,))
+    result = connection.execute("DELETE FROM assignments WHERE id = ?", (assignment_id,))
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Assignment not found")
+    if resource:
+        archive_ip_resource(connection, resource.resource_uuid, "ASSIGNMENT_RELEASED_CST_DELETED" if in_cst else "ASSIGNMENT_RELEASED")
+        connection.execute("DELETE FROM assignment_details WHERE resource_uuid = ?", (resource.resource_uuid,))
+        connection.execute("DELETE FROM ip_resources WHERE resource_uuid = ?", (resource.resource_uuid,))
+    if materialize:
         materialize_bulk_unassigned_fragments(connection)
-        record_audit(connection, audit_action, "assignment", assignment_id, assignment.model_dump_json(), audit_new_value)
+    record_audit(connection, "Retired Resource Deletion" if retired else "Subnet Release", "assignment", assignment_id, assignment.model_dump_json(), audit_new_value)
+    return in_cst
+
+
+
+def bulk_release_target(connection: sqlite3.Connection, row: dict[str, str]) -> Assignment:
+    """Resolve the assignment a bulk-delete row points at, with safety checks."""
+    assignment_id = csv_value(row, "assignmentId", "assignment_id", "id")
+    cidr_text = csv_value(row, "cidr")
+    if not assignment_id and not cidr_text:
+        raise HTTPException(status_code=400, detail="Each delete row needs cidr or assignmentId")
+    if assignment_id:
+        found = connection.execute("SELECT * FROM assignments WHERE id = ?", (assignment_id,)).fetchone()
+        if found is None:
+            raise HTTPException(status_code=404, detail=f"Assignment {assignment_id} not found")
+        assignment = assignment_from_row(found)
+        if cidr_text and str(normalize_network(cidr_text)) != str(network_of(assignment)):
+            raise HTTPException(status_code=409, detail=f"Assignment {assignment_id} is {assignment.cidr}, not {cidr_text}")
+    else:
+        network = normalize_network(cidr_text)
+        if cidr_text.strip() != str(network):
+            raise HTTPException(status_code=400, detail=f"{cidr_text} is not CIDR-aligned; use {network}")
+        matches = connection.execute("SELECT * FROM assignments WHERE cidr = ?", (str(network),)).fetchall()
+        if not matches:
+            raise HTTPException(status_code=404, detail=f"No assignment exists for {network}")
+        if len(matches) > 1:
+            ids = ", ".join(str(item["id"]) for item in matches[:8])
+            raise HTTPException(status_code=409, detail=f"{network} matches {len(matches)} assignments ({ids}); add assignmentId to choose one")
+        assignment = assignment_from_row(matches[0])
+
+    expected_customer = csv_value(row, "customerName", "customer_name")
+    if expected_customer and expected_customer.strip().casefold() != str(assignment.customer_name or "").strip().casefold():
+        raise HTTPException(status_code=409, detail=f"{assignment.cidr} belongs to '{assignment.customer_name}', not '{expected_customer}'")
+    expected_service = csv_value(row, "serviceId", "service_id")
+    if expected_service and expected_service.strip() != str(assignment.service_id or "").strip():
+        raise HTTPException(status_code=409, detail=f"{assignment.cidr} has serviceId '{assignment.service_id}', not '{expected_service}'")
+    return assignment
+
+
+def process_assignment_release_bulk(csv_text: object, dry_run: bool = False) -> BulkImportResult:
+    """Bulk release per CST LIR rules (UpdateLIR to Unassigned, then DeleteLIR). Each row is its own transaction."""
+    deleted = 0
+    errors: list[str] = []
+    output_rows: list[BulkOutputRow] = []
+    seen_ids: set[str] = set()
+    for index, row in enumerate(csv_rows(csv_text), start=2):
+        cidr_text = csv_value(row, "cidr")
+        try:
+            if csv_value(row, "_extra_columns"):
+                raise HTTPException(status_code=400, detail="Row has more values than the CSV header; quote fields that contain commas")
+            row_key = csv_value(row, "assignmentId", "assignment_id", "id") or cidr_text.strip()
+            if row_key in seen_ids:
+                raise HTTPException(status_code=409, detail=f"{row_key} is listed more than once in this file")
+            with connect() as connection:
+                assignment = bulk_release_target(connection, row)
+                if assignment.id in seen_ids or assignment.cidr in seen_ids:
+                    raise HTTPException(status_code=409, detail=f"{assignment.cidr} is listed more than once in this file")
+                seen_ids.update({row_key, assignment.id, assignment.cidr})
+                resource = find_resource_by_source(connection, "assignment", assignment.id)
+                cst_required = cst_resource_reported_to_cst(connection, resource) and not cst_resource_deleted_from_cst(connection, resource)
+                transaction_id = resource.transaction_id if resource else ""
+                cst_steps = f"CST UpdateLIR to Unassigned, then DeleteLIR (Transaction ID {transaction_id} retired)"
+                if dry_run:
+                    if not (resource and resource.status == "RETIRED"):
+                        assert_resource_can_change(connection, "assignment", assignment.id)
+                    status = "WOULD_RELEASE"
+                    message = ("Would send " + cst_steps if cst_required else "Not held in CST; no CST call") + " and remove the subnet locally"
+                else:
+                    unassign_assignment_record(connection, assignment, materialize=False)
+                    status = "RELEASED"
+                    message = (cst_steps if cst_required else "Not held in CST; no CST call") + "; subnet removed locally"
+                    reason = csv_value(row, "reason", "notes")
+                    if reason:
+                        record_audit(connection, "Bulk Assignment Release Reason", "assignment", assignment.id, "", reason)
+            deleted += 1
+            output_rows.append(
+                BulkOutputRow(
+                    inputRowNumber=index,
+                    processingStatus=status,
+                    processingMessage=message,
+                    generatedResourceUuid=resource.resource_uuid if resource else "",
+                    generatedCidr=assignment.cidr,
+                    generatedSize=assignment.size,
+                    status=assignment.status,
+                    assignmentDate=assignment.assignment_date,
+                    customerName=assignment.customer_name,
+                    cstSyncReady=not cst_required,
+                    cstValidationStatus="CST_UNASSIGN_AND_DELETE" if cst_required else "NOT_REQUIRED",
+                )
+            )
+        except (HTTPException, ValueError, sqlite3.Error) as exc:
+            detail = str(exc.detail) if isinstance(exc, HTTPException) else str(exc)
+            errors.append(f"row {index}{' ' + cidr_text if cidr_text else ''}: {detail}")
+            output_rows.append(
+                BulkOutputRow(
+                    inputRowNumber=index,
+                    processingStatus="FAILED",
+                    processingMessage=detail,
+                    generatedCidr=cidr_text,
+                    customerName=csv_value(row, "customerName", "customer_name"),
+                    cstValidationStatus="REJECTED",
+                    cstValidationErrors=detail,
+                )
+            )
+    if deleted and not dry_run:
+        with connect() as connection:
+            materialized, deleted_stale = materialize_bulk_unassigned_fragments(connection)
+        output_rows.append(
+            BulkOutputRow(
+                inputRowNumber=0,
+                processingStatus="MATERIALIZED_UNASSIGNED",
+                processingMessage=f"Materialized {materialized} unassigned CIDR fragment(s); removed {deleted_stale} stale fragment(s).",
+                assignmentType="UNASSIGNED",
+                cstSyncReady=True,
+                cstValidationStatus="READY",
+            )
+        )
+    return BulkImportResult(imported=deleted, blocked=len(errors), errors=errors, output_rows=output_rows)
+
+
+@app.post("/assignments/bulk-release", response_model=BulkBatch, status_code=202)
+def bulk_release_assignments(payload: BulkCsvRequest, background_tasks: BackgroundTasks) -> BulkBatch:
+    operation_type = "ASSIGNMENT_RELEASE_PREVIEW" if payload.dry_run else "ASSIGNMENT_RELEASE"
+    batch = create_bulk_batch(operation_type, payload)
+    background_tasks.add_task(run_bulk_batch, batch.id, batch.operation_type, payload.csv_text)
+    return batch
 
 
 @app.get("/audit", response_model=list[AuditEvent])
