@@ -7651,13 +7651,31 @@ def cst_overlap_groups(
     return groups, plain
 
 
+def cst_record_local_owner(connection: sqlite3.Connection, row: sqlite3.Row) -> Assignment | None:
+    """The active local assignment a CST record belongs to, if it has not been released or reassigned."""
+    resource = connection.execute("SELECT * FROM ip_resources WHERE resource_uuid = ?", (str(row["resource_uuid"]),)).fetchone()
+    if resource is None or str(resource["source_entity_type"]) != "assignment" or str(resource["status"]) == "RETIRED":
+        return None
+    assignment_row = connection.execute("SELECT * FROM assignments WHERE id = ?", (str(resource["source_entity_id"]),)).fetchone()
+    if assignment_row is None:
+        return None
+    assignment = assignment_from_row(assignment_row)
+    return assignment if assignment_active_for_conflict(assignment) else None
+
+
 def cst_plan_overlap_group(
     connection: sqlite3.Connection,
     rows: list[sqlite3.Row],
     members: list[ResourceRecord],
     exempt_uuids: set[str] | None = None,
 ) -> tuple[CstContainerSplitItem, list[tuple[ResourceRecord, str]]]:
-    """DeleteLIR the CST records, then SendLIR the local subnets (UpdateLIR when one subnet equals one record)."""
+    """CST LIR partial reassignment for one group of overlapping records.
+
+    Per record: (1) UpdateLIR to Unassigned, only if CST does not already hold it as Unassigned;
+    (2) DeleteLIR, retiring its Transaction ID. Then (3)/(4) SendLIR every local subnet in the
+    group: the reassigned and the remaining portions. When one local subnet equals the one record,
+    a single UpdateLIR replaces all of this.
+    """
     exempt = exempt_uuids or set()
     statuses = {str(row["transaction_id"]): cst_recorded_assignment_status(connection, str(row["transaction_id"])) for row in rows}
     item = CstContainerSplitItem(
@@ -7675,11 +7693,9 @@ def cst_plan_overlap_group(
         if queued_delete is not None:
             blockers.append(f"a DeleteLIR for {row['cidr']} is already queued in CST batch {queued_delete['batch_id']}; push pending CST jobs first")
             continue
-        status_id = statuses[str(row["transaction_id"])]
-        if status_id is None:
-            blockers.append(f"CST status of {row['cidr']} is unknown (no successful SendLIR/UpdateLIR recorded here); confirm it is Unassigned in CST first")
-        elif status_id != 1:
-            blockers.append(f"{row['cidr']} is {assignment_status_id_name(status_id)} in CST (assignmentStatusId {status_id}); DeleteLIR needs Unassigned. Release it or use partial reassignment first")
+        owner = cst_record_local_owner(connection, row)
+        if owner is not None:
+            blockers.append(f"{row['cidr']} is still assigned locally to {owner.customer_name or owner.id}; release it or use partial reassignment first")
     blockers.extend(blocker for blocker in (cst_resource_send_blocker(connection, member) for member in members if member.resource_uuid not in exempt) if blocker)
 
     previous_end = -1
@@ -7703,13 +7719,19 @@ def cst_plan_overlap_group(
     if len(rows) == 1 and len(members) == 1 and normalize_network(members[0].cidr) == normalize_network(str(rows[0]["cidr"])):
         operations: list[tuple[ResourceRecord, str]] = [(members[0], "UPDATE")]
     else:
-        operations = [
-            *[(cst_resource_from_ledger(row).model_copy(update={"assignment_status_id": 1}), "DELETE") for row in rows],
-            *[(member, "SEND") for member in members],
-        ]
+        operations = []
+        for row in rows:
+            record = cst_unassigned_update_resource(cst_resource_from_ledger(row))
+            if statuses[str(row["transaction_id"])] != 1:
+                operations.append((record, "UPDATE"))  # step 1: only if not already Unassigned (or unknown here)
+            operations.append((record, "DELETE"))  # step 2
+        operations.extend((member, "SEND") for member in members)  # steps 3 and 4
     item.operations = [
-        f"{'DeleteLIR' if operation == 'DELETE' else 'UpdateLIR' if operation == 'UPDATE' else 'SendLIR'} {resource.cidr}"
-        + (f" (Transaction ID {resource.transaction_id})" if operation == "DELETE" else f" [{assignment_status_id_name(resource.assignment_status_id)}]")
+        (
+            f"DeleteLIR {resource.cidr} (Transaction ID {resource.transaction_id})" if operation == "DELETE"
+            else f"UpdateLIR {resource.cidr} to Unassigned (Transaction ID {resource.transaction_id})" if operation == "UPDATE" and resource.source_entity_type == "cst_lir_ledger"
+            else f"{'UpdateLIR' if operation == 'UPDATE' else 'SendLIR'} {resource.cidr} [{assignment_status_id_name(resource.assignment_status_id)}]"
+        )
         for resource, operation in operations
     ]
     if blockers:

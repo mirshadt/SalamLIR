@@ -101,16 +101,43 @@ class CstContainerSplitTest(unittest.TestCase):
         self.assertTrue(all(": PENDING" in status for status in statuses[1:]), statuses)
         self.assertEqual(self.ledger(self.container_tx)["retired_at"], "")
 
-    def test_assigned_cst_record_is_never_deleted(self):
+    def test_assigned_cst_record_is_unassigned_then_deleted(self):
+        """CST LIR step 1: UpdateLIR to Unassigned only when the record is not Unassigned, then steps 2-4."""
         with app.connect() as connection:
             root = app.find_resource_by_cidr(connection, ROOT)
         assigned_tx = self.send_unassigned_fragment("87.101.190.32/27", root, status_id=3)
-        self.load_assignment("87.101.190.32/30", 4)
-        result = app.run_cst_container_split(app.CstContainerSplitRequest(dry_run=False, execute_immediately=True))
-        blocked = [item for item in result.containers if item.container_transaction_id == assigned_tx]
-        self.assertEqual(blocked[0].status, "BLOCKED")
-        self.assertIn("DeleteLIR needs Unassigned", blocked[0].reason)
-        self.assertNotIn(("DELETE", "87.101.190.32/27"), {(op, cidr) for op, cidr, *_ in self.calls})
+        self.load_assignment("87.101.190.32/28", 16)
+        preview = app.run_cst_container_split(app.CstContainerSplitRequest(dry_run=True))
+        group = next(item for item in preview.containers if item.container_transaction_id == assigned_tx)
+        self.assertEqual(group.status, "PLANNED", group.reason)
+        self.assertEqual(group.operations, [
+            f"UpdateLIR 87.101.190.32/27 to Unassigned (Transaction ID {assigned_tx})",
+            f"DeleteLIR 87.101.190.32/27 (Transaction ID {assigned_tx})",
+            "SendLIR 87.101.190.32/28 [Business]",
+            "SendLIR 87.101.190.48/28 [Unassigned]",
+        ])
+        app.run_cst_container_split(app.CstContainerSplitRequest(dry_run=False, execute_immediately=True, container_cidrs=["87.101.190.32/27"]))
+        self.assertEqual([(op, cidr, status) for op, cidr, _tx, status in self.calls], [
+            ("UPDATE", "87.101.190.32/27", 1), ("DELETE", "87.101.190.32/27", 1),
+            ("SEND", "87.101.190.32/28", 3), ("SEND", "87.101.190.48/28", 1),
+        ])
+        self.assertEqual({tx for op, _cidr, tx, _status in self.calls if op != "SEND"}, {assigned_tx})
+        self.assertNotEqual(self.ledger(assigned_tx)["retired_at"], "")
+
+    def test_unassigned_record_skips_step_one(self):
+        self.load_assignment()
+        preview = app.run_cst_container_split(app.CstContainerSplitRequest(dry_run=True))
+        self.assertFalse(any(line.startswith("UpdateLIR") for line in preview.containers[0].operations))
+
+    def test_record_still_assigned_locally_is_blocked(self):
+        owner = self.individual_assignment("87.101.190.64/27", 32, "Current Owner")
+        self.calls.clear()
+        result = app.process_assignment_bulk("\n".join([HEADER, business_row("87.101.190.64/30", 4, "Other Customer", "SVC-2")]), allow_conflicts=True)
+        self.assertEqual(result.imported, 1, result.errors)
+        preview = app.run_cst_container_split(app.CstContainerSplitRequest(dry_run=True))
+        group = next(item for item in preview.containers if item.container_cidr == owner.cidr)
+        self.assertEqual(group.status, "BLOCKED")
+        self.assertIn("still assigned locally to Current Owner", group.reason)
 
     def individual_assignment(self, cidr: str, size: int, customer: str = "Walk-in Customer"):
         """Assignment Management path: one assignment, sent to CST straight away."""

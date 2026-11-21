@@ -407,12 +407,18 @@ CST rejects a SendLIR whose CIDR overlaps a record it already holds ("This IP CI
 
 Every path that sends new subnets to CST applies the same rule, so the result does not depend on how the subnet was created: Assignment Management, pool partition, bulk load (when its migration job is created), manual migration and initial bootstrap. Before sending, the overlapping CST records and every unsent local subnet sharing their space are grouped, and per group:
 
-1. DeleteLIR each overlapping record. It must be Unassigned in CST; its Transaction ID is retired and never reused.
-2. SendLIR every local subnet in the group: the assigned portions and the remaining unassigned portions, each with a new Transaction ID. The remaining portions are the saved local unassigned blocks, so they are not sent twice later.
+| Step | Condition | Action | Function |
+| --- | --- | --- | --- |
+| 1 | Only if the record is not Unassigned in CST (or its status is not recorded here) | Change the record to Unassigned | UpdateLIR |
+| 2 | Always | Delete the original record; its Transaction ID is retired and never reused | DeleteLIR |
+| 3 | Always | Create the reassigned portion(s) with new Transaction IDs | SendLIR |
+| 4 | Always | Create the remaining portion(s) with new Transaction IDs | SendLIR |
+
+Example: original `172.20.40.0/23`, reassign `172.20.40.0/24`: UpdateLIR `/23` to Unassigned (if needed), DeleteLIR `/23`, SendLIR `172.20.40.0/24`, SendLIR `172.20.41.0/24`. The remaining portions are the saved local unassigned blocks, so they are not sent twice later.
 
 When one local subnet has exactly the CIDR of one record, an UpdateLIR is sent instead. Each group is its own strictly sequenced batch: no SendLIR runs unless the DeleteLIRs succeeded.
 
-A group is blocked, and nothing is deleted, when a record is assigned in CST or its CST status is unknown here, the local subnets do not cover all of a record's addresses, or another subnet in the group is not CST-ready, has an unresolved conflict or is already queued. For Assignment Management the assignment is then refused with the reason. If CST accepted the DeleteLIR but a later SendLIR failed, the assignment is kept (CST no longer holds the old record) and the error names the batch to retry.
+A group is blocked, and nothing is changed in CST, when a record still belongs to an active local assignment (release it or use partial reassignment first), a DeleteLIR for it is already queued, the local subnets do not cover all of a record's addresses, or another subnet in the group is not CST-ready, has an unresolved conflict or is already queued. For Assignment Management the assignment is then refused with the reason. If CST accepted the DeleteLIR but a later SendLIR failed, the assignment is kept (CST no longer holds the old record) and the error names the batch to retry.
 
 With CST auto-execute off (controlled sync), changes are saved locally and their CST jobs are queued, then sent in order when pending jobs are pushed. Releases queue UpdateLIR to Unassigned and DeleteLIR in one ordered batch. While a DeleteLIR is still queued, CST still holds that record, so a new assignment over the same space is refused until pending jobs are pushed.
 
