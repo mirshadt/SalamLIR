@@ -146,6 +146,22 @@ Assignment Management supports:
 - Creating the assignment
 - Suspending, resuming, refreshing BSS, or releasing existing assignments
 
+### 8.2.1 Loading New IP Assignments in Bulk
+
+Template: `scripts/templates/new_ip_assignment_iptool_template.csv`. It is the IP Tool export layout plus optional columns that make each row ready for CST without a Siebel export: `CR Number`, `Unified Number`, `Contact Name`, `Mobile Number`, `Email`, `ID Number`, `City`, `Region`.
+
+1. Fill one row per subnet. In Excel, format `Order Number`, `CR Number`, `Unified Number`, `Mobile Number` and `ID Number` as **Text** before pasting. Otherwise Excel turns long numbers into values like `1.00001E+12` and the real digits are lost; the script rejects such rows.
+2. Convert to the bulk assignment CSV:
+
+   ```bash
+   python scripts/generate_assignment_bulk_from_iptool_siebel.py --iptool new_ip.csv --legacy-iptool-only --city-map scripts/cst_city_lookup.csv --output bulk_assignments.csv --missing-output rejected_rows.csv
+   ```
+
+   With a Siebel export, use `--siebel siebel.csv` instead of `--legacy-iptool-only`; Siebel supplies CR/unified number and contact details.
+3. Check `rejected_rows.csv` (`missingReason` column), then upload `bulk_assignments.csv` in Bulk Operations > Bulk Import: Assignments / Reservations.
+
+Mapping: `Order Number` becomes `serviceId`; `Status` "Reserved" is loaded as assignmentStatusId 3 (Business); `CustomerType` GOV maps to customerTypeId 1, otherwise 2. CST requires a valid 10-digit `CR Number` or `Unified Number`; without one the row imports but is not ready for CST sync. Missing contact fields fall back to placeholders (`Business Contact`, `0000000000`, `NA@NA.com`).
+
 ### 8.3 Administration
 
 Administration contains:

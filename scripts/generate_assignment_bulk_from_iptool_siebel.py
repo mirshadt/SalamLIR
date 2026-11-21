@@ -110,6 +110,14 @@ def row_get(row: dict[str, str], *names: str) -> str:
     return ""
 
 
+EXCEL_SCIENTIFIC_RE = re.compile(r"^\s*\d+(\.\d+)?[eE]\+?\d+\s*$")
+
+
+def is_excel_scientific(value: str) -> bool:
+    """True for values like 1.00001E+12: Excel rounded a long number and its real digits are lost."""
+    return bool(EXCEL_SCIENTIFIC_RE.match(str(value or "")))
+
+
 def normalize_join_key(value: str) -> str:
     text = str(value or "").strip()
     if not text:
@@ -486,11 +494,18 @@ def contact_name(siebel: dict[str, str]) -> str:
     name = " ".join(part.strip() for part in parts if part and part.strip())
     return name or row_get(siebel, "X_ITC_B2B_AP_NAME")
 
+# Optional IP Tool columns for new-IP sheets loaded without a Siebel export.
+IPTOOL_CR_COLUMNS = ("CR Number", "CRNumber", "Commercial Registration", "CommercialRegId", "commercialRegId")
+IPTOOL_UNIFIED_COLUMNS = ("Unified Number", "UnifiedNumber", "unifiedNumber")
+
+
 def organization_identifier(siebel: dict[str, str], iptool: dict[str, str]) -> str:
     for value in (
         row_get(siebel, "X_ITC_B2B_COMMERCIAL_REGIS_NUM"),
         row_get(siebel, "X_ITC_B2B_UNIFIED_NUMBER"),
         row_get(siebel, "X_ITC_B2B_AP_IDENTITY_ID"),
+        row_get(iptool, *IPTOOL_CR_COLUMNS),
+        row_get(iptool, *IPTOOL_UNIFIED_COLUMNS),
         row_get(iptool, "CustomerNumber", "Customer Number"),
     ):
         valid = valid_10_digit(value)
@@ -514,8 +529,8 @@ def make_bulk_row(
     customer_name = row_get(siebel, "ACCOUNT_NAME") or row_get(iptool, "CustomerName", "Customer Name") or "Business Customer"
     customer_id = row_get(siebel, "ACCOUNT_NUMBER") or row_get(iptool, "CustomerNumber", "Customer Number") or "0"
     org_id = organization_identifier(siebel, iptool) or customer_id
-    commercial_reg = valid_10_digit(row_get(siebel, "X_ITC_B2B_COMMERCIAL_REGIS_NUM"))
-    unified = valid_10_digit(row_get(siebel, "X_ITC_B2B_UNIFIED_NUMBER"))
+    commercial_reg = valid_10_digit(row_get(siebel, "X_ITC_B2B_COMMERCIAL_REGIS_NUM")) or valid_10_digit(row_get(iptool, *IPTOOL_CR_COLUMNS))
+    unified = valid_10_digit(row_get(siebel, "X_ITC_B2B_UNIFIED_NUMBER")) or valid_10_digit(row_get(iptool, *IPTOOL_UNIFIED_COLUMNS))
 
     region_text = row_get(siebel, "ACCOUNT_REGION", "REGION", "Region") or iptool_region
     city_text = row_get(siebel, "CITY", "ACCOUNT_CITY", "City") or iptool_city
@@ -548,7 +563,15 @@ def make_bulk_row(
         or "Business Contact"
     )
 
-    service_id = row_get(siebel, "SERIAL_NUM") or normalize_join_key(row_get(iptool, args.iptool_join_column)) or "0"
+    order_number = row_get(iptool, args.iptool_join_column)
+    service_id = row_get(siebel, "SERIAL_NUM")
+    if not service_id:
+        if is_excel_scientific(order_number):
+            raise ValueError(
+                f"{args.iptool_join_column} '{order_number}' is in Excel scientific notation, so the real number is lost. "
+                f"Re-export the IP Tool sheet with {args.iptool_join_column} formatted as Text, or supply Siebel SERIAL_NUM."
+            )
+        service_id = normalize_join_key(order_number) or "0"
     product_type = row_get(iptool, "Product Type", "ProductType", "product_type")
     product_class = row_get(iptool, "ProductClass", "Product Class", "product_class")
     service_description = row_get(siebel, "PRODUCT_NAME") or product_type or product_class
@@ -664,7 +687,8 @@ def main() -> int:
         public_value = row_get(iptool, "PublicIP", "Public IP")
         if public_value and public_value.strip().lower() not in {"yes", "y", "true", "1"} and not args.include_non_public:
             continue
-        service_key = normalize_join_key(row_get(iptool, args.iptool_join_column))
+        raw_service_key = row_get(iptool, args.iptool_join_column)
+        service_key = "" if is_excel_scientific(raw_service_key) else normalize_join_key(raw_service_key)
         account_key = normalize_join_key(row_get(iptool, args.iptool_account_column, "Customer Number", "CustomerNumber"))
         customer_key = normalize_join_key(row_get(iptool, args.iptool_customer_column, "Customer Name", "CustomerName"))
 
