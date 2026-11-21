@@ -148,7 +148,9 @@ Assignment Management supports:
 
 ### 8.2.1 Loading New IP Assignments in Bulk
 
-Template: `scripts/templates/new_ip_assignment_iptool_template.csv`. It is the IP Tool export layout plus optional columns that make each row ready for CST without a Siebel export: `CR Number`, `Unified Number`, `Contact Name`, `Mobile Number`, `Email`, `ID Number`, `City`, `Region`.
+Template: **Bulk Operations > Bulk Import: Assignments / Reservations > Download Template** (same file as `scripts/templates/new_ip_assignment_iptool_template.csv`). It is the IP Tool export layout plus optional columns that make each row ready for CST without a Siebel export: `CR Number`, `Unified Number`, `Contact Name`, `Mobile Number`, `Email`, `ID Number`, `City`, `Region`, `Assignment Date` (defaults to today).
+
+Upload the filled sheet directly on that card: it is converted to the CST import format in the browser (same mapping as the script below), and rows with a missing or Excel-shortened Order Number, a misaligned IP or a size mismatch are rejected before import. Use the script instead when Siebel data should fill in CR/contact details.
 
 1. Fill one row per subnet. In Excel, format `Order Number`, `CR Number`, `Unified Number`, `Mobile Number` and `ID Number` as **Text** before pasting. Otherwise Excel turns long numbers into values like `1.00001E+12` and the real digits are lost; the script rejects such rows.
 2. Convert to the bulk assignment CSV:
@@ -406,7 +408,7 @@ CST rejects a SendLIR whose CIDR overlaps a record it already holds ("This IP CI
 - Merge: free space grows (e.g. after a release) into a block that contains smaller Unassigned records already in CST.
 - Local split: an assignment already in CST (e.g. a `/27`) is cut down locally (e.g. to a `/28`). CST still holds the old CIDR, so the assignment is treated as unsent and its old record joins the group.
 
-Every path that sends new subnets to CST applies the same rule, so the result does not depend on how the subnet was created: Assignment Management, pool partition, bulk load (when its migration job is created), manual migration and initial bootstrap. Before sending, the overlapping CST records and every unsent local subnet sharing their space are grouped, and per group:
+Every path that sends new subnets to CST applies the same rule, so the result does not depend on how the subnet was created: **Create Migration Job** (review and manual migration, which also covers bulk loads), Assignment Management, pool partition and initial bootstrap. There is no separate split action. Before sending, the overlapping CST records and every unsent local subnet sharing their space are grouped, and per group:
 
 | Step | Condition | Action | Function |
 | --- | --- | --- | --- |
@@ -417,13 +419,18 @@ Every path that sends new subnets to CST applies the same rule, so the result do
 
 Example: original `172.20.40.0/23`, reassign `172.20.40.0/24`: UpdateLIR `/23` to Unassigned (if needed), DeleteLIR `/23`, SendLIR `172.20.40.0/24`, SendLIR `172.20.41.0/24`. The remaining portions are the saved local unassigned blocks, so they are not sent twice later.
 
-When one local subnet has exactly the CIDR of one record, an UpdateLIR is sent instead. Each group is its own strictly sequenced batch: no SendLIR runs unless the DeleteLIRs succeeded.
+When one local subnet has exactly the CIDR of one record, an UpdateLIR is sent instead.
+
+A migration job is ONE batch. Plain SendLIRs come first; each partial reassignment follows as a chain (`depends_on_job_id`): every step waits only for the previous step of its own chain, so a failure holds back that partial reassignment alone. The review list marks affected subnets ("Partial reassignment: replaces CST record(s) ..."), and subnets whose earlier plain SendLIR failed with an overlap error are offered again. Pushing pending jobs runs the steps in order.
 
 A group is blocked, and nothing is changed in CST, when a record still belongs to an active local assignment (release it or use partial reassignment first), a DeleteLIR for it is already queued, the local subnets do not cover all of a record's addresses, or another subnet in the group is not CST-ready, has an unresolved conflict or is already queued. For Assignment Management the assignment is then refused with the reason. If CST accepted the DeleteLIR but a later SendLIR failed, the assignment is kept (CST no longer holds the old record) and the error names the batch to retry.
 
-With CST auto-execute off (controlled sync), changes are saved locally and their CST jobs are queued, then sent in order when pending jobs are pushed. Releases queue UpdateLIR to Unassigned and DeleteLIR in one ordered batch. While a DeleteLIR is still queued, CST still holds that record, so a new assignment over the same space is refused until pending jobs are pushed.
+With CST auto-execute off (controlled sync), assignments and releases do not create batches of their own. They are saved locally and wait in **Create Migration Job > Review Pending CST Transactions**, where each composite transaction is ONE row that expands into its steps:
 
-**CST Sync Monitor > Split CST Records** (`POST /cst/container-splits`, `dry_run` to preview) applies the same rule to subnets whose earlier SendLIR already failed with an overlap.
+- **Partial reassignment**: (UpdateLIR to Unassigned if assigned), DeleteLIR, SendLIR reassigned and remaining portions.
+- **Assignment release**: UpdateLIR to Unassigned (if assigned), DeleteLIR; when the freed space exists as its own local block, a SendLIR reports it again as Unassigned with a new Transaction ID.
+
+Selected rows become one migration batch; each composite is a chain inside it, run in order when pending jobs are pushed. Old per-assignment release batches that never reached CST are marked NOT_REQUIRED ("Replaced by migration batch ...") when their record is included. With auto-execute on, assignments and releases still go to CST immediately.
 
 ### 11.5 CST Scheduling
 
@@ -653,7 +660,6 @@ This keeps business assignment data fresh before business hours and reduces load
 | `PUT` | `/siebel/config` | Update Siebel config |
 | `POST` | `/siebel/business-customer` | Lookup BSS details by service ID |
 | `POST` | `/assignments/{assignment_id}/siebel-refresh` | Refresh one assignment from BSS |
-| `POST` | `/cst/container-splits` | Preview (`dry_run`) or create partial reassignment batches: DeleteLIR an Unassigned CST record that contains new subnets, then SendLIR its assigned and remaining portions |
 | `POST` | `/siebel/delta-sync` | Run BSS delta sync for all active business assignments |
 | `GET` | `/siebel/delta-audit` | Read BSS delta audit rows |
 

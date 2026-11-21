@@ -638,7 +638,7 @@ def make_bulk_row(
         "endIp": "",
         "size": network_size(cidr, iptool),
         "status": args.assignment_status,
-        "assignmentDate": args.assignment_date,
+        "assignmentDate": row_get(iptool, "Assignment Date", "AssignmentDate", "assignment_date") or args.assignment_date,
         "customerName": customer_name,
         "organizationName": customer_name,
         "organizationId": org_id,

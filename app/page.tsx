@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState, type UIEvent } from "react";
+import { Fragment, useEffect, useMemo, useState, type UIEvent } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
@@ -42,7 +42,6 @@ import {
   AuditEvent,
   createCstMigrationJobFromReview,
   createManualCstMigrationJob,
-  runCstContainerSplit,
   BssDeltaSyncResponse,
   BulkBatch,
   BulkResult,
@@ -333,6 +332,12 @@ const SEARCH_FILTER_FIELDS: Array<{ value: SearchFilterField; label: string; mod
   { value: "description", label: "Description", mode: "text" }
 ];
 
+
+// Same layout as scripts/templates/new_ip_assignment_iptool_template.csv (IP Tool export + CST columns).
+const NEW_IP_ASSIGNMENT_TEMPLATE = [
+  "Ip Address,Order Number,Product Type,CustomerSpecific,ProductClass,CustomerName,CustomerNumber,CustomerType,Subnet Type,Number of IpAddress,Status,Subnet Mask,Category,Previous CustomerNumber,Previous CustomerName,CR Number,Unified Number,Contact Name,Mobile Number,Email,ID Number,City,Region,Assignment Date",
+  "87.101.192.16,11211621,BDI,,BDI(1:1),Example Customer Company,33945,CORP,LAN1,8,Reserved,255.255.255.248,New IP,,,1010123456,7001234567,Network Contact,0501234567,noc@example.com,1012345678,Riyadh,Riyadh,2026-11-21"
+].join("\n");
 
 const CST_BULK_ASSIGNMENT_TEMPLATE = [
   "assignmentType,cidr,startIp,endIp,size,status,assignmentDate,customerName,organizationName,organizationId,commercialRegId,unifiedNumber,customerTypeId,customerType,subnetType,productClass,regionId,cityId,fullName,mobileNumber,idNumber,email,contactName,contactNumber,contactEmail,customerId,serviceId,serviceDescription,accessTechnologyId,owner,assignmentPurpose,site,city,region,notes",
@@ -883,7 +888,7 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
   const [bulkPoolCsv, setBulkPoolCsv] = useState(BULK_SUBNET_TEMPLATE);
   const [bulkPoolAllocated, setBulkPoolAllocated] = useState(false);
   const [bulkAssignmentAllowConflicts, setBulkAssignmentAllowConflicts] = useState(false);
-  const [bulkAssignmentCsv, setBulkAssignmentCsv] = useState(CST_BULK_ASSIGNMENT_TEMPLATE);
+  const [bulkAssignmentCsv, setBulkAssignmentCsv] = useState(NEW_IP_ASSIGNMENT_TEMPLATE);
   const [ripeConfigForm, setRipeConfigForm] = useState<RipeConfigPayload>({ base_url: "https://rest.db.ripe.net", auth_type: "Basic Authentication", username: "", password: "", connection_timeout: 10, read_timeout: 30, default_maintainer: "ITC-NOC-MNT" });
   const [siebelConfigForm, setSiebelConfigForm] = useState<SiebelConfigPayload>({ username: "LIR_USER", password: "", dsn: "172.31.23.101:1525/SIDB", connection_timeout: 10, query_sql: DEFAULT_SIEBEL_QUERY });
   const [databaseConnectionForm, setDatabaseConnectionForm] = useState<DatabaseConnectionPayload>({ host: "localhost", port: 5432, database: "lir", username: "lir_app", password: "", ssl_mode: "prefer", connect_timeout: 10 });
@@ -1408,30 +1413,6 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                 onReconcileCst={() => run(async () => {
                   const jobs = await reconcileCstResources();
                   setNotice({ title: "CST GetLIR Sent", detail: `${jobs.length} provider-wide GetLIR API job(s) created. GetLIR pulls CST data using pageNumber/pageSize, not per-subnet filtering.` });
-                })}
-                onCstContainerSplit={() => run(async () => {
-                  const preview = await runCstContainerSplit({ dry_run: true });
-                  const describe = (items: typeof preview.containers) => items.map((item) => (
-                    `${item.container_cidr} (Transaction ID ${item.container_transaction_id}) - ${item.status}${item.reason ? `: ${item.reason}` : ""}${item.operations.length ? `\n  ${item.operations.join("\n  ")}` : ""}`
-                  )).join("\n\n");
-                  if (!preview.containers.length) {
-                    setNotice({ title: "Split CST Records", detail: "No CST record overlaps new local subnets. Nothing to split." });
-                    return;
-                  }
-                  if (!preview.planned) {
-                    setNotice({ title: "Split CST Records - all blocked", detail: `${preview.message}\n\n${describe(preview.containers)}` });
-                    return;
-                  }
-                  if (!window.confirm(`${preview.message}\n\nEach planned record will be deleted in CST with DeleteLIR (its Transaction ID is retired permanently), then the assigned and remaining portions are sent with SendLIR. Jobs are queued; CST is called when you push pending jobs.\n\nCreate the jobs?`)) {
-                    setNotice({ title: "Split CST Records - preview", detail: `${preview.message}\n\n${describe(preview.containers)}` });
-                    return;
-                  }
-                  const result = await runCstContainerSplit({ dry_run: false });
-                  void cstSummaryQuery.refetch();
-                  void cstJobsQuery.refetch();
-                  void cstBatchesQuery.refetch();
-                  void cstTransactionsQuery.refetch();
-                  setNotice({ title: "Split CST Records", detail: `${result.message}\n\n${describe(result.containers)}` });
                 })}
                 onRunCstDayMinusOne={() => run(async () => {
                   const result = await runCstDayMinusOneSync();
@@ -2032,7 +2013,7 @@ ${errorMessage(error)}`
           void cstTransactionsQuery.refetch();
           setNotice({
             title: result.batch_id ? "Pending CST Migration Job Created" : "CST Migration Job Not Created",
-            detail: `${result.message}\nJob ID: ${result.batch_id || "-"}\nIncluded: ${result.included_transactions}\nRejected/skipped: ${result.rejected_count + result.skipped_count}\nCreated: ${result.created_at.slice(0, 19)}\nCreated by: ${result.created_by}${result.rejected.length ? `\n\nRejected:\n${result.rejected.map((item) => `${item.review_id} ${item.cidr}: ${item.reason}`).join("\n")}` : ""}`
+            detail: `${result.message}\nJob ID: ${result.batch_id || "-"}\nIncluded: ${result.included_transactions}\nRejected/skipped: ${result.rejected_count + result.skipped_count}\nCreated: ${result.created_at.slice(0, 19)}\nCreated by: ${result.created_by}${result.partial_reassignments?.length ? `\n\nComposite transactions (steps run in order):\n${result.partial_reassignments.map((group) => `${group.container_cidr} - ${group.status}${group.reason ? `: ${group.reason}` : ""}${group.operations.length ? `\n  ${group.operations.join("\n  ")}` : ""}`).join("\n\n")}` : ""}${result.rejected.length ? `\n\nRejected:\n${result.rejected.map((item) => `${item.review_id} ${item.cidr}: ${item.reason}`).join("\n")}` : ""}`
           });
         })}
       />
@@ -2318,7 +2299,6 @@ type CstMonitorProps = {
   onRefreshCst: () => void;
   onBootstrapCst: () => void;
   onReconcileCst: () => void;
-  onCstContainerSplit: () => void;
   onRunCstDayMinusOne: () => void;
   onRetryCstJob: (job: CstSyncJob) => void;
   onRetryCstBatch: (batch: CstSyncBatch) => void;
@@ -4175,16 +4155,23 @@ function BulkOperations(props: {
             <div className="rounded-md border bg-muted/20 p-3">
               <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
                 <div>
-                  <p className="text-sm font-semibold">CST assignment data template</p>
-                  <p className="text-xs text-muted-foreground">Includes Business and Internal rows. Internal rows only need the assignment basics and serviceDescription; customer/contact/address fields are optional.</p>
+                  <p className="text-sm font-semibold">New IP assignment template</p>
+                  <p className="text-xs text-muted-foreground">IP Tool layout (Ip Address, Order Number, CustomerName, Subnet Mask, ...) plus CR Number, Unified Number, contact, City, Region and Assignment Date. It is converted on upload. In Excel, format Order Number, CR Number, Unified Number, Mobile Number and ID Number as Text. The CST format (assignmentType, cidr, ...) is still accepted.</p>
                 </div>
                 <div className="flex flex-wrap gap-2">
-                  <Button size="sm" variant="outline" onClick={() => { props.onAssignmentCsv(CST_BULK_ASSIGNMENT_TEMPLATE); props.onAssignmentFileName("cst-lir-assignment-template.csv"); }}>
-                    Load CST Template
+                  <Button size="sm" variant="outline" onClick={() => { props.onAssignmentCsv(NEW_IP_ASSIGNMENT_TEMPLATE); props.onAssignmentFileName("new-ip-assignment-template.csv"); }}>
+                    Load Template
                   </Button>
-                  <Button size="sm" variant="outline" onClick={() => downloadBlob(`cst-lir-assignment-template-${today()}.csv`, "text/csv;charset=utf-8", CST_BULK_ASSIGNMENT_TEMPLATE)}>
+                  <Button size="sm" variant="outline" onClick={() => downloadBlob(`new-ip-assignment-template-${today()}.csv`, "text/csv;charset=utf-8", NEW_IP_ASSIGNMENT_TEMPLATE)}>
                     <FileDown className="h-4 w-4" />
                     Download Template
+                  </Button>
+                  <Button size="sm" variant="ghost" onClick={() => { props.onAssignmentCsv(CST_BULK_ASSIGNMENT_TEMPLATE); props.onAssignmentFileName("cst-lir-assignment-template.csv"); }}>
+                    Load CST Template
+                  </Button>
+                  <Button size="sm" variant="ghost" onClick={() => downloadBlob(`cst-lir-assignment-template-${today()}.csv`, "text/csv;charset=utf-8", CST_BULK_ASSIGNMENT_TEMPLATE)}>
+                    <FileDown className="h-4 w-4" />
+                    Download CST Format
                   </Button>
                 </div>
               </div>
@@ -5581,6 +5568,7 @@ function CstMigrationReviewDialog(props: {
   const selectedSet = new Set(props.selectedIds);
   const excludedSet = new Set(props.excludedIds);
   const matchingIds = review?.all_matching_review_ids ?? [];
+  const [openComposites, setOpenComposites] = useState<Record<string, boolean>>({});
   const matchingSet = new Set(matchingIds);
   const includedIds = props.selectedIds.filter((id) => matchingSet.has(id) && !excludedSet.has(id));
   const visibleIds = review?.items.map((item) => item.review_id) ?? [];
@@ -5619,7 +5607,7 @@ function CstMigrationReviewDialog(props: {
             </label>
             <label className="grid gap-1">
               <span className="text-xs font-medium text-muted-foreground">Transaction type</span>
-              <Select value={props.filters.transaction_type} values={["all", "SEND", "UPDATE", "DELETE"]} labels={{ all: "All" }} onChange={(value) => setFilter("transaction_type", value)} />
+              <Select value={props.filters.transaction_type} values={["all", "SEND", "UPDATE", "DELETE", "PARTIAL_REASSIGNMENT", "RELEASE"]} labels={{ all: "All", PARTIAL_REASSIGNMENT: "Partial reassignment", RELEASE: "Assignment release" }} onChange={(value) => setFilter("transaction_type", value)} />
             </label>
             <label className="grid gap-1">
               <span className="text-xs font-medium text-muted-foreground">Validation</span>
@@ -5670,13 +5658,24 @@ function CstMigrationReviewDialog(props: {
                 ) : review?.items.length ? review.items.map((item) => {
                   const isSelected = selectedSet.has(item.review_id);
                   const isExcluded = excludedSet.has(item.review_id);
+                  const isComposite = Boolean(item.composite_type);
+                  const isOpen = Boolean(openComposites[item.review_id]);
                   return (
-                    <TableRow key={item.review_id} className={isExcluded ? "opacity-55" : ""}>
-                      <TableCell>
+                    <Fragment key={item.review_id}>
+                    <TableRow className={cn(isExcluded ? "opacity-55" : "", isComposite ? "cursor-pointer bg-muted/20 hover:bg-muted/40" : "")} onClick={isComposite ? () => setOpenComposites((current) => ({ ...current, [item.review_id]: !current[item.review_id] })) : undefined}>
+                      <TableCell onClick={(event) => event.stopPropagation()}>
                         <input type="checkbox" checked={isSelected} onChange={(event) => event.target.checked ? mergeSelected([item.review_id]) : removeSelected([item.review_id])} aria-label={`Select ${item.cidr}`} />
                       </TableCell>
                       <TableCell><Badge variant={isExcluded ? "warning" : isSelected ? "success" : "default"}>{isExcluded ? "Excluded" : isSelected ? "Selected" : "Pending"}</Badge></TableCell>
-                      <TableCell>{item.operation}</TableCell>
+                      <TableCell>
+                        {isComposite ? (
+                          <span className="flex items-center gap-1 font-medium">
+                            {isOpen ? <ChevronDown className="h-4 w-4 shrink-0" /> : <ChevronRight className="h-4 w-4 shrink-0" />}
+                            {item.composite_type}
+                            <span className="text-xs font-normal text-muted-foreground">({item.steps?.length ?? 0} steps)</span>
+                          </span>
+                        ) : item.operation}
+                      </TableCell>
                       <TableCell>{item.cidr}</TableCell>
                       <TableCell>{item.start_ip} - {item.end_ip}</TableCell>
                       <TableCell>{item.customer_name || item.customer_id || "-"}</TableCell>
@@ -5684,6 +5683,14 @@ function CstMigrationReviewDialog(props: {
                       <TableCell className="max-w-[180px] truncate" title={item.transaction_id}>{item.transaction_id}</TableCell>
                       <TableCell><Badge variant={item.validation_status === "VALID" ? "success" : "danger"}>{item.validation_status}</Badge>{item.reason ? <p className="mt-1 max-w-[240px] text-xs text-muted-foreground">{item.reason}</p> : null}</TableCell>
                     </TableRow>
+                    {isComposite && isOpen ? (item.steps ?? []).map((step, index) => (
+                      <TableRow key={`${item.review_id}-${index}`} className="text-xs">
+                        <TableCell />
+                        <TableCell className="text-muted-foreground">Step {index + 1}</TableCell>
+                        <TableCell colSpan={7} className="font-mono">{step}</TableCell>
+                      </TableRow>
+                    )) : null}
+                    </Fragment>
                   );
                 }) : (
                   <TableRow><TableCell colSpan={9}>No matching CST transactions found.</TableCell></TableRow>
@@ -5713,6 +5720,60 @@ function CstMigrationReviewDialog(props: {
     </Dialog>
   );
 }
+const CST_CHAIN_HEAD_PREFIX = "chain-head:";
+
+type CstBatchRow =
+  | { kind: "job"; key: string; job: CstSyncJob }
+  | { kind: "partial"; key: string; steps: CstSyncJob[]; status: string; replaced: string[]; created: string[] };
+
+const cstStepLabel = (job: CstSyncJob) => (job.operation === "DELETE" ? "DeleteLIR" : job.operation === "UPDATE" ? "UpdateLIR" : job.operation === "SEND" ? "SendLIR" : job.operation);
+
+function cstStatusVariant(status: string) {
+  return status === "SUCCESS" ? "success" : status === "FAILED" || status === "BLOCKED" ? "danger" : status === "PENDING" || status === "RUNNING" ? "warning" : "default";
+}
+
+/** One row per partial reassignment (its chained steps), plus one row per plain job. */
+function groupCstBatchJobs(jobs: CstSyncJob[]): CstBatchRow[] {
+  const nextByDependency = new Map(jobs.filter((job) => job.depends_on_job_id && !job.depends_on_job_id.startsWith(CST_CHAIN_HEAD_PREFIX)).map((job) => [job.depends_on_job_id, job]));
+  const inChain = new Set<string>();
+  const rows: CstBatchRow[] = [];
+  for (const job of [...jobs].sort((left, right) => left.sequence_no - right.sequence_no)) {
+    if (inChain.has(job.id)) {
+      continue;
+    }
+    if (!job.depends_on_job_id.startsWith(CST_CHAIN_HEAD_PREFIX)) {
+      if (!job.depends_on_job_id) {
+        rows.push({ kind: "job", key: job.id, job });
+      }
+      continue;
+    }
+    const steps = [job];
+    let current: CstSyncJob | undefined = job;
+    while (current && nextByDependency.has(current.id)) {
+      current = nextByDependency.get(current.id);
+      if (current) {
+        steps.push(current);
+      }
+    }
+    steps.forEach((step) => inChain.add(step.id));
+    const statuses = steps.map((step) => step.status);
+    const status = statuses.some((item) => item === "FAILED" || item === "BLOCKED")
+      ? "FAILED"
+      : statuses.some((item) => item === "PENDING" || item === "RUNNING")
+        ? "PENDING"
+        : statuses.every((item) => item === "SUCCESS" || item === "NOT_REQUIRED") ? "SUCCESS" : statuses[statuses.length - 1];
+    rows.push({
+      kind: "partial",
+      key: job.depends_on_job_id,
+      steps,
+      status,
+      replaced: [...new Set(steps.filter((step) => step.operation !== "SEND").map((step) => step.cidr))],
+      created: steps.filter((step) => step.operation === "SEND").map((step) => step.cidr)
+    });
+  }
+  return rows;
+}
+
 function CstIntegrationMonitor(props: CstMonitorProps) {
   const [pendingPushLimit, setPendingPushLimit] = useState("0");
   const [selectedBatchId, setSelectedBatchId] = useState(props.cstBatches[0]?.id ?? "");
@@ -5737,13 +5798,39 @@ function CstIntegrationMonitor(props: CstMonitorProps) {
     });
   }, [batchSearch, batchStatusFilter, props.cstBatches]);
   const batchJobsQuery = useQuery({
-    queryKey: ["cst-batch-jobs", selectedBatchId, batchJobStatusFilter],
-    queryFn: () => getCstBatchJobs(selectedBatchId, batchJobStatusFilter),
+    queryKey: ["cst-batch-jobs", selectedBatchId],
+    queryFn: () => getCstBatchJobs(selectedBatchId, "all"),
     enabled: Boolean(selectedBatchId),
     staleTime: 5000,
     refetchOnWindowFocus: false
   });
   const selectedBatchJobs = batchJobsQuery.data ?? [];
+  const [expandedPartials, setExpandedPartials] = useState<Record<string, boolean>>({});
+  const [retryingPartial, setRetryingPartial] = useState("");
+  const batchRows = useMemo(() => groupCstBatchJobs(selectedBatchJobs).filter((row) => (
+    batchJobStatusFilter === "all"
+      || (row.kind === "job" ? row.job.status === batchJobStatusFilter : row.status === batchJobStatusFilter || row.steps.some((step) => step.status === batchJobStatusFilter))
+  )), [selectedBatchJobs, batchJobStatusFilter]);
+  const retryPartialReassignment = async (row: Extract<CstBatchRow, { kind: "partial" }>) => {
+    // Retry from the first unfinished step; stop at the first step that does not succeed.
+    setRetryingPartial(row.key);
+    try {
+      for (const step of row.steps) {
+        if (step.status === "SUCCESS" || step.status === "NOT_REQUIRED") {
+          continue;
+        }
+        const result = await retryCstJob(step.id);
+        if (result.status !== "SUCCESS") {
+          break;
+        }
+      }
+    } catch (error) {
+      window.alert(errorMessage(error));
+    } finally {
+      setRetryingPartial("");
+      void batchJobsQuery.refetch();
+    }
+  };
   const retryableStatuses = new Set(["FAILED", "BLOCKED", "PENDING"]);
   const openBatch = (batch: CstSyncBatch) => {
     setSelectedBatchId(batch.id);
@@ -5780,10 +5867,6 @@ function CstIntegrationMonitor(props: CstMonitorProps) {
             <Button variant="outline" onClick={props.onReconcileCst}>
               <Search className="h-4 w-4" />
               GetLIR Pull
-            </Button>
-            <Button variant="outline" onClick={props.onCstContainerSplit} title="Partial reassignment: DeleteLIR an Unassigned CST record that now contains new subnets, then SendLIR the assigned and remaining portions">
-              <GitBranch className="h-4 w-4" />
-              Split CST Records
             </Button>
             <label className="flex items-center gap-2 rounded-md border bg-muted/20 px-2 py-1">
               <span className="text-xs font-medium text-muted-foreground">Submit</span>
@@ -5922,21 +6005,66 @@ function CstIntegrationMonitor(props: CstMonitorProps) {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {selectedBatchJobs.map((job) => (
-                    <TableRow key={job.id}>
+                  {batchRows.map((row) => row.kind === "job" ? (
+                    <TableRow key={row.key}>
                       <TableCell>
-                        <p className="font-semibold">{job.cidr}</p>
-                        <p className="font-mono text-xs text-muted-foreground">{job.transaction_id}</p>
-                        <p className="font-mono text-xs text-muted-foreground">{job.id}</p>
+                        <p className="font-semibold">{row.job.cidr}</p>
+                        <p className="font-mono text-xs text-muted-foreground">{row.job.transaction_id}</p>
+                        <p className="font-mono text-xs text-muted-foreground">{row.job.id}</p>
                       </TableCell>
-                      <TableCell>{job.operation}</TableCell>
-                      <TableCell><Badge variant={job.status === "SUCCESS" ? "success" : job.status === "FAILED" || job.status === "BLOCKED" ? "danger" : job.status === "PENDING" ? "warning" : "default"}>{job.status}</Badge></TableCell>
-                      <TableCell className="max-w-[360px] text-xs text-muted-foreground">{job.last_error || "-"}</TableCell>
-                      <TableCell>{retryableStatuses.has(job.status) ? <Button size="sm" variant="outline" onClick={() => retryJobFromBatch(job)}>Retry</Button> : null}</TableCell>
+                      <TableCell>{row.job.operation}</TableCell>
+                      <TableCell><Badge variant={cstStatusVariant(row.job.status)}>{row.job.status}</Badge></TableCell>
+                      <TableCell className="max-w-[360px] text-xs text-muted-foreground">{row.job.last_error || "-"}</TableCell>
+                      <TableCell>{retryableStatuses.has(row.job.status) ? <Button size="sm" variant="outline" onClick={() => retryJobFromBatch(row.job)}>Retry</Button> : null}</TableCell>
                     </TableRow>
+                  ) : (
+                    <Fragment key={row.key}>
+                      <TableRow className="cursor-pointer bg-muted/20 hover:bg-muted/40" onClick={() => setExpandedPartials((current) => ({ ...current, [row.key]: !current[row.key] }))}>
+                        <TableCell>
+                          <div className="flex items-start gap-2">
+                            {expandedPartials[row.key] ? <ChevronDown className="mt-0.5 h-4 w-4 shrink-0" /> : <ChevronRight className="mt-0.5 h-4 w-4 shrink-0" />}
+                            <div>
+                              <p className="font-semibold">{row.replaced.join(", ")}</p>
+                              <p className="text-xs text-muted-foreground">{row.created.length ? `into ${row.created.join(", ")}` : "UpdateLIR to Unassigned, DeleteLIR"}</p>
+                            </div>
+                          </div>
+                        </TableCell>
+                        <TableCell>
+                          <p className="font-medium">{row.steps.some((step) => step.operation === "SEND") ? "Partial reassignment" : "Assignment release"}</p>
+                          <p className="text-xs text-muted-foreground">{row.steps.filter((step) => step.status === "SUCCESS").length}/{row.steps.length} steps done</p>
+                        </TableCell>
+                        <TableCell><Badge variant={cstStatusVariant(row.status)}>{row.status}</Badge></TableCell>
+                        <TableCell className="max-w-[360px] text-xs text-muted-foreground">{row.steps.find((step) => step.status !== "SUCCESS" && step.last_error)?.last_error || "-"}</TableCell>
+                        <TableCell onClick={(event) => event.stopPropagation()}>
+                          {row.status !== "SUCCESS" ? (
+                            <Button size="sm" variant="outline" disabled={retryingPartial === row.key} onClick={() => void retryPartialReassignment(row)}>
+                              {retryingPartial === row.key ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+                              Retry
+                            </Button>
+                          ) : null}
+                        </TableCell>
+                      </TableRow>
+                      {expandedPartials[row.key] ? row.steps.map((step, index) => (
+                        <TableRow key={step.id} className="text-sm">
+                          <TableCell className="pl-10">
+                            <p className="font-medium">Step {index + 1}: {step.cidr}</p>
+                            <p className="font-mono text-xs text-muted-foreground">{step.transaction_id}</p>
+                            <p className="font-mono text-xs text-muted-foreground">{step.id}</p>
+                          </TableCell>
+                          <TableCell>{cstStepLabel(step)}{step.operation === "UPDATE" && index === 0 && row.steps.some((other) => other.operation === "DELETE" && other.cidr === step.cidr) ? " to Unassigned" : ""}</TableCell>
+                          <TableCell><Badge variant={cstStatusVariant(step.status)}>{step.status}</Badge></TableCell>
+                          <TableCell className="max-w-[360px] text-xs text-muted-foreground">
+                            {step.status === "PENDING" && index > 0 && row.steps[index - 1].status !== "SUCCESS"
+                              ? `Waiting for step ${index} (${cstStepLabel(row.steps[index - 1])} ${row.steps[index - 1].cidr}) to succeed`
+                              : step.last_error || "-"}
+                          </TableCell>
+                          <TableCell />
+                        </TableRow>
+                      )) : null}
+                    </Fragment>
                   ))}
                   {selectedBatchId && batchJobsQuery.isFetching ? <TableRow><TableCell colSpan={5} className="py-6 text-center text-muted-foreground">Loading batch jobs...</TableCell></TableRow> : null}
-                  {selectedBatchId && !batchJobsQuery.isFetching && !selectedBatchJobs.length ? <TableRow><TableCell colSpan={5} className="py-6 text-center text-muted-foreground">No jobs match this batch/status filter.</TableCell></TableRow> : null}
+                  {selectedBatchId && !batchJobsQuery.isFetching && !batchRows.length ? <TableRow><TableCell colSpan={5} className="py-6 text-center text-muted-foreground">No jobs match this batch/status filter.</TableCell></TableRow> : null}
                   {!selectedBatchId ? <TableRow><TableCell colSpan={5} className="py-6 text-center text-muted-foreground">Select a batch to view failed jobs and retry individual transactions.</TableCell></TableRow> : null}
                 </TableBody>
               </Table>
@@ -8114,12 +8242,115 @@ function normalizePoolImportCsv(csvText: string) {
   );
 }
 
+const CST_IMPORT_COLUMNS = [
+  "assignmentType", "cidr", "size", "status", "assignmentDate", "customerName", "organizationName", "organizationId",
+  "commercialRegId", "unifiedNumber", "customerTypeId", "customerType", "subnetType", "productClass", "regionId", "cityId",
+  "fullName", "mobileNumber", "idNumber", "email", "contactName", "contactNumber", "contactEmail", "customerId", "serviceId",
+  "serviceDescription", "owner", "assignmentPurpose", "city", "region", "notes"
+];
+
+function isIpToolAssignmentLayout(row: Record<string, string>) {
+  return "ip address" in row && ("subnet mask" in row || "number of ipaddress" in row);
+}
+
+function maskToPrefix(mask: string) {
+  const bits = mask.split(".").map((part) => Number.parseInt(part, 10));
+  if (bits.length !== 4 || bits.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) {
+    return null;
+  }
+  const binary = bits.map((part) => part.toString(2).padStart(8, "0")).join("");
+  return /^1*0*$/.test(binary) ? binary.indexOf("0") === -1 ? 32 : binary.indexOf("0") : null;
+}
+
+/**
+ * New-IP template (IP Tool layout: Ip Address, Order Number, ..., Subnet Mask, CR Number, ...) converted to the
+ * CST import layout, the same mapping as scripts/generate_assignment_bulk_from_iptool_siebel.py --legacy-iptool-only.
+ */
+function convertIpToolAssignmentCsv(csvText: string) {
+  const rows = parseCsvRows(csvText).map(normalizeCsvRecord);
+  const tenDigits = (value: string) => (/^\d{10}$/.test(value.replace(/\D/g, "")) && value.replace(/\D/g, "").length === 10 ? value.replace(/\D/g, "") : "");
+  const output = rows.map((row, index) => {
+    const rowNumber = index + 2;
+    const ip = row["ip address"] ?? "";
+    const prefix = row["subnet mask"] ? maskToPrefix(row["subnet mask"]) : row["number of ipaddress"] ? 32 - Math.log2(Number.parseInt(row["number of ipaddress"], 10)) : null;
+    if (!ip || prefix === null || !Number.isInteger(prefix)) {
+      throw new Error(`row ${rowNumber}: Ip Address and a valid Subnet Mask (or Number of IpAddress) are required.`);
+    }
+    const cidr = `${ip}/${prefix}`;
+    const range = parseCidr(cidr);
+    if (numberToIp(range.start) !== ip) {
+      throw new Error(`row ${rowNumber}: ${cidr} is not aligned; the network address is ${numberToIp(range.start)}.`);
+    }
+    const declaredSize = Number.parseInt(row["number of ipaddress"] ?? "", 10);
+    if (Number.isInteger(declaredSize) && declaredSize !== range.size) {
+      throw new Error(`row ${rowNumber}: Number of IpAddress ${declaredSize} does not match ${cidr} (${range.size}).`);
+    }
+    const orderNumber = row["order number"] ?? "";
+    if (/^\s*\d+(\.\d+)?e\+?\d+\s*$/i.test(orderNumber)) {
+      throw new Error(`row ${rowNumber}: Order Number ${orderNumber} was shortened by Excel and its digits are lost. Format the Order Number column as Text and enter the full number.`);
+    }
+    if (!orderNumber) {
+      throw new Error(`row ${rowNumber}: Order Number is required (it becomes the CST serviceId).`);
+    }
+    const customerName = row["customername"] || row["customer name"] || "";
+    if (!customerName) {
+      throw new Error(`row ${rowNumber}: CustomerName is required.`);
+    }
+    const commercialRegId = tenDigits(row["cr number"] ?? "");
+    const unifiedNumber = tenDigits(row["unified number"] ?? "");
+    const contactName = row["contact name"] || "Business Contact";
+    const mobile = row["mobile number"] || "";
+    const email = row["email"] || "NA@NA.com";
+    const customerType = (row["customertype"] || row["customer type"] || "").toUpperCase();
+    const notes = [row["category"], row["previous customername"] ? `Previous customer: ${row["previous customername"]} (${row["previous customernumber"] || "-"})` : ""].filter(Boolean).join("; ");
+    const values: Record<string, string> = {
+      assignmentType: "BUSINESS",
+      cidr,
+      size: String(range.size),
+      status: "3",
+      assignmentDate: row["assignment date"] || today(),
+      customerName,
+      organizationName: customerName,
+      organizationId: commercialRegId || unifiedNumber,
+      commercialRegId,
+      unifiedNumber,
+      customerTypeId: ["GOV", "GOVERNMENT", "GOVERNMENTAL"].includes(customerType) ? "1" : "2",
+      customerType,
+      subnetType: row["subnet type"] || "",
+      productClass: row["productclass"] || row["product class"] || "",
+      regionId: "",
+      cityId: "",
+      fullName: contactName,
+      mobileNumber: mobile,
+      idNumber: tenDigits(row["id number"] ?? "") || "0000000000",
+      email,
+      contactName,
+      contactNumber: mobile,
+      contactEmail: email,
+      customerId: row["customernumber"] || row["customer number"] || "",
+      serviceId: orderNumber,
+      serviceDescription: row["product type"] || row["productclass"] || "",
+      owner: "Business Customer",
+      assignmentPurpose: row["product type"] || "",
+      city: row["city"] || "",
+      region: row["region"] || "",
+      notes: notes || "New IP assignment"
+    };
+    return CST_IMPORT_COLUMNS.map((column) => values[column] ?? "");
+  });
+  return buildSimpleCsv(CST_IMPORT_COLUMNS, output);
+}
+
 function normalizeAssignmentImportCsv(csvText: string) {
   const rows = parseCsvRows(csvText);
   if (!rows.length) {
     throw new Error("CSV file is empty.");
   }
   const firstRow = normalizeCsvRecord(rows[0]);
+  if (isIpToolAssignmentLayout(firstRow)) {
+    // Converted rows carry what the sheet has; the backend applies CST defaults and reports readiness per row.
+    return convertIpToolAssignmentCsv(csvText);
+  }
   const hasCidr = "cidr" in firstRow;
   const hasRange = "startip" in firstRow || "start_ip" in firstRow || "start" in firstRow || "endip" in firstRow || "end_ip" in firstRow || "end" in firstRow;
   if (!hasCidr && !hasRange) {
