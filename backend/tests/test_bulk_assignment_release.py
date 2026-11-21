@@ -76,93 +76,104 @@ class BulkAssignmentReleaseTest(unittest.TestCase):
         self.assertEqual(result.blocked, 1)
         self.assertIn("not CIDR-aligned", result.output_rows[0].processingMessage)
 
-    def test_cst_failure_rolls_back_that_row_only(self):
-        with app.connect() as connection:
-            connection.execute("UPDATE ip_resources SET cst_sync_status = 'SUCCESS' WHERE cidr = '87.101.152.0/30'")
-        original = app.create_cst_sync_jobs
-
-        def failing_jobs(connection, items, workflow_type, *args, **kwargs):
-            resource = items[0][0]
-            return [app.CstSyncJob.model_construct(status="FAILED", cidr=resource.cidr, last_error="CST unreachable")]
-
-        app.create_cst_sync_jobs = failing_jobs
-        try:
-            result = app.process_assignment_release_bulk("cidr\n87.101.152.0/30\n87.101.152.4/30")
-        finally:
-            app.create_cst_sync_jobs = original
-        self.assertEqual([row.processingStatus for row in result.output_rows if row.inputRowNumber], ["FAILED", "RELEASED"])
-        self.assertIn("CST unreachable", result.output_rows[0].processingMessage)
-        self.assertIn("87.101.152.0/30", self.assignment_cidrs())
-        with app.connect() as connection:
-            status = connection.execute("SELECT status FROM assignments WHERE cidr = '87.101.152.0/30'").fetchone()["status"]
-        self.assertNotEqual(status, "Retiring")
-
     def resource_row(self, cidr: str):
         with app.connect() as connection:
             return connection.execute("SELECT * FROM ip_resources WHERE cidr = ?", (cidr,)).fetchone()
 
-    def test_release_keeps_subnet_and_clears_customer(self):
-        before = self.resource_row("87.101.152.0/30")
-        app.process_assignment_release_bulk("cidr\n87.101.152.0/30")
-        after = self.resource_row("87.101.152.0/30")
-        self.assertIsNotNone(after, "released subnet must not be deleted")
-        self.assertEqual(after["resource_uuid"], before["resource_uuid"])
-        self.assertNotEqual(after["version_uuid"], before["version_uuid"])
-        self.assertEqual(after["status"], "AVAILABLE")
-        self.assertEqual(after["ownership_type"], "POOL")
-        self.assertEqual(after["assignment_status_id"], 1)
-        for field in ("customer_name", "organization_name", "service_id", "full_name", "mobile_number", "email"):
-            self.assertEqual(after[field], "", field)
-        self.assertTrue(after["source_entity_id"].startswith(app.RELEASED_SUBNET_SOURCE_PREFIX))
-        with app.connect() as connection:
-            history = connection.execute("SELECT * FROM ip_resource_history WHERE archived_resource_uuid = ?", (before["resource_uuid"],)).fetchall()
-            details = connection.execute("SELECT COUNT(*) FROM assignment_details WHERE resource_uuid = ?", (before["resource_uuid"],)).fetchone()[0]
-        self.assertEqual([row["archived_reason"] for row in history], ["ASSIGNMENT_RELEASED"])
-        self.assertEqual(history[0]["customer_name"], "Alpha")
-        self.assertEqual(details, 0)
+    def fake_cst(self, fail_operations: set[str] | None = None):
+        """Replace only the HTTP call to CST; job records and the transaction ledger run for real."""
+        fail_operations = fail_operations or set()
+        calls: list[tuple[str, str, int]] = []
+        original = app.execute_cst_real_api_job
 
-    def test_released_subnet_is_not_merged_into_larger_free_block(self):
-        app.process_assignment_release_bulk("cidr\n87.101.152.0/30\n87.101.152.4/30")
-        with app.connect() as connection:
-            app.materialize_bulk_unassigned_fragments(connection)
-        cidrs = self.resource_cidrs() | {row["cidr"] for row in app.connect().execute("SELECT cidr FROM ip_resources").fetchall()}
-        self.assertIn("87.101.152.0/30", cidrs)
-        self.assertIn("87.101.152.4/30", cidrs)
-        self.assertNotIn("87.101.152.0/29", cidrs)
+        def fake(connection, config, resource, operation, payload, transaction_id):
+            calls.append((operation, transaction_id, resource.assignment_status_id))
+            if operation in fail_operations:
+                return "FAILED", f"CST {operation} rejected", {"accepted": False}
+            return "SUCCESS", "", {"accepted": True, "externalApiCalled": True}
 
-    def test_reassign_same_cidr_reuses_released_subnet(self):
-        before = self.resource_row("87.101.152.0/30")
+        app.execute_cst_real_api_job = fake
+        self.addCleanup(setattr, app, "execute_cst_real_api_job", original)
+        with app.connect() as connection:
+            connection.execute("UPDATE cst_config SET enabled = 1, auto_execute = 1, send_enabled = 1, update_enabled = 1, delete_enabled = 1")
+        return calls
+
+    def send_to_cst(self, cidr: str) -> str:
+        with app.connect() as connection:
+            assignment_id = connection.execute("SELECT id FROM assignments WHERE cidr = ?", (cidr,)).fetchone()["id"]
+            resource = app.find_resource_by_source(connection, "assignment", assignment_id)
+            jobs = app.create_cst_sync_jobs(connection, [(resource, "SEND")], "TEST_SEND")
+        self.assertEqual(jobs[0].status, "SUCCESS", jobs[0].last_error)
+        return jobs[0].transaction_id
+
+    def ledger(self, transaction_id: str):
+        with app.connect() as connection:
+            return connection.execute("SELECT * FROM cst_transaction_ledger WHERE transaction_id = ?", (transaction_id,)).fetchone()
+
+    def test_release_in_cst_sends_unassigned_update_then_delete_and_retires_transaction(self):
+        calls = self.fake_cst()
+        transaction_id = self.send_to_cst("87.101.152.0/30")
+        result = app.process_assignment_release_bulk("cidr\n87.101.152.0/30")
+        self.assertEqual(result.output_rows[0].processingStatus, "RELEASED", result.errors)
+        self.assertIn(f"Transaction ID {transaction_id} retired", result.output_rows[0].processingMessage)
+        self.assertEqual([(op, tx, status_id) for op, tx, status_id in calls[1:]], [("UPDATE", transaction_id, 1), ("DELETE", transaction_id, 1)])
+        self.assertNotEqual(self.ledger(transaction_id)["retired_at"], "")
+        self.assertNotIn("87.101.152.0/30", self.assignment_cidrs())
+        self.assertNotIn("87.101.152.0/30", self.resource_cidrs())
+        with app.connect() as connection:
+            reasons = [row["archived_reason"] for row in connection.execute("SELECT archived_reason FROM ip_resource_history WHERE cidr = '87.101.152.0/30'").fetchall()]
+        self.assertIn("ASSIGNMENT_RELEASED_CST_DELETED", reasons)
+
+    def test_reassigned_cidr_gets_new_transaction_id(self):
+        calls = self.fake_cst()
+        old_transaction_id = self.send_to_cst("87.101.152.0/30")
         app.process_assignment_release_bulk("cidr\n87.101.152.0/30")
         result = app.process_assignment_bulk("\n".join([HEADER, business_row("87.101.152.0/30", 4, "Delta", "SVC-D")]))
         self.assertEqual(result.imported, 1, result.errors)
-        self.assertNotEqual(result.output_rows[0].processingStatus, "IMPORTED_WITH_CONFLICT")
-        after = self.resource_row("87.101.152.0/30")
-        self.assertEqual(after["resource_uuid"], before["resource_uuid"])
-        self.assertEqual(after["source_entity_type"], "assignment")
-        self.assertEqual(after["customer_name"], "Delta")
+        new_transaction_id = self.send_to_cst("87.101.152.0/30")
+        self.assertNotEqual(new_transaction_id, old_transaction_id)
+        self.assertNotEqual(self.ledger(old_transaction_id)["retired_at"], "")
 
-    def test_assigning_part_of_released_subnet_refragments_it(self):
-        pool = app.pool_from_network(ip_network("87.101.153.0/24"), "Second root", "Central")
+    def test_update_failure_changes_nothing(self):
+        self.fake_cst()
+        self.send_to_cst("87.101.152.0/30")
+        self.fake_cst({"UPDATE"})
+        result = app.process_assignment_release_bulk("cidr\n87.101.152.0/30\n87.101.152.4/30")
+        self.assertEqual([row.processingStatus for row in result.output_rows if row.inputRowNumber], ["FAILED", "RELEASED"])
         with app.connect() as connection:
-            app.insert_pool(connection, pool)
-            app.sync_pool_resource(connection, pool)
-        self.assertEqual(app.process_assignment_bulk("\n".join([HEADER, business_row("87.101.153.0/29", 8, "Wide", "SVC-W")])).imported, 1)
-        released_uuid = self.resource_row("87.101.153.0/29")["resource_uuid"]
-        app.process_assignment_release_bulk("cidr\n87.101.153.0/29")
-        self.assertEqual(self.resource_row("87.101.153.0/29")["status"], "AVAILABLE")
-        result = app.process_assignment_bulk("\n".join([HEADER, business_row("87.101.153.0/30", 4, "Narrow", "SVC-N")]))
-        self.assertEqual(result.imported, 1, result.errors)
-        self.assertIsNone(self.resource_row("87.101.153.0/29"))
-        self.assertEqual(self.resource_row("87.101.153.4/30")["status"], "AVAILABLE")
-        with app.connect() as connection:
-            reasons = [row["archived_reason"] for row in connection.execute("SELECT archived_reason FROM ip_resource_history WHERE archived_resource_uuid = ?", (released_uuid,)).fetchall()]
-        self.assertIn("RELEASED_SUBNET_REUSED", reasons)
+            row = connection.execute("SELECT status FROM assignments WHERE cidr = '87.101.152.0/30'").fetchone()
+        self.assertEqual(row["status"], "Active")
 
-    def test_single_unassign_endpoint_also_keeps_subnet(self):
+    def test_delete_failure_keeps_unassigned_and_retry_completes(self):
+        calls = self.fake_cst()
+        transaction_id = self.send_to_cst("87.101.152.0/30")
+        self.fake_cst({"DELETE"})
+        result = app.process_assignment_release_bulk("cidr\n87.101.152.0/30")
+        self.assertEqual(result.output_rows[0].processingStatus, "FAILED")
+        self.assertIn("DeleteLIR failed", result.output_rows[0].processingMessage)
+        with app.connect() as connection:
+            row = connection.execute("SELECT status FROM assignments WHERE cidr = '87.101.152.0/30'").fetchone()
+        self.assertEqual(row["status"], "Retiring")
+        self.assertEqual(self.ledger(transaction_id)["retired_at"], "")
+        self.fake_cst()
+        retry = app.process_assignment_release_bulk("cidr\n87.101.152.0/30")
+        self.assertEqual(retry.output_rows[0].processingStatus, "RELEASED", retry.errors)
+        self.assertNotEqual(self.ledger(transaction_id)["retired_at"], "")
+
+    def test_release_not_in_cst_makes_no_cst_call(self):
+        calls = self.fake_cst()
+        result = app.process_assignment_release_bulk("cidr\n87.101.152.4/30")
+        self.assertEqual(result.output_rows[0].processingStatus, "RELEASED")
+        self.assertEqual(calls, [])
+        self.assertNotIn("87.101.152.4/30", self.resource_cidrs())
+
+    def test_single_unassign_endpoint_uses_same_rules(self):
+        calls = self.fake_cst()
+        self.send_to_cst("87.101.152.8/30")
         with app.connect() as connection:
             assignment_id = connection.execute("SELECT id FROM assignments WHERE cidr = '87.101.152.8/30'").fetchone()["id"]
         app.unassign(assignment_id)
-        self.assertEqual(self.resource_row("87.101.152.8/30")["status"], "AVAILABLE")
+        self.assertEqual([op for op, _tx, _status in calls], ["SEND", "UPDATE", "DELETE"])
 
 
 if __name__ == "__main__":

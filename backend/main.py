@@ -74,9 +74,6 @@ BACKEND_LOG_PATH = Path(os.environ.get("BACKEND_LOG_FILE") or Path(__file__).wit
 BACKEND_LOG_LEVEL = os.environ.get("BACKEND_LOG_LEVEL", "INFO").strip().upper()
 CST_LOG_SENSITIVE_KEYS = {"authorization", "x-gateway-apikey", "apikey", "api_key", "access_token", "token", "refresh_token", "client_secret", "password"}
 BULK_UNASSIGNED_FRAGMENT_SOURCE = "bulk_unassigned_fragment"
-# Free-fragment resources whose source_entity_id starts with this prefix are subnets released from a
-# customer/service. They keep their own CIDR and resource UUID instead of being merged into larger free blocks.
-RELEASED_SUBNET_SOURCE_PREFIX = "released:"
 AUDIT_SERVICE = AuditService(lambda: now_iso())
 
 
@@ -3343,14 +3340,6 @@ def active_public_assignment_networks_all(connection: sqlite3.Connection) -> lis
     return networks
 
 
-def active_assignment_networks_any(connection: sqlite3.Connection) -> list[IPv4Network]:
-    return [
-        network_of(assignment)
-        for assignment in (assignment_from_row(row) for row in connection.execute("SELECT * FROM assignments").fetchall())
-        if assignment_active_for_conflict(assignment)
-    ]
-
-
 def materialize_bulk_unassigned_fragments(connection: sqlite3.Connection) -> tuple[int, int]:
     roots = top_level_public_pool_resources(connection)
     active_assignment_networks = active_public_assignment_networks_all(connection)
@@ -3365,25 +3354,9 @@ def materialize_bulk_unassigned_fragments(connection: sqlite3.Connection) -> tup
 
     desired: dict[str, ResourceRecord] = {}
     existing_fragment_uuids: set[str] = set()
-    released_networks: list[IPv4Network] = []
-    occupied_any = active_assignment_networks_any(connection)
-    for row in connection.execute(
-        "SELECT * FROM ip_resources WHERE source_entity_type = ? AND source_entity_id LIKE ? AND status != 'RETIRED'",
-        (BULK_UNASSIGNED_FRAGMENT_SOURCE, f"{RELEASED_SUBNET_SOURCE_PREFIX}%"),
-    ).fetchall():
-        released = resource_from_row(row)
-        released_network = normalize_network(released.cidr)
-        if any(released_network.overlaps(network) for network in occupied_any):
-            # A new assignment now uses part or all of this released subnet: let the free space be re-fragmented.
-            archive_ip_resource(connection, released.resource_uuid, "RELEASED_SUBNET_REUSED")
-            continue
-        released_networks.append(released_network)
-        existing_fragment_uuids.add(released.resource_uuid)
-        desired[released.resource_uuid] = released
-
     for root in roots:
         root_network = normalize_network(root.cidr)
-        assigned_networks = [network for network in [*active_assignment_networks, *released_networks] if network.subnet_of(root_network)]
+        assigned_networks = [network for network in active_assignment_networks if network.subnet_of(root_network)]
         if not assigned_networks:
             continue
         for fragment in subtract_allocated_networks(root_network, assigned_networks):
@@ -9568,84 +9541,65 @@ def unassign(assignment_id: str) -> None:
         unassign_assignment_record(connection, assignment)
 
 
-def released_subnet_resource(resource: ResourceRecord, assignment: Assignment, cst_reported: bool) -> ResourceRecord:
-    """The same subnet (same resource UUID and CIDR) with the customer/service link removed."""
-    timestamp = now_iso()
-    released_by = assignment.customer_name or assignment.internal_application_name or assignment.assignment_name or assignment.id
-    return cst_unassigned_update_resource(resource).model_copy(update={
-        "version_uuid": new_version_uuid(),
-        "service_id": "",
-        "region_id": resource.region_id,
-        "access_technology_id": "",
-        "access_technology": "",
-        "description": f"Released from {released_by} on {timestamp[:10]}",
-        "action_flag": "U" if cst_reported else "N",
-        "cst_sync_status": resource.cst_sync_status if cst_reported else ("PENDING" if resource.ip_type == "PUBLIC" else "NOT_REQUIRED"),
-        "cst_sync_ready": True,
-        "cst_validation_status": "READY",
-        "cst_validation_errors": "",
-        "cst_validation_warnings": "",
-        "migration_conflict_status": "",
-        "migration_conflict_reason": "",
-        "migration_conflict_group": "",
-        "update_date": timestamp[:10],
-        "updated_at": timestamp,
-        "source_entity_type": BULK_UNASSIGNED_FRAGMENT_SOURCE,
-        "source_entity_id": f"{RELEASED_SUBNET_SOURCE_PREFIX}{assignment.id}",
-    })
+def cst_release_failure_detail(jobs: list[CstSyncJob]) -> str:
+    failed = next((job for job in jobs if job.status != "SUCCESS"), None)
+    return (failed.last_error or f"CST job remained {failed.status}") if failed else ""
 
 
 def unassign_assignment_record(connection: sqlite3.Connection, assignment: Assignment, materialize: bool = True) -> bool:
-    """Release one assignment from its customer/service. Returns True when a CST unassign update was sent.
+    """Release one assignment following the CST LIR rules. Returns True when CST was updated.
 
-    The subnet itself is kept: its ip_resources row (same resource UUID and CIDR) becomes an
-    AVAILABLE, unassigned (assignmentStatusId 1) subnet, and the previous version is archived to
-    ip_resource_history. Only the assignment and its customer/service details are removed.
-    Retired resources keep the old behaviour and are deleted.
+    For a record held in CST:
+      1. UpdateLIR to Unassigned (assignmentStatusId 1) - DeleteLIR is rejected unless the record is Unassigned.
+      2. DeleteLIR - on success the Transaction ID is retired in cst_transaction_ledger and is never reused.
+    Then the subnet is removed locally (the previous version is archived to ip_resource_history) and the
+    freed space is re-materialized as new unassigned fragments, which get new Transaction IDs when sent.
 
-    Raises HTTPException on any blocking condition; the caller's connection context
-    rolls the row back so a failed CST update never leaves a half-released CIDR.
+    If step 1 fails nothing changes. If step 2 fails, the Unassigned state is committed (CST already has it),
+    the assignment is left in Retiring status, and an HTTPException is raised; releasing it again retries.
     """
     assignment_id = assignment.id
     resource = find_resource_by_source(connection, "assignment", assignment_id)
-    cst_delete_required = cst_resource_reported_to_cst(connection, resource)
     retired = bool(resource and resource.status == "RETIRED")
-    if retired:
-        audit_action = "Retired Resource Deletion" if not cst_delete_required else "CST Assignment Status Update"
-        audit_new_value = "Deleted retired resource" if not cst_delete_required else "Set CST LIR assignmentStatusId to 1 Unassigned and released locally"
-    else:
+    if not retired:
         assert_resource_can_change(connection, "assignment", assignment_id)
-        audit_action = "Subnet Release"
-        audit_new_value = "Released from customer/service; subnet kept as available"
+    in_cst = cst_resource_reported_to_cst(connection, resource) and not cst_resource_deleted_from_cst(connection, resource)
+    audit_new_value = "Released; subnet removed locally (not held in CST)"
 
-    if cst_delete_required:
+    if in_cst:
         connection.execute(
             "UPDATE assignments SET status = ?, action_flag = ? WHERE id = ?",
             ("Retiring", "U", assignment_id),
         )
         retiring_assignment = assignment_from_row(connection.execute("SELECT * FROM assignments WHERE id = ?", (assignment_id,)).fetchone())
         resource = sync_assignment_resource(connection, retiring_assignment)
-        jobs = create_cst_sync_jobs(connection, [(cst_unassigned_update_resource(resource), "UPDATE")], "ASSIGNMENT_UNASSIGN")
-        assert_cst_business_flow_succeeded(jobs, "Unassign")
-        audit_action = "CST Assignment Status Update"
-        audit_new_value = "Set CST LIR assignmentStatusId to 1 Unassigned; subnet kept as available"
+        update_jobs = create_cst_sync_jobs(connection, [(cst_unassigned_update_resource(resource), "UPDATE")], "ASSIGNMENT_RELEASE_UNASSIGN")
+        assert_cst_business_flow_succeeded(update_jobs, "Release (CST UpdateLIR to Unassigned)")
+
+        unassigned = find_resource_by_source(connection, "assignment", assignment_id) or resource
+        delete_jobs = create_cst_sync_jobs(connection, [(cst_unassigned_update_resource(unassigned), "DELETE")], "ASSIGNMENT_RELEASE_DELETE")
+        delete_error = cst_release_failure_detail(delete_jobs)
+        if delete_error:
+            record_audit(connection, "CST DeleteLIR Failed", "assignment", assignment_id, "", f"Record is Unassigned in CST; DeleteLIR failed: {delete_error}")
+            connection.commit()
+            raise HTTPException(
+                status_code=502,
+                detail=f"CST record set to Unassigned, but DeleteLIR failed: {delete_error}. The assignment is left in Retiring status; release it again to retry DeleteLIR.",
+            )
+        transaction_id = (find_resource_by_source(connection, "assignment", assignment_id) or unassigned).transaction_id
+        audit_new_value = f"CST UpdateLIR to Unassigned, then DeleteLIR; Transaction ID {transaction_id} retired; subnet removed locally"
 
     result = connection.execute("DELETE FROM assignments WHERE id = ?", (assignment_id,))
     if result.rowcount == 0:
         raise HTTPException(status_code=404, detail="Assignment not found")
     if resource:
+        archive_ip_resource(connection, resource.resource_uuid, "ASSIGNMENT_RELEASED_CST_DELETED" if in_cst else "ASSIGNMENT_RELEASED")
         connection.execute("DELETE FROM assignment_details WHERE resource_uuid = ?", (resource.resource_uuid,))
-        if retired:
-            connection.execute("DELETE FROM ip_resources WHERE resource_uuid = ?", (resource.resource_uuid,))
-        else:
-            # Re-read: a CST job may have updated sync status on the row.
-            current = find_resource_by_source(connection, "assignment", assignment_id) or resource
-            archive_ip_resource(connection, current.resource_uuid, "ASSIGNMENT_RELEASED")
-            upsert_resource_record(connection, released_subnet_resource(current, assignment, cst_delete_required))
+        connection.execute("DELETE FROM ip_resources WHERE resource_uuid = ?", (resource.resource_uuid,))
     if materialize:
         materialize_bulk_unassigned_fragments(connection)
-    record_audit(connection, audit_action, "assignment", assignment_id, assignment.model_dump_json(), audit_new_value)
-    return cst_delete_required
+    record_audit(connection, "Retired Resource Deletion" if retired else "Subnet Release", "assignment", assignment_id, assignment.model_dump_json(), audit_new_value)
+    return in_cst
 
 
 
@@ -9684,7 +9638,7 @@ def bulk_release_target(connection: sqlite3.Connection, row: dict[str, str]) -> 
 
 
 def process_assignment_release_bulk(csv_text: object, dry_run: bool = False) -> BulkImportResult:
-    """Bulk release from customer/service; subnets are kept. Each row is its own transaction."""
+    """Bulk release per CST LIR rules (UpdateLIR to Unassigned, then DeleteLIR). Each row is its own transaction."""
     deleted = 0
     errors: list[str] = []
     output_rows: list[BulkOutputRow] = []
@@ -9703,16 +9657,18 @@ def process_assignment_release_bulk(csv_text: object, dry_run: bool = False) -> 
                     raise HTTPException(status_code=409, detail=f"{assignment.cidr} is listed more than once in this file")
                 seen_ids.update({row_key, assignment.id, assignment.cidr})
                 resource = find_resource_by_source(connection, "assignment", assignment.id)
-                cst_required = cst_resource_reported_to_cst(connection, resource)
+                cst_required = cst_resource_reported_to_cst(connection, resource) and not cst_resource_deleted_from_cst(connection, resource)
+                transaction_id = resource.transaction_id if resource else ""
+                cst_steps = f"CST UpdateLIR to Unassigned, then DeleteLIR (Transaction ID {transaction_id} retired)"
                 if dry_run:
                     if not (resource and resource.status == "RETIRED"):
                         assert_resource_can_change(connection, "assignment", assignment.id)
                     status = "WOULD_RELEASE"
-                    message = "Would release from customer/service (subnet kept as available)" + (" and send CST unassign (status 1)" if cst_required else "; no CST update needed")
+                    message = ("Would send " + cst_steps if cst_required else "Not held in CST; no CST call") + " and remove the subnet locally"
                 else:
                     unassign_assignment_record(connection, assignment, materialize=False)
                     status = "RELEASED"
-                    message = "Released from customer/service; subnet kept as available" + ("; CST set to Unassigned" if cst_required else "")
+                    message = (cst_steps if cst_required else "Not held in CST; no CST call") + "; subnet removed locally"
                     reason = csv_value(row, "reason", "notes")
                     if reason:
                         record_audit(connection, "Bulk Assignment Release Reason", "assignment", assignment.id, "", reason)
@@ -9729,7 +9685,7 @@ def process_assignment_release_bulk(csv_text: object, dry_run: bool = False) -> 
                     assignmentDate=assignment.assignment_date,
                     customerName=assignment.customer_name,
                     cstSyncReady=not cst_required,
-                    cstValidationStatus="CST_UNASSIGN" if cst_required else "NOT_REQUIRED",
+                    cstValidationStatus="CST_UNASSIGN_AND_DELETE" if cst_required else "NOT_REQUIRED",
                 )
             )
         except (HTTPException, ValueError, sqlite3.Error) as exc:

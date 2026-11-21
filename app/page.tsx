@@ -1837,7 +1837,7 @@ ${errorMessage(error)}`
                 onReleaseFileName={setBulkReleaseFileName}
                 onReleaseAssignments={(dryRun) => run(async () => {
                   const rows = bulkReleaseCsv.split(/\r?\n/).filter(Boolean).length - 1;
-                  if (!dryRun && !window.confirm(`Release ${rows} subnet(s) from their customer/service? The subnets are kept as available. Assignments already reported to CST will be set to Unassigned in CST. Run Preview first if you have not.`)) {
+                  if (!dryRun && !window.confirm(`Release ${rows} assignment(s)? Per CST LIR rules, records held in CST are set to Unassigned and then deleted with DeleteLIR; their Transaction IDs are retired permanently and cannot be reused. The subnets are removed locally and the space returns to the free pool. Run Preview first if you have not.`)) {
                     return;
                   }
                   const { data } = await api.post<BulkBatch>("/assignments/bulk-release", { csv_text: bulkReleaseCsv, file_name: bulkReleaseFileName, dry_run: dryRun }, { timeout: 15 * 60 * 1000 });
@@ -4176,7 +4176,7 @@ function BulkOperations(props: {
         <Card>
           <CardHeader>
             <CardTitle>Bulk Release: Assignments</CardTitle>
-            <CardDescription>Release subnets from their customer/service. The subnet is kept as available with its UUID and history. For a reassignment, run this release first, then import the new assignment.</CardDescription>
+            <CardDescription>Release assignments per CST LIR rules: UpdateLIR to Unassigned, then DeleteLIR, which permanently retires the Transaction ID. The space returns to the free pool. For a reassignment, run this release first, then import the new assignment (it gets a new Transaction ID).</CardDescription>
           </CardHeader>
           <CardContent className="grid gap-3">
             <input
@@ -4192,7 +4192,7 @@ function BulkOperations(props: {
               <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
                 <div>
                   <p className="text-sm font-semibold">Release template</p>
-                  <p className="text-xs text-muted-foreground">cidr is required (or assignmentId when a CIDR has duplicates). customerName and serviceId are optional safety checks: the row is rejected if they do not match. Each row is independent; a CST failure leaves that assignment unchanged.</p>
+                  <p className="text-xs text-muted-foreground">cidr is required (or assignmentId when a CIDR has duplicates). customerName and serviceId are optional safety checks: the row is rejected if they do not match. Each row is independent. If UpdateLIR fails nothing changes; if DeleteLIR fails the record stays Unassigned in CST and the assignment stays Retiring, so release it again to retry.</p>
                 </div>
                 <div className="flex flex-wrap gap-2">
                   <Button size="sm" variant="outline" onClick={() => { props.onReleaseCsv(BULK_RELEASE_ASSIGNMENT_TEMPLATE); props.onReleaseFileName("bulk-release-assignment-template.csv"); }}>
@@ -6965,8 +6965,6 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[], persis
   const persistedCstStatus = (resource: ResourceRecord | null, fallback: CstSyncStatus) => resource?.cst_sync_status ? normalizeCstSyncStatus(resource.cst_sync_status) : fallback;
   const persistedSuccessfulFreeFragment = (cidr: string) => persistedByCidr.get(cidr)?.find((resource) => resource.source_entity_type === "bulk_unassigned_fragment" && ["SUCCESS", "SYNCHRONIZED"].includes(normalizeCstSyncStatus(resource.cst_sync_status))) ?? null;
   const persistedFreeFragments = persistedResources.filter((resource) => resource.source_entity_type === "bulk_unassigned_fragment");
-  // Subnets released from a customer/service keep their own CIDR; they occupy space in client-side free-range calculation.
-  const releasedSubnets = persistedFreeFragments.filter((resource) => String(resource.source_entity_id || "").startsWith("released:") && resource.status !== "RETIRED");
   const persistedFreeFragmentCidrs = new Set(persistedFreeFragments.map((resource) => resource.cidr));
   const persistedRipeStatus = (value: string | undefined | null, fallback: RipeSyncStatus): RipeSyncStatus => {
     const normalized = String(value || fallback).trim().toUpperCase();
@@ -7080,7 +7078,7 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[], persis
     const poolResourceUuid = resourceUuid("pool", pool.id, pool.cidr);
     const persistedPoolResource = persistedFor(poolResourceUuid, "pool", pool.id, pool.cidr);
     const poolHasMaterializedFragments = persistedPoolResource
-      ? persistedFreeFragments.some((fragment) => !releasedSubnets.includes(fragment) && (fragment.root_pool_uuid === persistedPoolResource.resource_uuid || fragment.parent_resource_uuid === persistedPoolResource.resource_uuid))
+      ? persistedFreeFragments.some((fragment) => fragment.root_pool_uuid === persistedPoolResource.resource_uuid || fragment.parent_resource_uuid === persistedPoolResource.resource_uuid)
       : false;
     const poolMaintainer = persistedPoolResource?.maintainer || resourceMaintainerFromPool(pool);
     const poolOwner = persistedPoolResource?.owner || ipResourceOwnerFromMaintainer(poolMaintainer);
@@ -7217,7 +7215,7 @@ function buildRegistryResources(pools: Pool[], assignments: Assignment[], persis
     }
 
     if (poolStatus !== "RETIRED" && poolStatus !== "HISTORICAL" && !poolHasMaterializedFragments) {
-      for (const range of calculateContinuousFreeRanges(pool, [...occupyingAssignments, ...releasedSubnets.map((released) => ({ cidr: released.cidr }) as Assignment)])) {
+      for (const range of calculateContinuousFreeRanges(pool, occupyingAssignments)) {
         for (const block of rangeToCidrs(range.start, range.end)) {
           if (block.cidr === pool.cidr) {
             continue;
