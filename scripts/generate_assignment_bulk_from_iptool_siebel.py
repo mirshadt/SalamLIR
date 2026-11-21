@@ -110,6 +110,14 @@ def row_get(row: dict[str, str], *names: str) -> str:
     return ""
 
 
+EXCEL_SCIENTIFIC_RE = re.compile(r"^\s*\d+(\.\d+)?[eE]\+?\d+\s*$")
+
+
+def is_excel_scientific(value: str) -> bool:
+    """True for values like 1.00001E+12: Excel rounded a long number and its real digits are lost."""
+    return bool(EXCEL_SCIENTIFIC_RE.match(str(value or "")))
+
+
 def normalize_join_key(value: str) -> str:
     text = str(value or "").strip()
     if not text:
@@ -481,16 +489,77 @@ def build_siebel_index(rows: list[dict[str, str]], join_column: str) -> tuple[di
     return selected, duplicates
 
 
+def serial_digits_key(value: str) -> str:
+    """SERIAL_NUM without its product prefix: BDI1000010114916 -> 1000010114916 (the IP Tool Order Number)."""
+    key = normalize_join_key(value)
+    stripped = re.sub(r"^[A-Z]+", "", key)
+    return stripped if stripped != key and stripped[:1].isdigit() else ""
+
+
+def add_serial_digit_keys(index: dict[str, dict[str, str]], rows: list[dict[str, str]], join_column: str) -> None:
+    """Also index Siebel rows by SERIAL_NUM without the product prefix; exact keys keep priority."""
+    grouped: dict[str, list[dict[str, str]]] = defaultdict(list)
+    for row in rows:
+        key = serial_digits_key(row_get(row, join_column))
+        if key:
+            grouped[key].append(row)
+    for key, items in grouped.items():
+        index.setdefault(key, sorted(items, key=siebel_score, reverse=True)[0])
+
+
+def active_serials_by_account(rows: list[dict[str, str]], account_column: str, join_column: str) -> dict[str, list[str]]:
+    serials: dict[str, set[str]] = defaultdict(set)
+    for row in rows:
+        if row_get(row, "SID_STATUS", "STATUS_CD").lower() != "active":
+            continue
+        account = normalize_join_key(row_get(row, account_column))
+        serial = row_get(row, join_column)
+        if account and serial:
+            serials[account].add(serial)
+    return {account: sorted(values) for account, values in serials.items()}
+
+
+def service_id_for_non_service_join(
+    iptool: dict[str, str], siebel: dict[str, str], args: argparse.Namespace, serials_by_account: dict[str, list[str]]
+) -> tuple[str, str]:
+    """serviceId when the row was joined by account/customer, not by its Order Number.
+
+    The matched Siebel row is only one of the account's services, so its SERIAL_NUM must not be used blindly.
+    Returns (service_id, note); raises ValueError when the service cannot be determined safely.
+    """
+    order_number = row_get(iptool, args.iptool_join_column)
+    if order_number and not is_excel_scientific(order_number):
+        return normalize_join_key(order_number), f"{args.iptool_join_column} not found in Siebel; serviceId taken from {args.iptool_join_column}, customer details joined by account"
+    account = normalize_join_key(row_get(siebel, args.siebel_account_column))
+    candidates = serials_by_account.get(account, [])
+    if len(candidates) == 1:
+        return candidates[0], "serviceId inferred: the only active Siebel service for this account"
+    reason = "is in Excel scientific notation" if order_number else "is blank"
+    if candidates:
+        raise ValueError(
+            f"{args.iptool_join_column} {reason} and account {account} has {len(candidates)} active Siebel services "
+            f"({', '.join(candidates)}); fill in the correct {args.iptool_join_column}"
+        )
+    raise ValueError(f"{args.iptool_join_column} {reason} and account {account} has no active Siebel service; fill in the correct {args.iptool_join_column}")
+
+
 def contact_name(siebel: dict[str, str]) -> str:
     parts = [row_get(siebel, "PER_TITLE"), row_get(siebel, "FST_NAME"), row_get(siebel, "LAST_NAME")]
     name = " ".join(part.strip() for part in parts if part and part.strip())
     return name or row_get(siebel, "X_ITC_B2B_AP_NAME")
+
+# Optional IP Tool columns for new-IP sheets loaded without a Siebel export.
+IPTOOL_CR_COLUMNS = ("CR Number", "CRNumber", "Commercial Registration", "CommercialRegId", "commercialRegId")
+IPTOOL_UNIFIED_COLUMNS = ("Unified Number", "UnifiedNumber", "unifiedNumber")
+
 
 def organization_identifier(siebel: dict[str, str], iptool: dict[str, str]) -> str:
     for value in (
         row_get(siebel, "X_ITC_B2B_COMMERCIAL_REGIS_NUM"),
         row_get(siebel, "X_ITC_B2B_UNIFIED_NUMBER"),
         row_get(siebel, "X_ITC_B2B_AP_IDENTITY_ID"),
+        row_get(iptool, *IPTOOL_CR_COLUMNS),
+        row_get(iptool, *IPTOOL_UNIFIED_COLUMNS),
         row_get(iptool, "CustomerNumber", "Customer Number"),
     ):
         valid = valid_10_digit(value)
@@ -514,8 +583,8 @@ def make_bulk_row(
     customer_name = row_get(siebel, "ACCOUNT_NAME") or row_get(iptool, "CustomerName", "Customer Name") or "Business Customer"
     customer_id = row_get(siebel, "ACCOUNT_NUMBER") or row_get(iptool, "CustomerNumber", "Customer Number") or "0"
     org_id = organization_identifier(siebel, iptool) or customer_id
-    commercial_reg = valid_10_digit(row_get(siebel, "X_ITC_B2B_COMMERCIAL_REGIS_NUM"))
-    unified = valid_10_digit(row_get(siebel, "X_ITC_B2B_UNIFIED_NUMBER"))
+    commercial_reg = valid_10_digit(row_get(siebel, "X_ITC_B2B_COMMERCIAL_REGIS_NUM")) or valid_10_digit(row_get(iptool, *IPTOOL_CR_COLUMNS))
+    unified = valid_10_digit(row_get(siebel, "X_ITC_B2B_UNIFIED_NUMBER")) or valid_10_digit(row_get(iptool, *IPTOOL_UNIFIED_COLUMNS))
 
     region_text = row_get(siebel, "ACCOUNT_REGION", "REGION", "Region") or iptool_region
     city_text = row_get(siebel, "CITY", "ACCOUNT_CITY", "City") or iptool_city
@@ -548,7 +617,15 @@ def make_bulk_row(
         or "Business Contact"
     )
 
-    service_id = row_get(siebel, "SERIAL_NUM") or normalize_join_key(row_get(iptool, args.iptool_join_column)) or "0"
+    order_number = row_get(iptool, args.iptool_join_column)
+    service_id = row_get(siebel, "SERIAL_NUM")
+    if not service_id:
+        if is_excel_scientific(order_number):
+            raise ValueError(
+                f"{args.iptool_join_column} '{order_number}' is in Excel scientific notation, so the real number is lost. "
+                f"Re-export the IP Tool sheet with {args.iptool_join_column} formatted as Text, or supply Siebel SERIAL_NUM."
+            )
+        service_id = normalize_join_key(order_number) or "0"
     product_type = row_get(iptool, "Product Type", "ProductType", "product_type")
     product_class = row_get(iptool, "ProductClass", "Product Class", "product_class")
     service_description = row_get(siebel, "PRODUCT_NAME") or product_type or product_class
@@ -653,6 +730,8 @@ def main() -> int:
     city_map = load_simple_map(args.city_map)
     city_region_map = load_city_region_map(args.city_map)
     service_by_key, duplicate_service = build_siebel_index(siebel_rows, args.siebel_join_column)
+    add_serial_digit_keys(service_by_key, siebel_rows, args.siebel_join_column)
+    serials_by_account = active_serials_by_account(siebel_rows, args.siebel_account_column, args.siebel_join_column)
     account_by_key, duplicate_account = build_siebel_index(siebel_rows, args.siebel_account_column)
     customer_by_key, duplicate_customer = build_siebel_index(siebel_rows, args.siebel_customer_column)
 
@@ -664,7 +743,8 @@ def main() -> int:
         public_value = row_get(iptool, "PublicIP", "Public IP")
         if public_value and public_value.strip().lower() not in {"yes", "y", "true", "1"} and not args.include_non_public:
             continue
-        service_key = normalize_join_key(row_get(iptool, args.iptool_join_column))
+        raw_service_key = row_get(iptool, args.iptool_join_column)
+        service_key = "" if is_excel_scientific(raw_service_key) else normalize_join_key(raw_service_key)
         account_key = normalize_join_key(row_get(iptool, args.iptool_account_column, "Customer Number", "CustomerNumber"))
         customer_key = normalize_join_key(row_get(iptool, args.iptool_customer_column, "Customer Name", "CustomerName"))
 
@@ -718,7 +798,13 @@ def main() -> int:
             missing_rows.append(missing)
             continue
         try:
+            join_note = ""
+            if join_type != "service":
+                service_id, join_note = service_id_for_non_service_join(iptool, siebel, args, serials_by_account)
+                siebel = {**siebel, "SERIAL_NUM": service_id}
             output = make_bulk_row(iptool, siebel, args, region_map, city_map, city_region_map)
+            if join_note:
+                output["notes"] = f"{output.get('notes') or ''}; {join_note}".strip("; ")
             output_rows.append(output)
         except Exception as exc:
             missing = dict(iptool)

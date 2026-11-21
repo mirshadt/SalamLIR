@@ -688,6 +688,26 @@ export type CstMigrationJobStats = {
   last_error: string;
 };
 
+export type CstContainerSplitItem = {
+  container_cidr: string;
+  container_transaction_id: string;
+  container_assignment_status_id: number | null;
+  status: "PLANNED" | "BLOCKED" | "CREATED";
+  reason: string;
+  operations: string[];
+  batch_id: string;
+  job_statuses: string[];
+};
+
+export type CstContainerSplitResult = {
+  dry_run: boolean;
+  planned: number;
+  blocked: number;
+  created_batches: number;
+  message: string;
+  containers: CstContainerSplitItem[];
+};
+
 export type CstManualMigrationResult = {
   batch_id: string;
   created_jobs: number;
@@ -1157,6 +1177,11 @@ export async function createCstMigrationJobFromReview(payload: CstMigrationRevie
   const { data } = await api.post<CstMigrationReviewCreateResult>("/cst/migration-jobs/review/create", payload);
   return data;
 }
+export async function runCstContainerSplit(payload: { dry_run: boolean; execute_immediately?: boolean; container_cidrs?: string[] }) {
+  const { data } = await api.post<CstContainerSplitResult>("/cst/container-splits", payload, { timeout: 15 * 60 * 1000 });
+  return data;
+}
+
 export async function createManualCstMigrationJob(payload: CstManualMigrationRequest = {}) {
   const { data } = await api.post<CstManualMigrationResult>("/cst/migration-jobs/manual", payload);
   return data;
