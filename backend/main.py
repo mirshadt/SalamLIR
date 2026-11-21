@@ -2764,14 +2764,16 @@ def cst_get_lir_page_resource(config: CstConfig, page_number: int = 1) -> Resour
 def cst_transaction_id_for_resource(connection: sqlite3.Connection, resource: ResourceRecord, operation: str, batch_id: str, correlation_id: str) -> str:
     existing = connection.execute(
         """
-        SELECT transaction_id, retired_at
+        SELECT transaction_id, retired_at, cidr
         FROM cst_transaction_ledger
         WHERE resource_uuid = ? OR cidr = ?
-        ORDER BY CASE WHEN resource_uuid = ? THEN 0 ELSE 1 END, first_used_at DESC
+        ORDER BY CASE WHEN resource_uuid = ? AND cidr = ? THEN 0 WHEN resource_uuid = ? THEN 1 ELSE 2 END, first_used_at DESC
         LIMIT 1
         """,
-        (resource.resource_uuid, resource.cidr, resource.resource_uuid),
+        (resource.resource_uuid, resource.cidr, resource.resource_uuid, resource.cidr, resource.resource_uuid),
     ).fetchone()
+    if existing and operation == "SEND" and str(existing["cidr"] or "") != resource.cidr:
+        existing = None  # e.g. a subnet split locally: its old record is deleted and the Transaction ID retired
     if existing and not str(existing["retired_at"] or ""):
         existing_transaction_id = str(existing["transaction_id"] or "").strip()
         if operation != "SEND" or is_uuid_text(existing_transaction_id):
@@ -7553,8 +7555,37 @@ def cst_recorded_assignment_status(connection: sqlite3.Connection, transaction_i
         return None
 
 
-def cst_unsent_local_resources(connection: sqlite3.Connection) -> list[ResourceRecord]:
-    """Local public assignments and unassigned fragments that CST does not hold yet."""
+def cst_active_rows_by_resource(active: list[tuple[int, int, sqlite3.Row]]) -> dict[str, list[sqlite3.Row]]:
+    by_resource: dict[str, list[sqlite3.Row]] = defaultdict(list)
+    for _start, _end, row in active:
+        by_resource[str(row["resource_uuid"])].append(row)
+    return by_resource
+
+
+def cst_resource_needs_send(
+    connection: sqlite3.Connection,
+    resource: ResourceRecord,
+    active: list[tuple[int, int, sqlite3.Row]] | None = None,
+) -> bool:
+    """True when CST does not hold this subnet with its current CIDR.
+
+    Covers a subnet never sent, one deleted from CST and not sent again, and one split or resized
+    locally while CST still holds its old CIDR (same local resource, different CIDR).
+    """
+    if resource.ip_type != "PUBLIC" or resource.status == "RETIRED":
+        return False
+    own_rows = cst_active_rows_by_resource(active if active is not None else cst_active_ledger_intervals(connection)).get(resource.resource_uuid, [])
+    if any(normalize_network(str(row["cidr"])) == normalize_network(resource.cidr) for row in own_rows):
+        return False
+    if own_rows:
+        return True
+    if not cst_resource_reported_to_cst(connection, resource):
+        return True
+    return cst_resource_deleted_from_cst(connection, resource)
+
+
+def cst_unsent_local_resources(connection: sqlite3.Connection, active: list[tuple[int, int, sqlite3.Row]] | None = None) -> list[ResourceRecord]:
+    """Local public assignments and unassigned fragments that CST does not hold with their current CIDR."""
     rows = connection.execute(
         """
         SELECT * FROM ip_resources
@@ -7563,8 +7594,8 @@ def cst_unsent_local_resources(connection: sqlite3.Connection) -> list[ResourceR
           AND source_entity_type IN ('assignment', 'bulk_unassigned_fragment')
         """
     ).fetchall()
-    resources = [resource_from_row(row) for row in rows]
-    return [resource for resource in resources if not cst_resource_reported_to_cst(connection, resource)]
+    active = active if active is not None else cst_active_ledger_intervals(connection)
+    return [resource for resource in (resource_from_row(row) for row in rows) if cst_resource_needs_send(connection, resource, active)]
 
 
 def cst_overlapping_ledger_rows(
@@ -7572,12 +7603,15 @@ def cst_overlapping_ledger_rows(
     resource: ResourceRecord,
     active: list[tuple[int, int, sqlite3.Row]] | None = None,
 ) -> list[sqlite3.Row]:
-    """Records CST holds that a SendLIR for this resource would overlap (either direction)."""
-    if resource.ip_type != "PUBLIC" or cst_resource_reported_to_cst(connection, resource):
+    """Records CST holds that a SendLIR for this resource would overlap (either direction).
+
+    Includes the resource's own record when CST holds it under an older CIDR (split locally).
+    """
+    active = active if active is not None else cst_active_ledger_intervals(connection)
+    if not cst_resource_needs_send(connection, resource, active):
         return []
     start, end = resource_interval(resource)
-    active = active if active is not None else cst_active_ledger_intervals(connection)
-    return [row for row_start, row_end, row in active if row_start <= end and start <= row_end and str(row["resource_uuid"]) != resource.resource_uuid]
+    return [row for row_start, row_end, row in active if row_start <= end and start <= row_end]
 
 
 def cst_resource_send_blocker(connection: sqlite3.Connection, resource: ResourceRecord) -> str:
@@ -7617,7 +7651,7 @@ def cst_overlap_groups(
     """
     ignore = ignore_ledger_resource_uuids or set()
     active = [item for item in cst_active_ledger_intervals(connection) if str(item[2]["resource_uuid"]) not in ignore]
-    unsent = {resource.resource_uuid: resource for resource in cst_unsent_local_resources(connection)}
+    unsent = {resource.resource_uuid: resource for resource in cst_unsent_local_resources(connection, active)}
     for seed in seeds:
         unsent.setdefault(seed.resource_uuid, seed)
     plain: list[ResourceRecord] = []
@@ -7651,6 +7685,25 @@ def cst_overlap_groups(
     return groups, plain
 
 
+def cst_record_assignment_status(connection: sqlite3.Connection, row: sqlite3.Row) -> int | None:
+    """Whether CST holds the record as assigned, judged from the local inventory first.
+
+    The local resource behind the record says what was sent: assigned (2/3/4) means CST holds it
+    as assigned. Without a local resource, the last successful SendLIR/UpdateLIR payload decides.
+    Returns 1 only when nothing indicates an assignment; None when nothing is known.
+    """
+    local = connection.execute("SELECT assignment_status_id, source_entity_type FROM ip_resources WHERE resource_uuid = ?", (str(row["resource_uuid"]),)).fetchone()
+    recorded = cst_recorded_assignment_status(connection, str(row["transaction_id"]))
+    local_status = cst_int_value(local["assignment_status_id"], 0) if local is not None else None
+    if local is not None and str(local["source_entity_type"]) == "assignment" and local_status not in (None, 0, 1):
+        return local_status
+    if recorded is not None and recorded != 1:
+        return recorded
+    if local_status == 1 or recorded == 1:
+        return 1
+    return None
+
+
 def cst_record_local_owner(connection: sqlite3.Connection, row: sqlite3.Row) -> Assignment | None:
     """The active local assignment a CST record belongs to, if it has not been released or reassigned."""
     resource = connection.execute("SELECT * FROM ip_resources WHERE resource_uuid = ?", (str(row["resource_uuid"]),)).fetchone()
@@ -7677,7 +7730,8 @@ def cst_plan_overlap_group(
     a single UpdateLIR replaces all of this.
     """
     exempt = exempt_uuids or set()
-    statuses = {str(row["transaction_id"]): cst_recorded_assignment_status(connection, str(row["transaction_id"])) for row in rows}
+    member_uuids = {member.resource_uuid for member in members}
+    statuses = {str(row["transaction_id"]): cst_record_assignment_status(connection, row) for row in rows}
     item = CstContainerSplitItem(
         container_cidr=", ".join(str(row["cidr"]) for row in rows),
         container_transaction_id=", ".join(str(row["transaction_id"]) for row in rows),
@@ -7694,7 +7748,7 @@ def cst_plan_overlap_group(
             blockers.append(f"a DeleteLIR for {row['cidr']} is already queued in CST batch {queued_delete['batch_id']}; push pending CST jobs first")
             continue
         owner = cst_record_local_owner(connection, row)
-        if owner is not None:
+        if owner is not None and str(row["resource_uuid"]) not in member_uuids:
             blockers.append(f"{row['cidr']} is still assigned locally to {owner.customer_name or owner.id}; release it or use partial reassignment first")
     blockers.extend(blocker for blocker in (cst_resource_send_blocker(connection, member) for member in members if member.resource_uuid not in exempt) if blocker)
 

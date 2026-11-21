@@ -129,6 +129,54 @@ class CstContainerSplitTest(unittest.TestCase):
         preview = app.run_cst_container_split(app.CstContainerSplitRequest(dry_run=True))
         self.assertFalse(any(line.startswith("UpdateLIR") for line in preview.containers[0].operations))
 
+    def split_locally(self, assignment, new_cidr: str):
+        """The assignment keeps its identity but is cut down locally to new_cidr (local split)."""
+        network = ip_network(new_cidr)
+        with app.connect() as connection:
+            connection.execute(
+                "UPDATE assignments SET cidr = ?, prefix = ?, size = ?, start = ?, end = ? WHERE id = ?",
+                (str(network), network.prefixlen, network.num_addresses, str(network.network_address), str(network.broadcast_address), assignment.id),
+            )
+            row = connection.execute("SELECT * FROM assignments WHERE id = ?", (assignment.id,)).fetchone()
+            app.sync_assignment_resource(connection, app.assignment_from_row(row))
+
+    def test_local_split_of_assigned_record_unassigns_deletes_and_sends_parts(self):
+        """Assigned locally => assigned in CST: UpdateLIR to Unassigned, DeleteLIR, SendLIR each part."""
+        owner = self.individual_assignment("87.101.190.64/27", 32, "Original Customer")
+        old_tx = next(tx for op, cidr, tx, _status in self.calls if op == "SEND" and cidr == "87.101.190.64/27")
+        self.calls.clear()
+        self.split_locally(owner, "87.101.190.64/28")
+        preview = app.run_cst_container_split(app.CstContainerSplitRequest(dry_run=True))
+        group = next(item for item in preview.containers if item.container_cidr == "87.101.190.64/27")
+        self.assertEqual(group.status, "PLANNED", group.reason)
+        self.assertEqual(group.operations, [
+            f"UpdateLIR 87.101.190.64/27 to Unassigned (Transaction ID {old_tx})",
+            f"DeleteLIR 87.101.190.64/27 (Transaction ID {old_tx})",
+            "SendLIR 87.101.190.64/28 [Business]",
+            "SendLIR 87.101.190.80/28 [Unassigned]",
+        ])
+        app.run_cst_container_split(app.CstContainerSplitRequest(dry_run=False, execute_immediately=True, container_cidrs=["87.101.190.64/27"]))
+        sends = {cidr: tx for op, cidr, tx, _status in self.calls if op == "SEND"}
+        self.assertNotIn(old_tx, sends.values(), "the retired Transaction ID is never reused")
+        self.assertNotEqual(self.ledger(old_tx)["retired_at"], "")
+        with app.connect() as connection:
+            resized = app.find_resource_by_source(connection, "assignment", owner.id)
+            self.assertEqual(resized.transaction_id, sends["87.101.190.64/28"])
+            self.assertFalse(app.cst_resource_needs_send(connection, resized))
+
+    def test_assignment_management_on_split_part_resends_whole_record(self):
+        """Split a /27 locally, assign the freed /28 to someone else: same CST steps, no manual split."""
+        owner = self.individual_assignment("87.101.190.64/27", 32, "Original Customer")
+        old_tx = next(tx for op, cidr, tx, _status in self.calls if op == "SEND" and cidr == "87.101.190.64/27")
+        self.calls.clear()
+        self.split_locally(owner, "87.101.190.64/28")
+        self.individual_assignment("87.101.190.80/28", 16, "New Customer")
+        self.assertEqual([(op, cidr, status) for op, cidr, _tx, status in self.calls], [
+            ("UPDATE", "87.101.190.64/27", 1), ("DELETE", "87.101.190.64/27", 1),
+            ("SEND", "87.101.190.64/28", 3), ("SEND", "87.101.190.80/28", 3),
+        ])
+        self.assertEqual([tx for op, *_rest in self.calls if op != "SEND" for tx in [_rest[1]]], [old_tx, old_tx])
+
     def test_record_still_assigned_locally_is_blocked(self):
         owner = self.individual_assignment("87.101.190.64/27", 32, "Current Owner")
         self.calls.clear()

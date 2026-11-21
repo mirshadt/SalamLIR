@@ -404,12 +404,13 @@ CST rejects a SendLIR whose CIDR overlaps a record it already holds ("This IP CI
 
 - Split: a block was sent as one Unassigned record (e.g. `87.101.190.112/28`) and an assignment is later made inside it (e.g. `87.101.190.120/29`).
 - Merge: free space grows (e.g. after a release) into a block that contains smaller Unassigned records already in CST.
+- Local split: an assignment already in CST (e.g. a `/27`) is cut down locally (e.g. to a `/28`). CST still holds the old CIDR, so the assignment is treated as unsent and its old record joins the group.
 
 Every path that sends new subnets to CST applies the same rule, so the result does not depend on how the subnet was created: Assignment Management, pool partition, bulk load (when its migration job is created), manual migration and initial bootstrap. Before sending, the overlapping CST records and every unsent local subnet sharing their space are grouped, and per group:
 
 | Step | Condition | Action | Function |
 | --- | --- | --- | --- |
-| 1 | Only if the record is not Unassigned in CST (or its status is not recorded here) | Change the record to Unassigned | UpdateLIR |
+| 1 | Only if the record is assigned: its local resource is an assignment, its last CST payload was assigned, or its status is not recorded here | Change the record to Unassigned | UpdateLIR |
 | 2 | Always | Delete the original record; its Transaction ID is retired and never reused | DeleteLIR |
 | 3 | Always | Create the reassigned portion(s) with new Transaction IDs | SendLIR |
 | 4 | Always | Create the remaining portion(s) with new Transaction IDs | SendLIR |
