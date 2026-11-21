@@ -398,6 +398,19 @@ operation = UPDATE
 
 The job is then handled by the existing CST sync process.
 
+### 11.4.1 Splitting CST Records (Partial Reassignment)
+
+CST rejects a SendLIR whose CIDR overlaps a record it already holds ("This IP CIDR overlaps with an existing allocation"). This happens when a block was sent to CST as one Unassigned record (for example `87.101.190.112/28`) and new assignments were later loaded inside it (for example `87.101.190.120/29`).
+
+Per the CST LIR partial reassignment workflow, the covering record is replaced:
+
+1. DeleteLIR the covering record. It must be Unassigned in CST; its Transaction ID is retired and never reused.
+2. SendLIR every local subnet inside it: the assigned portions and the remaining unassigned portions, each with a new Transaction ID.
+
+Use **CST Sync Monitor > Split CST Records** (or `POST /cst/container-splits` with `dry_run`). It previews every affected record, then creates one strictly sequenced batch per record, so no SendLIR runs unless the DeleteLIR succeeded. A record is blocked, and never deleted, when it is assigned in CST, its CST status is unknown, the local subnets inside it are not CST-ready or do not cover all of its addresses, or they are already queued in another job.
+
+Migration jobs no longer send subnets that sit inside a record CST still holds; review rejects them with a pointer to Split CST Records.
+
 ### 11.5 CST Scheduling
 
 CST configuration supports scheduled sync. If scheduled sync is enabled, jobs are queued for the daily CST sync window instead of immediate external execution.
@@ -626,6 +639,7 @@ This keeps business assignment data fresh before business hours and reduces load
 | `PUT` | `/siebel/config` | Update Siebel config |
 | `POST` | `/siebel/business-customer` | Lookup BSS details by service ID |
 | `POST` | `/assignments/{assignment_id}/siebel-refresh` | Refresh one assignment from BSS |
+| `POST` | `/cst/container-splits` | Preview (`dry_run`) or create partial reassignment batches: DeleteLIR an Unassigned CST record that contains new subnets, then SendLIR its assigned and remaining portions |
 | `POST` | `/siebel/delta-sync` | Run BSS delta sync for all active business assignments |
 | `GET` | `/siebel/delta-audit` | Read BSS delta audit rows |
 

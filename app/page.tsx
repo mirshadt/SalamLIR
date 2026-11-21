@@ -42,6 +42,7 @@ import {
   AuditEvent,
   createCstMigrationJobFromReview,
   createManualCstMigrationJob,
+  runCstContainerSplit,
   BssDeltaSyncResponse,
   BulkBatch,
   BulkResult,
@@ -1408,6 +1409,30 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                   const jobs = await reconcileCstResources();
                   setNotice({ title: "CST GetLIR Sent", detail: `${jobs.length} provider-wide GetLIR API job(s) created. GetLIR pulls CST data using pageNumber/pageSize, not per-subnet filtering.` });
                 })}
+                onCstContainerSplit={() => run(async () => {
+                  const preview = await runCstContainerSplit({ dry_run: true });
+                  const describe = (items: typeof preview.containers) => items.map((item) => (
+                    `${item.container_cidr} (Transaction ID ${item.container_transaction_id}) - ${item.status}${item.reason ? `: ${item.reason}` : ""}${item.operations.length ? `\n  ${item.operations.join("\n  ")}` : ""}`
+                  )).join("\n\n");
+                  if (!preview.containers.length) {
+                    setNotice({ title: "Split CST Records", detail: "No CST record overlaps new local subnets. Nothing to split." });
+                    return;
+                  }
+                  if (!preview.planned) {
+                    setNotice({ title: "Split CST Records - all blocked", detail: `${preview.message}\n\n${describe(preview.containers)}` });
+                    return;
+                  }
+                  if (!window.confirm(`${preview.message}\n\nEach planned record will be deleted in CST with DeleteLIR (its Transaction ID is retired permanently), then the assigned and remaining portions are sent with SendLIR. Jobs are queued; CST is called when you push pending jobs.\n\nCreate the jobs?`)) {
+                    setNotice({ title: "Split CST Records - preview", detail: `${preview.message}\n\n${describe(preview.containers)}` });
+                    return;
+                  }
+                  const result = await runCstContainerSplit({ dry_run: false });
+                  void cstSummaryQuery.refetch();
+                  void cstJobsQuery.refetch();
+                  void cstBatchesQuery.refetch();
+                  void cstTransactionsQuery.refetch();
+                  setNotice({ title: "Split CST Records", detail: `${result.message}\n\n${describe(result.containers)}` });
+                })}
                 onRunCstDayMinusOne={() => run(async () => {
                   const result = await runCstDayMinusOneSync();
                   setNotice({ title: "CST Day-1 Sync", detail: `${result.message}\nBatch: ${result.batch_id}` });
@@ -2293,6 +2318,7 @@ type CstMonitorProps = {
   onRefreshCst: () => void;
   onBootstrapCst: () => void;
   onReconcileCst: () => void;
+  onCstContainerSplit: () => void;
   onRunCstDayMinusOne: () => void;
   onRetryCstJob: (job: CstSyncJob) => void;
   onRetryCstBatch: (batch: CstSyncBatch) => void;
@@ -5754,6 +5780,10 @@ function CstIntegrationMonitor(props: CstMonitorProps) {
             <Button variant="outline" onClick={props.onReconcileCst}>
               <Search className="h-4 w-4" />
               GetLIR Pull
+            </Button>
+            <Button variant="outline" onClick={props.onCstContainerSplit} title="Partial reassignment: DeleteLIR an Unassigned CST record that now contains new subnets, then SendLIR the assigned and remaining portions">
+              <GitBranch className="h-4 w-4" />
+              Split CST Records
             </Button>
             <label className="flex items-center gap-2 rounded-md border bg-muted/20 px-2 py-1">
               <span className="text-xs font-medium text-muted-foreground">Submit</span>
