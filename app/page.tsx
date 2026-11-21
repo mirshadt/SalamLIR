@@ -42,7 +42,6 @@ import {
   AuditEvent,
   createCstMigrationJobFromReview,
   createManualCstMigrationJob,
-  runCstContainerSplit,
   BssDeltaSyncResponse,
   BulkBatch,
   BulkResult,
@@ -1409,30 +1408,6 @@ function RegistryWorkspace({ theme, onTheme, onLogout }: { theme: AppTheme; onTh
                   const jobs = await reconcileCstResources();
                   setNotice({ title: "CST GetLIR Sent", detail: `${jobs.length} provider-wide GetLIR API job(s) created. GetLIR pulls CST data using pageNumber/pageSize, not per-subnet filtering.` });
                 })}
-                onCstContainerSplit={() => run(async () => {
-                  const preview = await runCstContainerSplit({ dry_run: true });
-                  const describe = (items: typeof preview.containers) => items.map((item) => (
-                    `${item.container_cidr} (Transaction ID ${item.container_transaction_id}) - ${item.status}${item.reason ? `: ${item.reason}` : ""}${item.operations.length ? `\n  ${item.operations.join("\n  ")}` : ""}`
-                  )).join("\n\n");
-                  if (!preview.containers.length) {
-                    setNotice({ title: "Split CST Records", detail: "No CST record overlaps new local subnets. Nothing to split." });
-                    return;
-                  }
-                  if (!preview.planned) {
-                    setNotice({ title: "Split CST Records - all blocked", detail: `${preview.message}\n\n${describe(preview.containers)}` });
-                    return;
-                  }
-                  if (!window.confirm(`${preview.message}\n\nEach planned record will be deleted in CST with DeleteLIR (its Transaction ID is retired permanently), then the assigned and remaining portions are sent with SendLIR. Jobs are queued; CST is called when you push pending jobs.\n\nCreate the jobs?`)) {
-                    setNotice({ title: "Split CST Records - preview", detail: `${preview.message}\n\n${describe(preview.containers)}` });
-                    return;
-                  }
-                  const result = await runCstContainerSplit({ dry_run: false });
-                  void cstSummaryQuery.refetch();
-                  void cstJobsQuery.refetch();
-                  void cstBatchesQuery.refetch();
-                  void cstTransactionsQuery.refetch();
-                  setNotice({ title: "Split CST Records", detail: `${result.message}\n\n${describe(result.containers)}` });
-                })}
                 onRunCstDayMinusOne={() => run(async () => {
                   const result = await runCstDayMinusOneSync();
                   setNotice({ title: "CST Day-1 Sync", detail: `${result.message}\nBatch: ${result.batch_id}` });
@@ -2032,7 +2007,7 @@ ${errorMessage(error)}`
           void cstTransactionsQuery.refetch();
           setNotice({
             title: result.batch_id ? "Pending CST Migration Job Created" : "CST Migration Job Not Created",
-            detail: `${result.message}\nJob ID: ${result.batch_id || "-"}\nIncluded: ${result.included_transactions}\nRejected/skipped: ${result.rejected_count + result.skipped_count}\nCreated: ${result.created_at.slice(0, 19)}\nCreated by: ${result.created_by}${result.rejected.length ? `\n\nRejected:\n${result.rejected.map((item) => `${item.review_id} ${item.cidr}: ${item.reason}`).join("\n")}` : ""}`
+            detail: `${result.message}\nJob ID: ${result.batch_id || "-"}\nIncluded: ${result.included_transactions}\nRejected/skipped: ${result.rejected_count + result.skipped_count}\nCreated: ${result.created_at.slice(0, 19)}\nCreated by: ${result.created_by}${result.partial_reassignments?.length ? `\n\nPartial reassignments:\n${result.partial_reassignments.map((group) => `${group.container_cidr} - ${group.status}${group.reason ? `: ${group.reason}` : ""}${group.operations.length ? `\n  ${group.operations.join("\n  ")}` : ""}`).join("\n\n")}` : ""}${result.rejected.length ? `\n\nRejected:\n${result.rejected.map((item) => `${item.review_id} ${item.cidr}: ${item.reason}`).join("\n")}` : ""}`
           });
         })}
       />
@@ -2318,7 +2293,6 @@ type CstMonitorProps = {
   onRefreshCst: () => void;
   onBootstrapCst: () => void;
   onReconcileCst: () => void;
-  onCstContainerSplit: () => void;
   onRunCstDayMinusOne: () => void;
   onRetryCstJob: (job: CstSyncJob) => void;
   onRetryCstBatch: (batch: CstSyncBatch) => void;
@@ -5682,7 +5656,7 @@ function CstMigrationReviewDialog(props: {
                       <TableCell>{item.customer_name || item.customer_id || "-"}</TableCell>
                       <TableCell>{item.service_id || "-"}</TableCell>
                       <TableCell className="max-w-[180px] truncate" title={item.transaction_id}>{item.transaction_id}</TableCell>
-                      <TableCell><Badge variant={item.validation_status === "VALID" ? "success" : "danger"}>{item.validation_status}</Badge>{item.reason ? <p className="mt-1 max-w-[240px] text-xs text-muted-foreground">{item.reason}</p> : null}</TableCell>
+                      <TableCell><Badge variant={item.validation_status === "VALID" ? "success" : "danger"}>{item.validation_status}</Badge>{item.reason ? <p className="mt-1 max-w-[240px] text-xs text-muted-foreground">{item.reason}</p> : null}{item.partial_reassignment ? <p className="mt-1 max-w-[260px] text-xs font-medium text-amber-600" title={item.partial_reassignment}>{item.partial_reassignment}</p> : null}</TableCell>
                     </TableRow>
                   );
                 }) : (
@@ -5780,10 +5754,6 @@ function CstIntegrationMonitor(props: CstMonitorProps) {
             <Button variant="outline" onClick={props.onReconcileCst}>
               <Search className="h-4 w-4" />
               GetLIR Pull
-            </Button>
-            <Button variant="outline" onClick={props.onCstContainerSplit} title="Partial reassignment: DeleteLIR an Unassigned CST record that now contains new subnets, then SendLIR the assigned and remaining portions">
-              <GitBranch className="h-4 w-4" />
-              Split CST Records
             </Button>
             <label className="flex items-center gap-2 rounded-md border bg-muted/20 px-2 py-1">
               <span className="text-xs font-medium text-muted-foreground">Submit</span>
