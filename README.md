@@ -165,6 +165,7 @@ Assignments and reservations:
 | `GET` | `/assignments` | List assignments and reservations |
 | `POST` | `/assignments` | Create assignment or reservation |
 | `POST` | `/assignments/bulk` | Bulk import assignments/reservations |
+| `POST` | `/assignments/bulk-delete` | Bulk release assignments (supports `dry_run` preview) |
 | `PATCH` | `/assignments/{assignment_id}/status` | Update assignment status |
 | `DELETE` | `/assignments/{assignment_id}` | Release assignment/reservation |
 

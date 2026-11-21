@@ -594,6 +594,7 @@ This keeps business assignment data fresh before business hours and reduces load
 | `GET` | `/assignments` | List assignments |
 | `POST` | `/assignments` | Create assignment |
 | `POST` | `/assignments/bulk` | Bulk assignment import |
+| `POST` | `/assignments/bulk-delete` | Bulk release assignments by CIDR or assignmentId (`dry_run: true` previews without changes). Use with `/assignments/bulk` for two-step reassignment. |
 | `PATCH` | `/assignments/{assignment_id}/status` | Suspend/resume/retire assignment |
 | `DELETE` | `/assignments/{assignment_id}` | Release assignment |
 
