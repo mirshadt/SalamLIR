@@ -7146,6 +7146,7 @@ def cst_resource_has_existing_job(connection: sqlite3.Connection, resource_uuid:
         WHERE j.resource_uuid = ?
           AND b.workflow_type IN ('MANUAL_LIR_MIGRATION', 'INITIAL_MIGRATION', 'INITIAL_LIR_MIGRATION', 'PARTIAL_REASSIGNMENT_CONTAINER_SPLIT')
           AND j.status IN ('PENDING', 'RUNNING', 'SUCCESS', 'FAILED', 'NOT_REQUIRED')
+              AND j.transaction_id NOT IN (SELECT transaction_id FROM cst_transaction_ledger WHERE retired_at != '')
         LIMIT 1
         """,
         (resource_uuid,),
@@ -7234,12 +7235,13 @@ def cst_assignment_review_where(request: CstMigrationReviewRequest) -> tuple[str
           WHERE j.resource_uuid = r.resource_uuid
             AND b.workflow_type IN ('MANUAL_LIR_MIGRATION', 'INITIAL_MIGRATION', 'INITIAL_LIR_MIGRATION', 'PARTIAL_REASSIGNMENT_CONTAINER_SPLIT')
             AND j.status IN ('PENDING', 'RUNNING', 'SUCCESS', 'FAILED', 'NOT_REQUIRED')
+              AND j.transaction_id NOT IN (SELECT transaction_id FROM cst_transaction_ledger WHERE retired_at != '')
         )
         """,
     ]
     params: list[object] = []
     if not request.include_existing_transactions:
-        filters.append("r.resource_uuid NOT IN (SELECT resource_uuid FROM cst_transaction_ledger)")
+        filters.append("r.resource_uuid NOT IN (SELECT resource_uuid FROM cst_transaction_ledger WHERE retired_at = '')")
 
     search = str(request.search or "").strip().lower()
     if search:
@@ -7293,6 +7295,9 @@ def cst_assignment_review_response(connection: sqlite3.Connection, request: CstM
     composites = cst_composites(connection)
     composite_items = [
         item for item in (cst_composite_review_item(connection, composite) for composite in composites)
+        if item.assignment_status_id in (2, 3, 4) and cst_review_matches_filter(item, request)
+    ] + [
+        item for item in (cst_review_operation_item(connection, resource, "UPDATE") for resource in cst_update_candidates(connection))
         if item.assignment_status_id in (2, 3, 4) and cst_review_matches_filter(item, request)
     ]
     member_uuids = sorted({member.resource_uuid for composite in composites for member in composite.members})
@@ -7391,7 +7396,7 @@ def cst_assignment_review_items_for_ids(connection: sqlite3.Connection, review_i
           AND r.ip_type = 'PUBLIC'
           AND r.status != 'RETIRED'
           AND r.assignment_status_id IN (2, 3, 4)
-          AND r.resource_uuid NOT IN (SELECT resource_uuid FROM cst_transaction_ledger)
+          AND r.resource_uuid NOT IN (SELECT resource_uuid FROM cst_transaction_ledger WHERE retired_at = '')
           AND COALESCE(a.migration_conflict_status, '') IN ('', 'ACCEPTED')
           AND NOT EXISTS (
             SELECT 1
@@ -7400,6 +7405,7 @@ def cst_assignment_review_items_for_ids(connection: sqlite3.Connection, review_i
             WHERE j.resource_uuid = r.resource_uuid
               AND b.workflow_type IN ('MANUAL_LIR_MIGRATION', 'INITIAL_MIGRATION', 'INITIAL_LIR_MIGRATION', 'PARTIAL_REASSIGNMENT_CONTAINER_SPLIT')
               AND j.status IN ('PENDING', 'RUNNING', 'SUCCESS', 'FAILED', 'NOT_REQUIRED')
+              AND j.transaction_id NOT IN (SELECT transaction_id FROM cst_transaction_ledger WHERE retired_at != '')
           )
         """,
         resource_uuids,
@@ -7433,7 +7439,7 @@ def cst_migration_review_items(connection: sqlite3.Connection, request: CstMigra
         if review_id in seen or resource.resource_uuid in member_uuids:
             continue
         seen.add(review_id)
-        if cst_resource_has_existing_job(connection, resource.resource_uuid):
+        if operation != "UPDATE" and cst_resource_has_existing_job(connection, resource.resource_uuid):
             continue
         item = cst_review_operation_item(connection, resource, operation)
         if cst_review_matches_filter(item, request):
@@ -7469,7 +7475,7 @@ def cst_migration_resource_rows(connection: sqlite3.Connection, payload: CstManu
     elif resource_scope == "unassigned":
         filters.append("r.assignment_status_id = 1")
     if not payload.include_existing_transactions:
-        filters.append("r.resource_uuid NOT IN (SELECT resource_uuid FROM cst_transaction_ledger)")
+        filters.append("r.resource_uuid NOT IN (SELECT resource_uuid FROM cst_transaction_ledger WHERE retired_at = '')")
     filters.append("(r.source_entity_type != 'assignment' OR COALESCE(a.migration_conflict_status, '') IN ('', 'ACCEPTED'))")
     if payload.only_cst_ready:
         filters.append("(r.source_entity_type != 'assignment' OR COALESCE(a.cst_sync_ready, 0) = 1)")
@@ -7636,6 +7642,61 @@ def cst_resource_needs_send(
     if not cst_resource_reported_to_cst(connection, resource):
         return True
     return cst_resource_deleted_from_cst(connection, resource)
+
+
+CST_SYNC_FINGERPRINT_KEYS = ("assignmentStatusId", "organizationId", "organizationName")
+
+
+def cst_sync_fingerprint(payload: object) -> tuple[str, ...]:
+    values = []
+    for key in CST_SYNC_FINGERPRINT_KEYS:
+        value = cst_status_from_payload_value(payload, key)
+        values.append(str(value if value is not None else "").strip().casefold())
+    return tuple(values)
+
+
+def cst_resource_pending_update(
+    connection: sqlite3.Connection,
+    resource: ResourceRecord,
+    active: list[tuple[int, int, sqlite3.Row]] | None = None,
+) -> sqlite3.Row | None:
+    """CST holds this subnet with the same CIDR but older content: it needs an UpdateLIR.
+
+    E.g. a block reported to CST as Unassigned (after a release or by the unassigned migration)
+    that is now assigned to a customer with exactly the same CIDR. Compared on assignment status
+    and organization against the last successful SendLIR/UpdateLIR of that Transaction ID.
+    """
+    if resource.ip_type != "PUBLIC" or resource.status == "RETIRED":
+        return None
+    own_rows = cst_active_rows_by_resource(active if active is not None else cst_active_ledger_intervals(connection)).get(resource.resource_uuid, [])
+    row = next((item for item in own_rows if normalize_network(str(item["cidr"])) == normalize_network(resource.cidr)), None)
+    if row is None or cst_in_flight_job(connection, str(row["transaction_id"])) is not None:
+        return None
+    recorded = connection.execute(
+        "SELECT payload_json FROM cst_sync_jobs WHERE transaction_id = ? AND operation IN ('SEND', 'UPDATE') AND status = 'SUCCESS' ORDER BY updated_at DESC, created_at DESC LIMIT 1",
+        (str(row["transaction_id"]),),
+    ).fetchone()
+    if recorded is None:
+        return None
+    try:
+        sent = json.loads(str(recorded["payload_json"] or "{}"))
+    except (TypeError, ValueError):
+        return None
+    current = cst_payload_for_resource(resource, "UPDATE", str(row["transaction_id"]), "sync-check")
+    return row if cst_sync_fingerprint(sent) != cst_sync_fingerprint(current) else None
+
+
+def cst_update_candidates(connection: sqlite3.Connection) -> list[ResourceRecord]:
+    """Local subnets CST holds with the same CIDR but outdated content (status/customer)."""
+    active = cst_active_ledger_intervals(connection)
+    rows = connection.execute(
+        """
+        SELECT * FROM ip_resources
+        WHERE ip_type = 'PUBLIC' AND status != 'RETIRED'
+          AND source_entity_type IN ('assignment', 'bulk_unassigned_fragment')
+        """
+    ).fetchall()
+    return [resource for resource in (resource_from_row(row) for row in rows) if cst_resource_pending_update(connection, resource, active) is not None]
 
 
 def cst_unsent_local_resources(connection: sqlite3.Connection, active: list[tuple[int, int, sqlite3.Row]] | None = None) -> list[ResourceRecord]:
@@ -8013,6 +8074,16 @@ def cst_send_resources(
     """
     materialize_bulk_unassigned_fragments(connection)
     outcome = CstSendOutcome()
+    active = cst_active_ledger_intervals(connection)
+    updates: list[tuple[ResourceRecord, str]] = []
+    to_send: list[ResourceRecord] = []
+    for resource in resources:
+        if cst_resource_needs_send(connection, resource, active):
+            to_send.append(resource)
+        elif cst_resource_pending_update(connection, resource, active) is not None:
+            updates.append((resource, "UPDATE"))  # same CIDR held by CST: update it, never SendLIR again
+    resources = to_send
+    extra_operations = [*(extra_operations or []), *[item for item in updates if item[0].resource_uuid not in {res.resource_uuid for res, _op in (extra_operations or [])}]]
     groups, plain = cst_overlap_groups(connection, resources, ignore_ledger_resource_uuids)
     planned: dict[str, CstComposite] = {}
     for rows, members in groups:
@@ -8132,8 +8203,9 @@ def cst_migration_resource_operations(
             resources.append(candidate)
             selected.add(candidate.resource_uuid)
             eligible_count += 1
-    operations = [*delete_operations, *[(resource, "SEND") for resource in resources]]
-    return operations, eligible_count, len(delete_operations)
+    update_operations = [(resource, "UPDATE") for resource in cst_update_candidates(connection) if resource.resource_uuid not in selected]
+    operations = [*delete_operations, *update_operations, *[(resource, "SEND") for resource in resources]]
+    return operations, eligible_count + len(update_operations), len(delete_operations)
 
 def cst_batch_job_stats(connection: sqlite3.Connection, batch_id: str) -> CstMigrationJobStats:
     batch = connection.execute("SELECT * FROM cst_sync_batches WHERE id = ?", (batch_id,)).fetchone()
@@ -8283,7 +8355,8 @@ def create_cst_migration_job_from_review(request: CstMigrationReviewCreateReques
             include_existing_transactions=False,
             validation_status="all",
         )
-        candidate_uuids = {resource.resource_uuid for resource in cst_partial_reassignment_candidates(connection)}
+        update_uuids = {resource.resource_uuid for resource in cst_update_candidates(connection)}
+        candidate_uuids = {resource.resource_uuid for resource in cst_partial_reassignment_candidates(connection)} | update_uuids
         composites_by_key = {composite.key: composite for composite in cst_composites(connection)}
         selected_composites: list[CstComposite] = []
         for review_id in [item for item in included_ids if item.startswith(CST_COMPOSITE_PREFIX)]:
@@ -8299,10 +8372,10 @@ def create_cst_migration_job_from_review(request: CstMigrationReviewCreateReques
             current_items = cst_assignment_review_items_for_ids(connection, included_ids)
             for review_id in included_ids:
                 operation, resource_uuid = parse_cst_review_id(review_id)
-                if review_id not in current_items and operation == "SEND" and resource_uuid in candidate_uuids:
+                if review_id not in current_items and operation in {"SEND", "UPDATE"} and resource_uuid in candidate_uuids:
                     row = connection.execute("SELECT * FROM ip_resources WHERE resource_uuid = ?", (resource_uuid,)).fetchone()
                     if row is not None:
-                        current_items[review_id] = cst_review_operation_item(connection, resource_from_row(row), "SEND")
+                        current_items[review_id] = cst_review_operation_item(connection, resource_from_row(row), operation)
         else:
             current_items = {item.review_id: item for item in cst_migration_review_items(connection, review_request)}
         operations: list[tuple[ResourceRecord, str]] = []
@@ -8486,7 +8559,7 @@ def bootstrap_current_cst_resources() -> list[CstSyncJob]:
                 SELECT * FROM ip_resources
                 WHERE ip_type = 'PUBLIC'
                   AND status != 'RETIRED'
-                  AND resource_uuid NOT IN (SELECT resource_uuid FROM cst_transaction_ledger)
+                  AND resource_uuid NOT IN (SELECT resource_uuid FROM cst_transaction_ledger WHERE retired_at = '')
                 ORDER BY prefix, cidr
                 """
             ).fetchall()

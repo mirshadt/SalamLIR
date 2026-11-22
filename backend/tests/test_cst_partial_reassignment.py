@@ -341,6 +341,64 @@ class CstPartialReassignmentTest(unittest.TestCase):
             self.assertIsNone(connection.execute("SELECT 1 FROM assignments WHERE cidr = ?", (ASSIGNED,)).fetchone())
         self.assertEqual(self.ledger(self.container_tx)["retired_at"], "")
 
+    # --- same CIDR already in CST: UpdateLIR, never a second SendLIR --------------------------
+    def last_payload(self, transaction_id: str, operation: str):
+        with app.connect() as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM cst_sync_jobs WHERE transaction_id = ? AND operation = ? ORDER BY created_at DESC LIMIT 1", (transaction_id, operation)
+            ).fetchone()
+        return json.loads(row["payload_json"])
+
+    def test_assignment_management_on_unassigned_record_sends_update(self):
+        self.individual_assignment(CONTAINER, 16, "New Customer")
+        self.assertEqual([(op, cidr, tx) for op, cidr, tx, _status in self.calls], [("UPDATE", CONTAINER, self.container_tx)])
+        payload = self.last_payload(self.container_tx, "UPDATE")
+        self.assertEqual(int(find_value(payload, "assignmentStatusId")), 3)
+        self.assertEqual(find_value(payload, "organizationName"), "New Customer")
+        self.assertEqual(self.ledger(self.container_tx)["retired_at"], "", "UpdateLIR keeps the Transaction ID")
+
+    def test_bulk_load_on_unassigned_record_is_an_update_row_and_job(self):
+        self.load_assignment(CONTAINER, 16, "New Customer")
+        for scope in ("all", "assigned"):
+            row = next(item for item in self.review(scope) if item.cidr == CONTAINER)
+            self.assertEqual(row.operation, "UPDATE")
+            self.assertEqual(row.transaction_id, self.container_tx)
+        result = self.create_from_review([row.review_id])
+        jobs = [job for job in self.batch_jobs(result.batch_id) if job.cidr == CONTAINER]
+        self.assertEqual([(job.operation, job.transaction_id) for job in jobs], [("UPDATE", self.container_tx)])
+        with app.connect() as connection:
+            app.process_cst_batch_pending_jobs(connection, result.batch_id)
+        self.assertEqual([op for op, cidr, *_ in self.calls if cidr == CONTAINER], ["UPDATE"])
+        self.assertFalse(any(item.cidr == CONTAINER for item in self.review()), "in sync after the UpdateLIR")
+
+    def test_release_then_new_customer_on_same_subnet(self):
+        """Released -> DeleteLIR; free space reported as Unassigned (new ID); new customer -> UpdateLIR of that ID."""
+        self.individual_assignment("87.101.190.32/27", 32, "Left Neighbour")  # neighbours keep the freed space a /27
+        self.individual_assignment("87.101.190.96/27", 32, "Right Neighbour")
+        first = self.individual_assignment("87.101.190.64/27", 32, "Old Customer")
+        old_tx = next(tx for op, cidr, tx, _status in self.calls if op == "SEND" and cidr == "87.101.190.64/27")
+        self.calls.clear()
+        app.unassign(first.id)
+        self.assertEqual([op for op, cidr, *_ in self.calls], ["UPDATE", "DELETE"])
+        self.assertNotEqual(self.ledger(old_tx)["retired_at"], "")
+        self.calls.clear()
+        self.migration_job(execute=True)  # reports the free space to CST as Unassigned
+        free_tx, free_status = next((tx, status) for op, cidr, tx, status in self.calls if op == "SEND" and cidr == "87.101.190.64/27")
+        self.assertEqual(free_status, 1)
+        self.assertNotEqual(free_tx, old_tx)
+        self.calls.clear()
+        self.individual_assignment("87.101.190.64/27", 32, "New Customer")
+        self.assertEqual([(op, cidr, tx) for op, cidr, tx, _status in self.calls], [("UPDATE", "87.101.190.64/27", free_tx)])
+        self.assertEqual(find_value(self.last_payload(free_tx, "UPDATE"), "organizationName"), "New Customer")
+
+    def test_unchanged_subnet_is_not_updated_again(self):
+        self.individual_assignment(CONTAINER, 16, "New Customer")
+        self.calls.clear()
+        result = self.migration_job()
+        with app.connect() as connection:
+            jobs = connection.execute("SELECT operation FROM cst_sync_jobs WHERE batch_id = ? AND cidr = ?", (result.batch_id, CONTAINER)).fetchall()
+        self.assertEqual(jobs, [])
+
     # --- controlled sync (auto-execute off) ----------------------------------------------------
     def test_controlled_sync_individual_assignment_waits_for_migration_job(self):
         self.controlled_sync()
