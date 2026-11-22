@@ -502,6 +502,14 @@ class CstPartialReassignmentTest(unittest.TestCase):
         app.unassign(assignment.id)  # the live record of the same assignment is not duplicated
         self.assertEqual(len([row for row in self.deleted() if row.assignment_id == assignment.id]), 1)
 
+    def test_old_snapshot_missing_newer_fields_is_still_reported(self):
+        old_snapshot = {"id": "legacy-assignment-1", "cidr": "87.101.190.8/29", "customer_name": "Legacy Customer", "status": "Active", "service_id": None}
+        with app.connect() as connection:
+            app.record_audit(connection, "Subnet Release", "assignment", "legacy-assignment-1", json.dumps(old_snapshot), "Released to free pool")
+            self.assertEqual(app.backfill_deleted_assignments(connection), 1)
+        row = next(row for row in self.deleted() if row.assignment_id == "legacy-assignment-1")
+        self.assertEqual((row.cidr, row.size, row.start_ip, row.customer_name), ("87.101.190.8/29", 8, "87.101.190.8", "Legacy Customer"))
+
     def test_deleted_assignments_report_filters(self):
         self.load_assignment("87.101.190.0/30", 4, "Alpha Customer")
         self.load_assignment("87.101.190.4/30", 4, "Beta Customer")

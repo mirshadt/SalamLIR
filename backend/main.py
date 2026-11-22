@@ -5363,6 +5363,45 @@ def record_deleted_assignment(
     )
 
 
+def deleted_assignment_snapshot(old_value: str, entity_id: str, timestamp: str) -> Assignment | None:
+    """The assignment saved in an audit entry, tolerating snapshots from older versions.
+
+    Fields the snapshot lacks (e.g. added later) are filled from its CIDR or left blank, so old
+    deletions are not skipped. Only an entry without a usable CIDR is ignored.
+    """
+    try:
+        snapshot = json.loads(old_value)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(snapshot, dict) or not snapshot.get("cidr"):
+        return None
+    try:
+        network = normalize_network(str(snapshot["cidr"]))
+    except HTTPException:
+        return None
+    hosts = list(network.hosts()) if network.num_addresses > 2 else [network.network_address, network.broadcast_address]
+    defaults: dict[str, object] = {
+        "id": entity_id or stable_uuid("deleted-assignment-snapshot", str(network), timestamp),
+        "cidr": str(network),
+        "prefix": network.prefixlen,
+        "size": network.num_addresses,
+        "start": str(network.network_address),
+        "end": str(network.broadcast_address),
+        "first_usable": str(hosts[0]),
+        "last_usable": str(hosts[-1]),
+        "created_at": timestamp,
+    }
+    for name, field in Assignment.model_fields.items():
+        if field.is_required() and name not in defaults:
+            defaults[name] = ""
+    cleaned = {key: value for key, value in snapshot.items() if value is not None and key in Assignment.model_fields}
+    merged = {**defaults, **cleaned}
+    try:
+        return Assignment(**merged)
+    except Exception:
+        return Assignment.model_construct(**merged)
+
+
 def backfill_deleted_assignments(connection: sqlite3.Connection) -> int:
     """Rebuild deletions that happened before the table existed, from the audit trail."""
     placeholders = ", ".join("?" for _ in DELETED_ASSIGNMENT_AUDIT_EVENTS)
@@ -5380,10 +5419,8 @@ def backfill_deleted_assignments(connection: sqlite3.Connection) -> int:
                 continue
         if action in {"Subnet Release", "CST Assignment Status Update", "Retired Resource Deletion"} and str(row["entity_type"]) != "assignment":
             continue
-        try:
-            snapshot = json.loads(str(row["old_value"] or ""))
-            assignment = Assignment(**snapshot)
-        except (TypeError, ValueError, Exception):
+        assignment = deleted_assignment_snapshot(str(row["old_value"] or ""), str(row["entity_id"] or ""), str(row["timestamp"] or ""))
+        if assignment is None:
             continue
         new_value = str(row["new_value"] or "")
         before = connection.total_changes
