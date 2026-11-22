@@ -1153,6 +1153,35 @@ export async function getCstJobs() {
   return data;
 }
 
+export type DeletedAssignmentRecord = {
+  id: string;
+  assignment_id: string;
+  cidr: string;
+  size: number;
+  start_ip: string;
+  end_ip: string;
+  customer_name: string;
+  customer_id: string;
+  organization_id: string;
+  service_id: string;
+  assignment_type: string;
+  assignment_status: string;
+  assignment_date: string;
+  event_type: string;
+  source: string;
+  reason: string;
+  cst_action: string;
+  cst_transaction_id: string;
+  deleted_at: string;
+  deleted_by: string;
+  assignment_json: string;
+};
+
+export async function getDeletedAssignmentsReport() {
+  const { data } = await api.get<DeletedAssignmentRecord[]>("/reports/deleted-assignments", { timeout: 5 * 60 * 1000 });
+  return data;
+}
+
 export async function getCstBatchJobs(batchId: string, status = "all") {
   const { data } = await api.get<CstSyncJob[]>(`/cst/batches/${batchId}/jobs`, { params: { status } });
   return data;

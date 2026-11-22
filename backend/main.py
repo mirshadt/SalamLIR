@@ -5240,6 +5240,164 @@ def init_db() -> None:
             sync_normalized_inventory(connection)
         sync_allocated_pool_resources(connection)
         refresh_ip_resource_pool_owners(connection)
+        connection.executescript(DELETED_ASSIGNMENTS_SCHEMA)
+        backfill_deleted_assignments(connection)
+
+
+class DeletedAssignmentRecord(BaseModel):
+    id: str
+    assignment_id: str
+    cidr: str
+    size: int = 0
+    start_ip: str = ""
+    end_ip: str = ""
+    customer_name: str = ""
+    customer_id: str = ""
+    organization_id: str = ""
+    service_id: str = ""
+    assignment_type: str = ""
+    assignment_status: str = ""
+    assignment_date: str = ""
+    event_type: str
+    source: str = ""
+    reason: str = ""
+    cst_action: str = ""
+    cst_transaction_id: str = ""
+    deleted_at: str
+    deleted_by: str = "ipam-admin"
+    assignment_json: str = ""
+
+
+DELETED_ASSIGNMENTS_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS deleted_assignments (
+      id TEXT PRIMARY KEY,
+      assignment_id TEXT NOT NULL,
+      cidr TEXT NOT NULL,
+      size INTEGER NOT NULL DEFAULT 0,
+      start_ip TEXT NOT NULL DEFAULT '',
+      end_ip TEXT NOT NULL DEFAULT '',
+      customer_name TEXT NOT NULL DEFAULT '',
+      customer_id TEXT NOT NULL DEFAULT '',
+      organization_id TEXT NOT NULL DEFAULT '',
+      service_id TEXT NOT NULL DEFAULT '',
+      assignment_type TEXT NOT NULL DEFAULT '',
+      assignment_status TEXT NOT NULL DEFAULT '',
+      assignment_date TEXT NOT NULL DEFAULT '',
+      event_type TEXT NOT NULL,
+      source TEXT NOT NULL DEFAULT '',
+      reason TEXT NOT NULL DEFAULT '',
+      cst_action TEXT NOT NULL DEFAULT '',
+      cst_transaction_id TEXT NOT NULL DEFAULT '',
+      deleted_at TEXT NOT NULL,
+      deleted_by TEXT NOT NULL DEFAULT 'ipam-admin',
+      assignment_json TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS idx_deleted_assignments_deleted_at ON deleted_assignments (deleted_at);
+    CREATE INDEX IF NOT EXISTS idx_deleted_assignments_cidr ON deleted_assignments (cidr);
+"""
+
+# Audit actions whose old_value holds the assignment as it was when it was deleted.
+DELETED_ASSIGNMENT_AUDIT_EVENTS = {
+    "Subnet Release": "Released",
+    "CST Assignment Status Update": "Released",
+    "Retired Resource Deletion": "Released (retired)",
+    "Reservation Auto Release": "Reservation expired",
+    "RIPE Assignment Removal": "Removed from RIPE",
+    "Partial LIR Reassignment Completed": "Replaced by partial reassignment",
+    "Bulk Assignment Conflict Auto-Removed Duplicate": "Duplicate removed",
+}
+
+
+def deleted_assignment_from_row(row: sqlite3.Row) -> DeletedAssignmentRecord:
+    return DeletedAssignmentRecord(**{key: row[key] for key in row.keys()})
+
+
+def record_deleted_assignment(
+    connection: sqlite3.Connection,
+    assignment: Assignment,
+    event_type: str,
+    *,
+    source: str = "",
+    reason: str = "",
+    cst_action: str = "",
+    cst_transaction_id: str = "",
+    deleted_at: str = "",
+    deleted_by: str = "ipam-admin",
+) -> None:
+    """Keep a permanent record of an assignment that is being deleted (Deleted Assignments Report).
+
+    One row per assignment: the id derives from the assignment id, so the historical backfill from
+    the audit trail never duplicates a live record.
+    """
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO deleted_assignments (
+          id, assignment_id, cidr, size, start_ip, end_ip, customer_name, customer_id, organization_id,
+          service_id, assignment_type, assignment_status, assignment_date, event_type, source, reason,
+          cst_action, cst_transaction_id, deleted_at, deleted_by, assignment_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            stable_uuid("deleted-assignment", assignment.id),
+            assignment.id,
+            assignment.cidr,
+            int(assignment.size or 0),
+            assignment.start,
+            assignment.end,
+            assignment.customer_name or assignment.organization_name or assignment.internal_application_name or "",
+            assignment.customer_id or "",
+            assignment.organization_id or "",
+            assignment.service_id or assignment.service_instance_id or "",
+            "Internal" if "internal" in str(assignment.assignment_target_type or "").lower() else "Business",
+            assignment.status or "",
+            assignment.assignment_date or "",
+            event_type,
+            source,
+            reason,
+            cst_action,
+            cst_transaction_id,
+            deleted_at or now_iso(),
+            deleted_by or "ipam-admin",
+            assignment.model_dump_json(),
+        ),
+    )
+
+
+def backfill_deleted_assignments(connection: sqlite3.Connection) -> int:
+    """Rebuild deletions that happened before the table existed, from the audit trail."""
+    placeholders = ", ".join("?" for _ in DELETED_ASSIGNMENT_AUDIT_EVENTS)
+    added = 0
+    for row in connection.execute(
+        f"SELECT * FROM audit_events WHERE action IN ({placeholders}) ORDER BY timestamp",
+        list(DELETED_ASSIGNMENT_AUDIT_EVENTS),
+    ).fetchall():
+        action = str(row["action"])
+        if action == "RIPE Assignment Removal":
+            try:
+                if json.loads(str(row["new_value"] or "{}")).get("status") != "SUCCESS":
+                    continue  # removal failed: the assignment was kept
+            except (TypeError, ValueError):
+                continue
+        if action in {"Subnet Release", "CST Assignment Status Update", "Retired Resource Deletion"} and str(row["entity_type"]) != "assignment":
+            continue
+        try:
+            snapshot = json.loads(str(row["old_value"] or ""))
+            assignment = Assignment(**snapshot)
+        except (TypeError, ValueError, Exception):
+            continue
+        new_value = str(row["new_value"] or "")
+        before = connection.total_changes
+        record_deleted_assignment(
+            connection,
+            assignment,
+            DELETED_ASSIGNMENT_AUDIT_EVENTS[action],
+            source="Audit trail (before report existed)",
+            reason="" if new_value.startswith("{") else new_value[:500],
+            deleted_at=str(row["timestamp"]),
+            deleted_by=str(row["user"] or "ipam-admin"),
+        )
+        added += connection.total_changes - before
+    return added
 
 
 def list_pools_from_db() -> list[Pool]:
@@ -5273,6 +5431,7 @@ def release_expired_reservations(connection: sqlite3.Connection) -> int:
         if not reserved_until or reserved_until > now:
             continue
         resource = find_resource_by_source(connection, "assignment", assignment.id)
+        record_deleted_assignment(connection, assignment, "Reservation expired", source="Reservation expiry", reason=f"Reservation expired ({assignment.notes or 'no notes'})"[:500])
         connection.execute("DELETE FROM assignments WHERE id = ?", (assignment.id,))
         if resource:
             connection.execute("DELETE FROM assignment_details WHERE resource_uuid = ?", (resource.resource_uuid,))
@@ -6866,6 +7025,7 @@ def push_assignment_to_ripe(assignment_id: str) -> RipePushResponse:
         before = find_assignment(assignment_id)
         if success and removing:
             resource = find_resource_by_source(connection, "assignment", assignment_id)
+            record_deleted_assignment(connection, before, "Removed from RIPE", source="RIPE push", reason=str(message or "")[:500], cst_transaction_id=resource.transaction_id if resource else "")
             connection.execute("DELETE FROM assignments WHERE id = ?", (assignment_id,))
             if resource:
                 connection.execute("DELETE FROM assignment_details WHERE resource_uuid = ?", (resource.resource_uuid,))
@@ -9683,6 +9843,11 @@ def complete_partial_reassignment_locally(
             (resource.resource_uuid, now_iso(), operation_id),
         )
     unassigned_resources = upsert_partial_unassigned_fragments_from_jobs(connection, operation_id, original_resource)
+    record_deleted_assignment(
+        connection, original_assignment, "Replaced by partial reassignment", source="Partial reassignment",
+        reason=f"Original {original_assignment.cidr} replaced", cst_action="DeleteLIR original, SendLIR portions",
+        cst_transaction_id=original_resource.transaction_id if original_resource else "",
+    )
     connection.execute("DELETE FROM assignments WHERE id = ?", (original_assignment.id,))
     connection.execute("DELETE FROM assignment_details WHERE resource_uuid = ?", (original_resource.resource_uuid,))
     connection.execute("DELETE FROM ip_resources WHERE resource_uuid = ?", (original_resource.resource_uuid,))
@@ -9776,6 +9941,11 @@ def finalize_partial_reassignment(connection: sqlite3.Connection, operation_id: 
     if original_resource:
         replaced_unassigned_resources = partial_cst_unassigned_delete_resources(connection, original_resource, original_network, requested_network)
         unassigned_resources = upsert_successful_partial_unassigned_fragments(connection, operation_id, original_resource)
+    record_deleted_assignment(
+        connection, original_assignment, "Replaced by partial reassignment", source="Partial reassignment",
+        reason=f"Original {original_assignment.cidr} replaced", cst_action="DeleteLIR original, SendLIR portions",
+        cst_transaction_id=original_resource.transaction_id if original_resource else "",
+    )
     connection.execute("DELETE FROM assignments WHERE id = ?", (original_assignment.id,))
     if original_resource:
         connection.execute("DELETE FROM assignment_details WHERE resource_uuid = ?", (original_resource.resource_uuid,))
@@ -10343,7 +10513,7 @@ def cst_release_failure_detail(jobs: list[CstSyncJob]) -> str:
     return (failed.last_error or f"CST job remained {failed.status}") if failed else ""
 
 
-def unassign_assignment_record(connection: sqlite3.Connection, assignment: Assignment, materialize: bool = True) -> bool:
+def unassign_assignment_record(connection: sqlite3.Connection, assignment: Assignment, materialize: bool = True, *, source: str = "Assignment Management", reason: str = "") -> bool:
     """Release one assignment following the CST LIR rules. Returns True when CST was updated.
 
     For a record held in CST:
@@ -10397,6 +10567,20 @@ def unassign_assignment_record(connection: sqlite3.Connection, assignment: Assig
             f"CST UpdateLIR to Unassigned, then DeleteLIR; Transaction ID {transaction_id} retired; subnet removed locally"
         )
 
+    controlled_pending = "waits for a migration job" in audit_new_value
+    record_deleted_assignment(
+        connection,
+        assignment,
+        "Released (retired)" if retired else "Released",
+        source=source,
+        reason=reason,
+        cst_action=(
+            "UpdateLIR to Unassigned + DeleteLIR" if in_cst
+            else "Pending: Assignment release in Create Migration Job" if controlled_pending
+            else "Not held in CST"
+        ),
+        cst_transaction_id=resource.transaction_id if resource and (in_cst or controlled_pending) else "",
+    )
     result = connection.execute("DELETE FROM assignments WHERE id = ?", (assignment_id,))
     if result.rowcount == 0:
         raise HTTPException(status_code=404, detail="Assignment not found")
@@ -10474,11 +10658,11 @@ def process_assignment_release_bulk(csv_text: object, dry_run: bool = False) -> 
                     status = "WOULD_RELEASE"
                     message = ("Would send " + cst_steps if cst_required else "Not held in CST; no CST call") + " and remove the subnet locally"
                 elif cst_required and cst_controlled_sync(connection):
-                    unassign_assignment_record(connection, assignment, materialize=False)
+                    unassign_assignment_record(connection, assignment, materialize=False, source="Bulk Release", reason=csv_value(row, "reason", "notes"))
                     status = "RELEASED"
                     message = f"Released locally; CST UpdateLIR to Unassigned and DeleteLIR (Transaction ID {transaction_id}) wait in Create Migration Job as an Assignment release row"
                 else:
-                    unassign_assignment_record(connection, assignment, materialize=False)
+                    unassign_assignment_record(connection, assignment, materialize=False, source="Bulk Release", reason=csv_value(row, "reason", "notes"))
                     status = "RELEASED"
                     message = (cst_steps if cst_required else "Not held in CST; no CST call") + "; subnet removed locally"
                     reason = csv_value(row, "reason", "notes")
@@ -10536,6 +10720,29 @@ def bulk_release_assignments(payload: BulkCsvRequest, background_tasks: Backgrou
     batch = create_bulk_batch(operation_type, payload)
     background_tasks.add_task(run_bulk_batch, batch.id, batch.operation_type, payload.csv_text)
     return batch
+
+
+@app.get("/reports/deleted-assignments", response_model=list[DeletedAssignmentRecord])
+def deleted_assignments_report(date_from: str = "", date_to: str = "", search: str = "") -> list[DeletedAssignmentRecord]:
+    """Every deleted assignment (released, expired, removed, replaced, duplicate), newest first."""
+    filters = ["1 = 1"]
+    params: list[object] = []
+    if date_from:
+        filters.append("substr(deleted_at, 1, 10) >= ?")
+        params.append(date_from)
+    if date_to:
+        filters.append("substr(deleted_at, 1, 10) <= ?")
+        params.append(date_to)
+    if search.strip():
+        needle = f"%{search.strip().lower()}%"
+        filters.append("(lower(cidr) LIKE ? OR lower(customer_name) LIKE ? OR lower(service_id) LIKE ? OR lower(customer_id) LIKE ? OR lower(reason) LIKE ? OR lower(cst_transaction_id) LIKE ?)")
+        params.extend([needle] * 6)
+    with connect() as connection:
+        rows = connection.execute(
+            f"SELECT * FROM deleted_assignments WHERE {' AND '.join(filters)} ORDER BY deleted_at DESC, cidr",
+            params,
+        ).fetchall()
+    return [deleted_assignment_from_row(row) for row in rows]
 
 
 @app.get("/audit", response_model=list[AuditEvent])
@@ -10786,6 +10993,7 @@ def auto_resolve_exact_duplicate_conflicts() -> ConflictAutoResolveResult:
                 if resource:
                     connection.execute("DELETE FROM assignment_details WHERE resource_uuid = ?", (resource.resource_uuid,))
                     connection.execute("DELETE FROM ip_resources WHERE resource_uuid = ?", (resource.resource_uuid,))
+                record_deleted_assignment(connection, duplicate, "Duplicate removed", source="Integrity auto-resolve", reason="Exact duplicate of another assignment for the same customer")
                 connection.execute("DELETE FROM assignments WHERE id = ?", (duplicate.id,))
                 record_audit(
                     connection,

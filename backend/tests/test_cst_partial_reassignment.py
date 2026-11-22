@@ -462,5 +462,53 @@ class CstPartialReassignmentTest(unittest.TestCase):
         app.process_assignment_release_bulk("cidr\n87.101.190.64/27")
         self.assertEqual([op for op, cidr, *_ in self.calls if cidr == "87.101.190.64/27"], ["UPDATE", "DELETE"])
 
+    # --- Deleted Assignments Report -----------------------------------------------------------
+    def deleted(self, **filters):
+        return app.deleted_assignments_report(**filters)
+
+    def test_deleted_assignments_report_records_every_release_flavour(self):
+        in_cst = self.individual_assignment("87.101.190.64/27", 32, "CST Customer")
+        tx = next(tx for op, cidr, tx, _status in self.calls if op == "SEND" and cidr == "87.101.190.64/27")
+        app.unassign(in_cst.id)
+        self.load_assignment("87.101.190.0/30", 4, "Bulk Customer")
+        app.process_assignment_release_bulk("cidr,reason\n87.101.190.0/30,Contract ended")
+        rows = {row.cidr: row for row in self.deleted()}
+        cst_row = rows["87.101.190.64/27"]
+        self.assertEqual((cst_row.event_type, cst_row.source, cst_row.cst_action, cst_row.cst_transaction_id), ("Released", "Assignment Management", "UpdateLIR to Unassigned + DeleteLIR", tx))
+        self.assertEqual(cst_row.customer_name, "CST Customer")
+        bulk_row = rows["87.101.190.0/30"]
+        self.assertEqual((bulk_row.source, bulk_row.reason, bulk_row.cst_action), ("Bulk Release", "Contract ended", "Not held in CST"))
+        self.assertEqual(json.loads(bulk_row.assignment_json)["cidr"], "87.101.190.0/30", "full snapshot kept")
+
+    def test_deleted_assignments_report_controlled_sync_release(self):
+        assignment = self.individual_assignment("87.101.190.64/27", 32, "Leaving Customer")
+        self.controlled_sync()
+        app.unassign(assignment.id)
+        row = next(row for row in self.deleted() if row.assignment_id == assignment.id)
+        self.assertEqual(row.cst_action, "Pending: Assignment release in Create Migration Job")
+        self.assertTrue(row.cst_transaction_id)
+
+    def test_deleted_assignments_backfilled_from_audit_trail_once(self):
+        self.load_assignment("87.101.190.0/30", 4, "Old Customer")
+        with app.connect() as connection:
+            assignment = app.assignment_from_row(connection.execute("SELECT * FROM assignments WHERE cidr = '87.101.190.0/30'").fetchone())
+            # a deletion from before the report existed: only the audit event is left
+            app.record_audit(connection, "Subnet Release", "assignment", assignment.id, assignment.model_dump_json(), "Released to free pool")
+            connection.execute("DELETE FROM deleted_assignments")
+            self.assertEqual(app.backfill_deleted_assignments(connection), 1)
+            self.assertEqual(app.backfill_deleted_assignments(connection), 0, "idempotent")
+        rows = self.deleted()
+        self.assertEqual([(row.cidr, row.event_type, row.source) for row in rows], [("87.101.190.0/30", "Released", "Audit trail (before report existed)")])
+        app.unassign(assignment.id)  # the live record of the same assignment is not duplicated
+        self.assertEqual(len([row for row in self.deleted() if row.assignment_id == assignment.id]), 1)
+
+    def test_deleted_assignments_report_filters(self):
+        self.load_assignment("87.101.190.0/30", 4, "Alpha Customer")
+        self.load_assignment("87.101.190.4/30", 4, "Beta Customer")
+        app.process_assignment_release_bulk("cidr,reason\n87.101.190.0/30,moved\n87.101.190.4/30,closed")
+        self.assertEqual([row.cidr for row in self.deleted(search="beta")], ["87.101.190.4/30"])
+        self.assertEqual(len(self.deleted(date_from=app.now_iso()[:10])), 2)
+        self.assertEqual(self.deleted(date_to="2000-01-01"), [])
+
 if __name__ == "__main__":
     unittest.main()

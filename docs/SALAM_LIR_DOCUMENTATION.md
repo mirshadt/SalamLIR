@@ -168,6 +168,17 @@ Upload the filled sheet directly on that card: it is converted to the CST import
 
 Mapping: `Order Number` becomes `serviceId`; `Status` "Reserved" is loaded as assignmentStatusId 3 (Business); `CustomerType` GOV maps to customerTypeId 1, otherwise 2. CST requires a valid 10-digit `CR Number` or `Unified Number`; without one the row imports but is not ready for CST sync. Missing contact fields fall back to placeholders (`Business Contact`, `0000000000`, `NA@NA.com`).
 
+### 8.2.2 Deleted Assignments Report
+
+**Reporting > Deleted Assignments Report** lists every assignment that was deleted, from the `deleted_assignments` audit table (API: `GET /reports/deleted-assignments?date_from=&date_to=&search=`). One row per assignment:
+
+- Event: Released, Released (retired), Reservation expired, Removed from RIPE, Replaced by partial reassignment, Duplicate removed.
+- Source: Assignment Management, Bulk Release, Reservation expiry, RIPE push, Partial reassignment, Integrity auto-resolve, or "Audit trail (before report existed)".
+- Reason (e.g. the Bulk Release `reason` column), CST action (UpdateLIR to Unassigned + DeleteLIR / pending in Create Migration Job / not held in CST) and the CST Transaction ID.
+- The full assignment as it was before deletion (click a row).
+
+Deletions from before the table existed are rebuilt from the audit trail at startup; each assignment appears once. Filter by date and per column; export CSV or XLSX.
+
 ### 8.3 Administration
 
 Administration contains:

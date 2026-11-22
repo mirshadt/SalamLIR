@@ -69,6 +69,8 @@ import {
   autoResolveExactDuplicateConflicts,
   getCstBatches,
   getCstBatchJobs,
+  getDeletedAssignmentsReport,
+  type DeletedAssignmentRecord,
   getCstConfig,
   getCstJobs,
   getCstSchedulerRuns,
@@ -4731,7 +4733,21 @@ function Reporting({
   onRunRipeReport: () => void;
   onClearRipeReport: () => void;
 }) {
-  const [activeReport, setActiveReport] = useState<"pool-summary" | "local-allocated-pool-utilization" | "active-assignments" | "cst-lir" | "resource-utilization" | "ripe-allocation" | null>(null);
+  const [activeReport, setActiveReport] = useState<"pool-summary" | "local-allocated-pool-utilization" | "active-assignments" | "cst-lir" | "resource-utilization" | "ripe-allocation" | "deleted-assignments" | null>(null);
+  const [deletedFilters, setDeletedFilters] = useState<Record<string, string>>({});
+  const [deletedDateFrom, setDeletedDateFrom] = useState("");
+  const [deletedDateTo, setDeletedDateTo] = useState("");
+  const [openDeletedId, setOpenDeletedId] = useState("");
+  const deletedAssignmentsQuery = useQuery({ queryKey: ["deleted-assignments-report"], queryFn: getDeletedAssignmentsReport, staleTime: 30000 });
+  const deletedRows = deletedAssignmentsQuery.data ?? [];
+  const filteredDeletedRows = deletedRows.filter((row) => (
+    (!deletedDateFrom || row.deleted_at.slice(0, 10) >= deletedDateFrom)
+    && (!deletedDateTo || row.deleted_at.slice(0, 10) <= deletedDateTo)
+    && DELETED_ASSIGNMENT_COLUMNS.every((column) => {
+      const needle = (deletedFilters[column.key] ?? "").trim().toLowerCase();
+      return !needle || String(row[column.key] ?? "").toLowerCase().includes(needle);
+    })
+  ));
   const [poolSummaryFilters, setPoolSummaryFilters] = useState<Record<string, string>>({});
   const [activeAssignmentFilters, setActiveAssignmentFilters] = useState<Record<string, string>>({});
   const [allIpFilters, setAllIpFilters] = useState<Record<string, string>>({});
@@ -4818,6 +4834,7 @@ function Reporting({
     { id: "resource-utilization", activeId: "resource-utilization" as const, name: "All IPs Report", scope: `${filteredAllIpRows.length} of ${utilizationRows.length} assigned and unassigned IP rows`, status: "Available" },
     { id: "cst-lir", activeId: "cst-lir" as const, name: "CST/LIR Registry Report", scope: `${registryRows.length} CIDRs`, status: "Available" },
     { id: "ripe-assignment", activeId: "ripe-allocation" as const, name: "RIPE Assignment Report", scope: "Maintainer ITC-NOC-MNT inetnum assignments", status: "Available" },
+    { id: "deleted-assignments", activeId: "deleted-assignments" as const, name: "Deleted Assignments Report", scope: deletedAssignmentsQuery.isLoading ? "Loading..." : `${deletedRows.length} deleted assignments (released, expired, removed, replaced, duplicates)`, status: "Available" },
     { id: "reservations", name: "Reservation Report", scope: `${resources.filter((item) => item.administrativeStatus === "RESERVED").length} reservations`, status: "Planned" },
     { id: "fragmentation", name: "Fragmentation Report", scope: `${resources.filter((item) => item.administrativeStatus === "AVAILABLE").length} available subnets`, status: "Planned" },
     { id: "integrity", name: "Integrity Violation Report", scope: `${conflicts.length} issues`, status: "Planned" },
@@ -5090,6 +5107,101 @@ function Reporting({
           </p>
         </CardContent>
       </Card>
+      ) : null}
+      {activeReport === "deleted-assignments" ? (
+        <Card>
+          <CardHeader>
+            <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+              <div>
+                <CardTitle>Deleted Assignments Report</CardTitle>
+                <CardDescription>Audit of every assignment that was deleted: released (single or bulk), reservation expired, removed from RIPE, replaced by a partial reassignment, or removed as a duplicate. Click a row for the full record as it was before deletion.</CardDescription>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Button variant="outline" onClick={() => setActiveReport(null)}>Back to Reports</Button>
+                <Button variant="outline" onClick={() => void deletedAssignmentsQuery.refetch()} disabled={deletedAssignmentsQuery.isFetching}>
+                  {deletedAssignmentsQuery.isFetching ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCcw className="h-4 w-4" />}
+                  Refresh
+                </Button>
+                <Button variant="outline" onClick={() => downloadBlob(`deleted-assignments-${today()}.csv`, "text/csv;charset=utf-8", buildSimpleCsv(DELETED_ASSIGNMENT_COLUMNS.map((column) => column.header), filteredDeletedRows.map((row) => DELETED_ASSIGNMENT_COLUMNS.map((column) => row[column.key] ?? ""))))} disabled={!filteredDeletedRows.length}>
+                  <FileDown className="h-4 w-4" />
+                  Export CSV
+                </Button>
+                <Button onClick={() => downloadBlob(`deleted-assignments-${today()}.xlsx`, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", buildXlsx("Deleted Assignments", DELETED_ASSIGNMENT_COLUMNS.map((column) => column.header), filteredDeletedRows.map((row) => DELETED_ASSIGNMENT_COLUMNS.map((column) => row[column.key] ?? ""))))} disabled={!filteredDeletedRows.length}>
+                  <FileDown className="h-4 w-4" />
+                  Export XLSX
+                </Button>
+                <Button variant="ghost" onClick={() => { setDeletedFilters({}); setDeletedDateFrom(""); setDeletedDateTo(""); }} disabled={!Object.values(deletedFilters).some(Boolean) && !deletedDateFrom && !deletedDateTo}>
+                  Clear Search
+                </Button>
+              </div>
+            </div>
+          </CardHeader>
+          <CardContent className="grid gap-3">
+            <div className="flex flex-wrap items-end gap-3">
+              <label className="grid gap-1">
+                <span className="text-xs font-semibold text-muted-foreground">Deleted from</span>
+                <Input type="date" value={deletedDateFrom} onChange={(event) => setDeletedDateFrom(event.target.value)} />
+              </label>
+              <label className="grid gap-1">
+                <span className="text-xs font-semibold text-muted-foreground">Deleted to</span>
+                <Input type="date" value={deletedDateTo} onChange={(event) => setDeletedDateTo(event.target.value)} />
+              </label>
+              <p className="pb-2 text-sm text-muted-foreground">{filteredDeletedRows.length} of {deletedRows.length} deleted assignments</p>
+            </div>
+            <div className="max-h-[620px] overflow-auto rounded-md border">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    {DELETED_ASSIGNMENT_COLUMNS.map((column) => <TableHead key={column.key}>{column.header}</TableHead>)}
+                  </TableRow>
+                  <TableRow>
+                    {DELETED_ASSIGNMENT_COLUMNS.map((column) => (
+                      <TableHead key={column.key}>
+                        <Input
+                          className="h-8 min-w-[120px] bg-background text-xs"
+                          value={deletedFilters[column.key] ?? ""}
+                          onChange={(event) => setDeletedFilters((current) => ({ ...current, [column.key]: event.target.value }))}
+                          placeholder={`Search ${column.header}`}
+                        />
+                      </TableHead>
+                    ))}
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {deletedAssignmentsQuery.isLoading ? (
+                    <TableRow><TableCell colSpan={DELETED_ASSIGNMENT_COLUMNS.length} className="py-6 text-center text-muted-foreground">Loading deleted assignments...</TableCell></TableRow>
+                  ) : filteredDeletedRows.length ? filteredDeletedRows.map((row) => (
+                    <Fragment key={row.id}>
+                      <TableRow className="cursor-pointer hover:bg-muted/40" onClick={() => setOpenDeletedId((current) => current === row.id ? "" : row.id)}>
+                        {DELETED_ASSIGNMENT_COLUMNS.map((column) => (
+                          <TableCell key={column.key} className={column.key === "cidr" ? "font-semibold" : column.key === "cst_transaction_id" || column.key === "reason" ? "max-w-[220px] truncate text-xs" : "text-sm"} title={String(row[column.key] ?? "")}>
+                            {column.key === "deleted_at" ? row.deleted_at.slice(0, 19).replace("T", " ") : String(row[column.key] ?? "") || "-"}
+                          </TableCell>
+                        ))}
+                      </TableRow>
+                      {openDeletedId === row.id ? (
+                        <TableRow>
+                          <TableCell colSpan={DELETED_ASSIGNMENT_COLUMNS.length} className="bg-muted/20">
+                            <p className="mb-2 text-xs font-semibold text-muted-foreground">Assignment {row.assignment_id} as it was before deletion</p>
+                            <div className="grid gap-x-6 gap-y-1 text-xs md:grid-cols-3">
+                              {Object.entries((() => { try { return JSON.parse(row.assignment_json || "{}") as Record<string, unknown>; } catch { return {}; } })())
+                                .filter(([, value]) => value !== "" && value !== null && value !== undefined && typeof value !== "object")
+                                .map(([key, value]) => (
+                                  <p key={key} className="truncate" title={`${key}: ${String(value)}`}><span className="text-muted-foreground">{key}:</span> {String(value)}</p>
+                                ))}
+                            </div>
+                          </TableCell>
+                        </TableRow>
+                      ) : null}
+                    </Fragment>
+                  )) : (
+                    <TableRow><TableCell colSpan={DELETED_ASSIGNMENT_COLUMNS.length} className="py-6 text-center text-muted-foreground">No deleted assignments match the filters.</TableCell></TableRow>
+                  )}
+                </TableBody>
+              </Table>
+            </div>
+          </CardContent>
+        </Card>
       ) : null}
       {activeReport === "active-assignments" ? (
         <Card>
@@ -7629,6 +7741,23 @@ const LOCAL_ALLOCATED_POOL_UTILIZATION_COLUMNS: Array<{ key: string; header: str
   { key: "transaction_id", header: "Transaction ID" },
   { key: "last_updated", header: "Last Updated" }
 ];
+const DELETED_ASSIGNMENT_COLUMNS: Array<{ key: keyof DeletedAssignmentRecord; header: string }> = [
+  { key: "deleted_at", header: "Deleted At" },
+  { key: "cidr", header: "CIDR" },
+  { key: "size", header: "Total IPs" },
+  { key: "customer_name", header: "Customer" },
+  { key: "customer_id", header: "Customer ID" },
+  { key: "service_id", header: "Service ID" },
+  { key: "assignment_type", header: "Type" },
+  { key: "assignment_date", header: "Assignment Date" },
+  { key: "event_type", header: "Event" },
+  { key: "source", header: "Source" },
+  { key: "reason", header: "Reason" },
+  { key: "cst_action", header: "CST Action" },
+  { key: "cst_transaction_id", header: "CST Transaction ID" },
+  { key: "deleted_by", header: "Deleted By" }
+];
+
 const ACTIVE_ASSIGNMENT_COLUMNS: Array<{ key: string; header: string }> = [
   { key: "cidr", header: "CIDR" },
   { key: "start_ip", header: "Start IP" },
