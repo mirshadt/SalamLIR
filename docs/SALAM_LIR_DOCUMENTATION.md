@@ -168,6 +168,17 @@ Upload the filled sheet directly on that card: it is converted to the CST import
 
 Mapping: `Order Number` becomes `serviceId`; `Status` "Reserved" is loaded as assignmentStatusId 3 (Business); `CustomerType` GOV maps to customerTypeId 1, otherwise 2. CST requires a valid 10-digit `CR Number` or `Unified Number`; without one the row imports but is not ready for CST sync. Missing contact fields fall back to placeholders (`Business Contact`, `0000000000`, `NA@NA.com`).
 
+### 8.2.2 Deleted Assignments Report
+
+**Reporting > Deleted Assignments Report** lists every assignment that was deleted, from the `deleted_assignments` audit table (API: `GET /reports/deleted-assignments?date_from=&date_to=&search=`). One row per assignment:
+
+- Event: Released, Released (retired), Reservation expired, Removed from RIPE, Replaced by partial reassignment, Duplicate removed.
+- Source: Assignment Management, Bulk Release, Reservation expiry, RIPE push, Partial reassignment, Integrity auto-resolve, or "Audit trail (before report existed)".
+- Reason (e.g. the Bulk Release `reason` column), CST action (UpdateLIR to Unassigned + DeleteLIR / pending in Create Migration Job / not held in CST) and the CST Transaction ID.
+- The full assignment as it was before deletion (click a row).
+
+Deletions from before the table existed are rebuilt from the audit trail at startup; each assignment appears once. Filter by date and per column; export CSV or XLSX.
+
 ### 8.3 Administration
 
 Administration contains:
@@ -420,6 +431,10 @@ Every path that sends new subnets to CST applies the same rule, so the result do
 Example: original `172.20.40.0/23`, reassign `172.20.40.0/24`: UpdateLIR `/23` to Unassigned (if needed), DeleteLIR `/23`, SendLIR `172.20.40.0/24`, SendLIR `172.20.41.0/24`. The remaining portions are the saved local unassigned blocks, so they are not sent twice later.
 
 When one local subnet has exactly the CIDR of one record, an UpdateLIR is sent instead.
+
+**Same CIDR already in CST (UpdateLIR).** A subnet that CST holds with exactly the same CIDR is never sent again with SendLIR. When its content changed since the last successful SendLIR/UpdateLIR of that Transaction ID (assignment status, organization ID or name), an **UpdateLIR** on the existing Transaction ID is sent. Typical case: a block reported to CST as Unassigned (after a release, or by the unassigned migration) is assigned to a new customer with the same CIDR: UpdateLIR sets assignmentStatusId 3 and the new customer, keeping the Transaction ID. Assignment Management sends it immediately (auto-execute on); otherwise it appears as an UPDATE row in Create Migration Job. A sub-block of the record is a partial reassignment instead (DeleteLIR, SendLIR portions).
+
+A subnet whose CST record was deleted (Transaction ID retired) and that has not been sent again counts as unsent: history on retired Transaction IDs is ignored when deciding what still needs sending.
 
 A migration job is ONE batch. Plain SendLIRs come first; each partial reassignment follows as a chain (`depends_on_job_id`): every step waits only for the previous step of its own chain, so a failure holds back that partial reassignment alone. The review list marks affected subnets ("Partial reassignment: replaces CST record(s) ..."), and subnets whose earlier plain SendLIR failed with an overlap error are offered again. Pushing pending jobs runs the steps in order.
 
