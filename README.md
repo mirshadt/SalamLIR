@@ -165,7 +165,7 @@ Assignments and reservations:
 | `GET` | `/assignments` | List assignments and reservations |
 | `POST` | `/assignments` | Create assignment or reservation |
 | `POST` | `/assignments/bulk` | Bulk import assignments/reservations |
-| `POST` | `/assignments/bulk-release` | Bulk release: CST UpdateLIR to Unassigned then DeleteLIR (Transaction ID retired); supports `dry_run` preview |
+| `POST` | `/assignments/bulk-release` | Bulk release (termination): CST UpdateLIR to Unassigned only, record and Transaction ID kept; supports `dry_run` preview |
 | `PATCH` | `/assignments/{assignment_id}/status` | Update assignment status |
 | `DELETE` | `/assignments/{assignment_id}` | Release assignment/reservation |
 

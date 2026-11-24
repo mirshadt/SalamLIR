@@ -1845,7 +1845,7 @@ ${errorMessage(error)}`
                 onReleaseFileName={setBulkReleaseFileName}
                 onReleaseAssignments={(dryRun) => run(async () => {
                   const rows = bulkReleaseCsv.split(/\r?\n/).filter(Boolean).length - 1;
-                  if (!dryRun && !window.confirm(`Release ${rows} assignment(s)? Per CST LIR rules, records held in CST are set to Unassigned and then deleted with DeleteLIR; their Transaction IDs are retired permanently and cannot be reused. The subnets are removed locally and the space returns to the free pool. Run Preview first if you have not.`)) {
+                  if (!dryRun && !window.confirm(`Release ${rows} assignment(s)? Records held in CST are set to Unassigned with UpdateLIR and kept (same Transaction ID, no DeleteLIR). The subnets stay as unassigned blocks, ready for a new customer. Run Preview first if you have not.`)) {
                     return;
                   }
                   const { data } = await api.post<BulkBatch>("/assignments/bulk-release", { csv_text: bulkReleaseCsv, file_name: bulkReleaseFileName, dry_run: dryRun }, { timeout: 15 * 60 * 1000 });
@@ -4191,7 +4191,7 @@ function BulkOperations(props: {
         <Card>
           <CardHeader>
             <CardTitle>Bulk Release: Assignments</CardTitle>
-            <CardDescription>Release assignments per CST LIR rules: UpdateLIR to Unassigned, then DeleteLIR, which permanently retires the Transaction ID. The space returns to the free pool. For a reassignment, run this release first, then import the new assignment (it gets a new Transaction ID).</CardDescription>
+            <CardDescription>Terminate assignments: records held in CST get UpdateLIR to Unassigned and are kept with the same Transaction ID (no DeleteLIR). The subnet stays as an unassigned block. A new customer on the same CIDR is then an UpdateLIR of that record. For a reassignment, run this release first, then import the new assignment (same CIDR: UpdateLIR of the kept record and Transaction ID).</CardDescription>
           </CardHeader>
           <CardContent className="grid gap-3">
             <input
@@ -4207,7 +4207,7 @@ function BulkOperations(props: {
               <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
                 <div>
                   <p className="text-sm font-semibold">Release template</p>
-                  <p className="text-xs text-muted-foreground">cidr is required (or assignmentId when a CIDR has duplicates). customerName and serviceId are optional safety checks: the row is rejected if they do not match. Each row is independent. If UpdateLIR fails nothing changes; if DeleteLIR fails the record stays Unassigned in CST and the assignment stays Retiring, so release it again to retry.</p>
+                  <p className="text-xs text-muted-foreground">cidr is required (or assignmentId when a CIDR has duplicates). customerName and serviceId are optional safety checks: the row is rejected if they do not match. Each row is independent. If the UpdateLIR fails nothing changes for that row. With auto-execute off, the UpdateLIR waits in Create Migration Job as an UPDATE row.</p>
                 </div>
                 <div className="flex flex-wrap gap-2">
                   <Button size="sm" variant="outline" onClick={() => { props.onReleaseCsv(BULK_RELEASE_ASSIGNMENT_TEMPLATE); props.onReleaseFileName("bulk-release-assignment-template.csv"); }}>
@@ -6137,7 +6137,7 @@ function CstIntegrationMonitor(props: CstMonitorProps) {
                             {expandedPartials[row.key] ? <ChevronDown className="mt-0.5 h-4 w-4 shrink-0" /> : <ChevronRight className="mt-0.5 h-4 w-4 shrink-0" />}
                             <div>
                               <p className="font-semibold">{row.replaced.join(", ")}</p>
-                              <p className="text-xs text-muted-foreground">{row.created.length ? `into ${row.created.join(", ")}` : "UpdateLIR to Unassigned, DeleteLIR"}</p>
+                              <p className="text-xs text-muted-foreground">{row.created.length ? `into ${row.created.join(", ")}` : row.steps.map((step) => cstStepLabel(step)).join(", ")}</p>
                             </div>
                           </div>
                         </TableCell>
