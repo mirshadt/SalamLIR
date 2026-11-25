@@ -563,5 +563,65 @@ class CstPartialReassignmentTest(unittest.TestCase):
         self.assertEqual(len(self.deleted(date_from=app.now_iso()[:10])), 2)
         self.assertEqual(self.deleted(date_to="2000-01-01"), [])
 
+    # --- patch of pending jobs planned under the old termination rule --------------------------
+    def old_style_release(self, cidr: str, size: int):
+        """State left by the previous version: assignment and its subnet deleted locally, CST record still active."""
+        assignment = self.individual_assignment(cidr, size, "Leaving Customer")
+        tx = next(t for op, c, t, _status in self.calls if op == "SEND" and c == cidr)
+        with app.connect() as connection:
+            resource = app.find_resource_by_source(connection, "assignment", assignment.id)
+            connection.execute("DELETE FROM assignments WHERE id = ?", (assignment.id,))
+            connection.execute("DELETE FROM assignment_details WHERE resource_uuid = ?", (resource.resource_uuid,))
+            connection.execute("DELETE FROM ip_resources WHERE resource_uuid = ?", (resource.resource_uuid,))
+            ledger = connection.execute("SELECT * FROM cst_transaction_ledger WHERE transaction_id = ?", (tx,)).fetchone()
+            record = app.cst_unassigned_update_resource(app.cst_resource_from_ledger(ledger))
+        self.calls.clear()
+        return tx, record
+
+    def statuses(self, batch_id: str):
+        return [(job.operation, job.status) for job in self.batch_jobs(batch_id)]
+
+    def test_patch_drops_delete_of_old_release_batch(self):
+        tx, record = self.old_style_release("87.101.190.64/27", 32)
+        with app.connect() as connection:
+            old = app.create_cst_sync_jobs(connection, [(record, "UPDATE"), (record, "DELETE")], app.CST_RELEASE_WORKFLOW, queue_only=True)
+            result = app.patch_pending_jobs_for_termination_policy(connection)
+            self.assertEqual(app.patch_pending_jobs_for_termination_policy(connection)["deletes"], 0, "idempotent")
+        self.assertEqual(result["deletes"], 1)
+        self.assertEqual(self.statuses(old[0].batch_id), [("UPDATE", "PENDING"), ("DELETE", "NOT_REQUIRED")])
+        with app.connect() as connection:
+            app.materialize_bulk_unassigned_fragments(connection)
+            app.process_cst_batch_pending_jobs(connection, old[0].batch_id)
+        self.assertEqual([op for op, cidr, *_ in self.calls if cidr == "87.101.190.64/27"], ["UPDATE"])
+        self.assertEqual(self.ledger(tx)["retired_at"], "")
+        with app.connect() as connection:
+            block = app.find_resource_by_cidr(connection, "87.101.190.64/27")
+            self.assertEqual(block.source_entity_type, app.BULK_UNASSIGNED_FRAGMENT_SOURCE)
+            self.assertFalse(app.cst_resource_needs_send(connection, block), "local block linked to the kept CST record")
+
+    def test_patch_drops_delete_and_free_space_resend_of_old_release_chain(self):
+        tx, record = self.old_style_release("87.101.190.64/27", 32)
+        free_block = app.cst_resource_from_network(ip_network("87.101.190.64/27"), app.stable_uuid("old-free", "64"), app.BULK_UNASSIGNED_FRAGMENT_SOURCE, "old", "free").model_copy(update={"root_pool_uuid": self.root.resource_uuid})
+        with app.connect() as connection:
+            app.upsert_resource_record(connection, free_block)
+            jobs = app.create_cst_sync_jobs(connection, [(record, "UPDATE"), (record, "DELETE"), (free_block, "SEND")], "MANUAL_LIR_MIGRATION", queue_only=True, chains=["release-1"] * 3)
+            self.assertEqual(app.patch_pending_jobs_for_termination_policy(connection)["dependents"], 1)
+        self.assertEqual(self.statuses(jobs[0].batch_id), [("UPDATE", "PENDING"), ("DELETE", "NOT_REQUIRED"), ("SEND", "NOT_REQUIRED")])
+        with app.connect() as connection:
+            app.materialize_bulk_unassigned_fragments(connection)
+            app.process_cst_batch_pending_jobs(connection, jobs[0].batch_id)
+        self.assertEqual([op for op, cidr, *_ in self.calls if cidr == "87.101.190.64/27"], ["UPDATE"])
+        with app.connect() as connection:
+            linked = connection.execute("SELECT resource_uuid FROM cst_transaction_ledger WHERE transaction_id = ?", (tx,)).fetchone()["resource_uuid"]
+        self.assertEqual(linked, free_block.resource_uuid, "the existing free block now represents the kept record")
+
+    def test_patch_leaves_partial_reassignment_alone(self):
+        self.load_assignment()
+        result = self.migration_job()
+        with app.connect() as connection:
+            self.assertEqual(app.patch_pending_jobs_for_termination_policy(connection)["deletes"], 0)
+        chain = self.chain(self.batch_jobs(result.batch_id), CONTAINER)
+        self.assertEqual([(job.operation, job.status) for job in chain], [("DELETE", "PENDING"), ("SEND", "PENDING"), ("SEND", "PENDING")])
+
 if __name__ == "__main__":
     unittest.main()

@@ -4403,6 +4403,15 @@ def retry_cst_jobs(connection: sqlite3.Connection, job_rows: list[sqlite3.Row], 
         if resource is not None and resource.cidr != job.cidr:
             # e.g. UpdateLIR/DeleteLIR of a /27 whose local subnet is now a /28: send what was planned.
             resource = None
+        if resource is None and job.transaction_id:
+            # The record may now be represented by another local subnet (e.g. a free block linked to a
+            # CST record kept on termination): follow the ledger so the link stays stable.
+            linked = connection.execute("SELECT resource_uuid FROM cst_transaction_ledger WHERE transaction_id = ?", (job.transaction_id,)).fetchone()
+            linked_row = connection.execute("SELECT * FROM ip_resources WHERE resource_uuid = ?", (str(linked["resource_uuid"]),)).fetchone() if linked else None
+            if linked_row is not None and str(linked_row["cidr"]) == job.cidr and str(linked_row["resource_uuid"]) != job.resource_uuid:
+                connection.execute("UPDATE cst_sync_jobs SET resource_uuid = ? WHERE id = ?", (str(linked_row["resource_uuid"]), job.id))
+                job = job.model_copy(update={"resource_uuid": str(linked_row["resource_uuid"])})
+                resource = resource_from_row(linked_row)
         stored_payload = json.loads(job.payload_json or "{}")
         if resource is None and job.operation == "GET":
             page_number = int(stored_payload.get("pageNumber") or 1)
@@ -5321,6 +5330,7 @@ def init_db() -> None:
         refresh_ip_resource_pool_owners(connection)
         connection.executescript(DELETED_ASSIGNMENTS_SCHEMA)
         backfill_deleted_assignments(connection)
+        patch_pending_jobs_for_termination_policy(connection)
 
 
 class DeletedAssignmentRecord(BaseModel):
@@ -5514,6 +5524,65 @@ def backfill_deleted_assignments(connection: sqlite3.Connection) -> int:
         )
         added += connection.total_changes - before
     return added
+
+
+def patch_pending_jobs_for_termination_policy(connection: sqlite3.Connection) -> dict[str, int]:
+    """One-time-safe patch of CST jobs planned under the old termination rule (UpdateLIR + DeleteLIR).
+
+    Termination now keeps the CST record (UpdateLIR to Unassigned only). For every DeleteLIR that has not
+    succeeded and belongs to a release - a per-release batch, or a chain whose other steps only send
+    unassigned blocks - and whose record no active assignment overlaps, the DeleteLIR and the steps
+    chained after it are marked NOT_REQUIRED. The UpdateLIR to Unassigned stays queued. Partial
+    reassignments (an assignment overlaps the record) and unchained deletes (root pools) are untouched.
+    Idempotent: a patched job is no longer PENDING/FAILED.
+    """
+    assignments = [network_of(assignment) for assignment in (assignment_from_row(row) for row in connection.execute("SELECT * FROM assignments").fetchall()) if assignment_active_for_conflict(assignment)]
+    deletes = connection.execute(
+        """
+        SELECT j.*, b.workflow_type FROM cst_sync_jobs j
+        INNER JOIN cst_sync_batches b ON b.id = j.batch_id
+        WHERE j.operation = 'DELETE' AND j.status IN ('PENDING', 'FAILED', 'BLOCKED')
+          AND (b.workflow_type = ? OR COALESCE(j.depends_on_job_id, '') != '')
+        """,
+        (CST_RELEASE_WORKFLOW,),
+    ).fetchall()
+    patched = {"deletes": 0, "dependents": 0, "batches": 0}
+    batches: set[str] = set()
+    note = "Not required: termination keeps the CST record Unassigned (UpdateLIR only, no DeleteLIR)"
+    for delete in deletes:
+        ledger = connection.execute("SELECT retired_at FROM cst_transaction_ledger WHERE transaction_id = ?", (str(delete["transaction_id"]),)).fetchone()
+        if ledger is not None and str(ledger["retired_at"] or ""):
+            continue
+        try:
+            record = normalize_network(str(delete["cidr"]))
+        except HTTPException:
+            continue
+        if any(record.overlaps(network) for network in assignments):
+            continue  # a partial reassignment: CST still requires DeleteLIR + SendLIR portions
+        dependents: list[sqlite3.Row] = []
+        frontier = [str(delete["id"])]
+        while frontier:
+            current = frontier.pop()
+            for row in connection.execute("SELECT * FROM cst_sync_jobs WHERE depends_on_job_id = ?", (current,)).fetchall():
+                dependents.append(row)
+                frontier.append(str(row["id"]))
+        if any(str(row["status"]) == "SUCCESS" for row in dependents):
+            continue
+        if any(str(row["operation"]) == "SEND" and int(cst_status_from_payload(json.loads(str(row["payload_json"] or "{}"))) or 1) != 1 for row in dependents):
+            continue  # the chain sends an assigned portion: it is a partial reassignment
+        timestamp = now_iso()
+        connection.execute("UPDATE cst_sync_jobs SET status = 'NOT_REQUIRED', last_error = ?, updated_at = ? WHERE id = ?", (note, timestamp, str(delete["id"])))
+        for row in dependents:
+            connection.execute("UPDATE cst_sync_jobs SET status = 'NOT_REQUIRED', last_error = ?, updated_at = ? WHERE id = ?", (f"{note}; the freed space is not re-sent as a new record", timestamp, str(row["id"])))
+        patched["deletes"] += 1
+        patched["dependents"] += len(dependents)
+        batches.add(str(delete["batch_id"]))
+    for batch_id in batches:
+        finalize_cst_sync_batch(connection, batch_id, [cst_job_from_row(row) for row in connection.execute("SELECT * FROM cst_sync_jobs WHERE batch_id = ?", (batch_id,)).fetchall()])
+    patched["batches"] = len(batches)
+    if patched["deletes"]:
+        record_audit(connection, "CST Pending Jobs Patched (termination keeps record)", "cst_batch", ",".join(sorted(batches)), "", json.dumps(patched))
+    return patched
 
 
 def list_pools_from_db() -> list[Pool]:

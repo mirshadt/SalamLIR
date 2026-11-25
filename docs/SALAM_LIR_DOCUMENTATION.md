@@ -419,6 +419,8 @@ Unassigned blocks CST already holds are never merged into larger free blocks (me
 
 DeleteLIR is still used by a **partial reassignment** (a different CIDR inside or around a CST record), as the CST LIR partial reassignment workflow requires.
 
+**Pending jobs planned under the old rule** are patched automatically when the API starts (idempotent): for every DeleteLIR that has not succeeded and belongs to a termination - an old per-release batch (UpdateLIR + DeleteLIR) or an "Assignment release" chain in a migration job - and whose record no active assignment overlaps, the DeleteLIR and the steps chained after it (re-sending the freed space as a new record) are marked NOT_REQUIRED ("termination keeps the CST record Unassigned"). The UpdateLIR to Unassigned stays queued, and the local free block is linked to the kept record and its Transaction ID. Partial reassignments and root-pool deletes are not touched. The patch is logged in the audit trail as "CST Pending Jobs Patched (termination keeps record)".
+
 ### 11.4.1 Overlapping CST Records (Partial Reassignment)
 
 CST rejects a SendLIR whose CIDR overlaps a record it already holds ("This IP CIDR overlaps with an existing allocation"). Two cases occur:
