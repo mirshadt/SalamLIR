@@ -416,6 +416,19 @@ class CstPartialReassignmentTest(unittest.TestCase):
         self.assertNotIn(tx, [t for op, _cidr, t, _status in self.calls[1:]], "new records get new Transaction IDs")
         self.assertNotEqual(self.ledger(tx)["retired_at"], "")
 
+    def test_update_lir_sends_the_complete_record_on_the_same_transaction(self):
+        first = self.individual_assignment("87.101.190.64/27", 32, "Old Customer")
+        tx = next(t for op, cidr, t, _status in self.calls if op == "SEND" and cidr == "87.101.190.64/27")
+        app.unassign(first.id)
+        unassign = self.last_payload(tx, "UPDATE")["data"][0]
+        self.assertEqual((unassign["transactionId"], unassign["ipSubnet"], unassign["assignmentStatusId"]), (tx, "87.101.190.64/27", 1))
+        self.assertTrue({"asn", "ipVersionId"} <= set(unassign))
+        self.assertFalse({"organizationName", "organizationId", "contact", "customerTypeId"} & set(unassign), "no customer data left on unassign")
+        self.individual_assignment("87.101.190.64/27", 32, "New Customer")
+        assign = self.last_payload(tx, "UPDATE")["data"][0]
+        self.assertEqual((assign["transactionId"], assign["ipSubnet"], assign["assignmentStatusId"], assign["organizationName"]), (tx, "87.101.190.64/27", 3, "New Customer"))
+        self.assertTrue({"organizationId", "customerTypeId", "contact", "assignmentDate", "asn", "ipVersionId"} <= set(assign))
+
     def migration_job_or_none(self):
         with app.connect() as connection:
             operations, _eligible, _deletes = app.cst_migration_resource_operations(connection, app.CstManualMigrationRequest())

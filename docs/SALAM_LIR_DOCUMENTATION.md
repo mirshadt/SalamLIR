@@ -413,7 +413,7 @@ The job is then handled by the existing CST sync process.
 
 ### 11.3.1 Termination (Release) Policy
 
-On termination (single release or Bulk Release) of an assignment held in CST, only **UpdateLIR to Unassigned** is sent. The CST record and its Transaction ID are kept; **no DeleteLIR**. Locally the assignment is removed (kept in the Deleted Assignments Report) and its subnet stays as an unassigned block with the same resource UUID, matched to that CST record. A later customer on exactly the same CIDR is an **UpdateLIR** of the same Transaction ID.
+On termination (single release or Bulk Release) of an assignment held in CST, only **UpdateLIR to Unassigned** is sent. The CST record and its Transaction ID are kept; **no DeleteLIR**. Locally the assignment is removed (kept in the Deleted Assignments Report) and its subnet stays as an unassigned block with the same resource UUID, matched to that CST record. A later customer on exactly the same CIDR is an **UpdateLIR** of the same Transaction ID. UpdateLIR always sends the complete record on the same Transaction ID (every SendLIR attribute, incl. `ipSubnet`, `asn`, `ipVersionId`): on assignment all customer attributes are replaced; on unassign (status 1) no customer, organization or contact data is sent.
 
 Unassigned blocks CST already holds are never merged into larger free blocks (merging would need DeleteLIR); new free blocks are formed around them, and only free space CST does not hold yet is sent with SendLIR. Old pending release batches (UpdateLIR + DeleteLIR from earlier versions) are marked NOT_REQUIRED when a migration job includes the UpdateLIR of that record, so their DeleteLIR is never sent.
 

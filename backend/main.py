@@ -3043,6 +3043,11 @@ def cst_payload_for_resource(resource: ResourceRecord, operation: str, transacti
             record["serviceDescription"] = cst_payload_service_description(resource, status_id)
         if str(resource.description or "").strip():
             record["description"] = str(resource.description).strip()
+        # CST accepts UpdateLIR on the same Transaction ID with every attribute, so send the complete
+        # record (as SendLIR would, incl. ipSubnet/asn/ipVersionId): a reassignment replaces all customer
+        # attributes, and an unassign (status 1) sends the record without any customer data.
+        full_record = cst_payload_for_resource(resource, "SEND", transaction_id, correlation_id)["data"][0]
+        record = {**full_record, **record, "transactionId": transaction_id}
         return {
             "serviceProviderId": cst_int_value(service_provider_id, cst_int_value(DEFAULT_SERVICE_PROVIDER_ID, 1)),
             "data": [record],
