@@ -392,6 +392,30 @@ class CstPartialReassignmentTest(unittest.TestCase):
         self.assertEqual([(op, cidr, t, status) for op, cidr, t, status in self.calls], [("UPDATE", "87.101.190.64/27", tx, 3)])
         self.assertEqual(find_value(self.last_payload(tx, "UPDATE"), "organizationName"), "New Customer")
 
+    def test_released_block_fully_free_is_simply_assigned(self):
+        """Whole free CST record assigned with the same CIDR: one UpdateLIR, nothing deleted or added."""
+        first = self.individual_assignment("87.101.190.64/27", 32, "Old Customer")
+        tx = next(t for op, cidr, t, _status in self.calls if op == "SEND" and cidr == "87.101.190.64/27")
+        app.unassign(first.id)
+        self.calls.clear()
+        self.individual_assignment("87.101.190.64/27", 32, "New Customer")
+        self.assertEqual([(op, cidr, t, status) for op, cidr, t, status in self.calls], [("UPDATE", "87.101.190.64/27", tx, 3)])
+
+    def test_released_block_partly_assigned_follows_partial_reassignment_rule(self):
+        """Part of a free CST record assigned: step 1 skipped (already Unassigned), DeleteLIR, SendLIR x2."""
+        first = self.individual_assignment("87.101.190.64/27", 32, "Old Customer")
+        tx = next(t for op, cidr, t, _status in self.calls if op == "SEND" and cidr == "87.101.190.64/27")
+        app.unassign(first.id)
+        self.calls.clear()
+        self.individual_assignment("87.101.190.64/28", 16, "New Customer")
+        self.assertEqual([(op, cidr) for op, cidr, _t, _status in self.calls], [
+            ("DELETE", "87.101.190.64/27"), ("SEND", "87.101.190.64/28"), ("SEND", "87.101.190.80/28"),
+        ])
+        self.assertEqual([status for op, _cidr, _t, status in self.calls if op == "SEND"], [3, 1])
+        self.assertEqual(self.calls[0][2], tx)
+        self.assertNotIn(tx, [t for op, _cidr, t, _status in self.calls[1:]], "new records get new Transaction IDs")
+        self.assertNotEqual(self.ledger(tx)["retired_at"], "")
+
     def migration_job_or_none(self):
         with app.connect() as connection:
             operations, _eligible, _deletes = app.cst_migration_resource_operations(connection, app.CstManualMigrationRequest())
