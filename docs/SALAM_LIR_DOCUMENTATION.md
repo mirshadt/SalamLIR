@@ -174,7 +174,7 @@ Mapping: `Order Number` becomes `serviceId`; `Status` "Reserved" is loaded as as
 
 - Event: Released, Released (retired), Reservation expired, Removed from RIPE, Replaced by partial reassignment, Duplicate removed.
 - Source: Assignment Management, Bulk Release, Reservation expiry, RIPE push, Partial reassignment, Integrity auto-resolve, or "Audit trail (before report existed)".
-- Reason (e.g. the Bulk Release `reason` column), CST action (UpdateLIR to Unassigned + DeleteLIR / pending in Create Migration Job / not held in CST) and the CST Transaction ID.
+- Reason (e.g. the Bulk Release `reason` column), CST action (UpdateLIR to Unassigned, record kept / pending in Create Migration Job / not held in CST; older rows may show UpdateLIR + DeleteLIR) and the CST Transaction ID.
 - The full assignment as it was before deletion (click a row).
 
 Deletions from before the table existed are rebuilt from the audit trail at startup; each assignment appears once. Filter by date and per column; export CSV or XLSX.
@@ -411,12 +411,21 @@ operation = UPDATE
 
 The job is then handled by the existing CST sync process.
 
+### 11.3.1 Termination (Release) Policy
+
+On termination (single release or Bulk Release) of an assignment held in CST, only **UpdateLIR to Unassigned** is sent. The CST record and its Transaction ID are kept; **no DeleteLIR**. Locally the assignment is removed (kept in the Deleted Assignments Report) and its subnet stays as an unassigned block with the same resource UUID, matched to that CST record. A later customer on exactly the same CIDR is an **UpdateLIR** of the same Transaction ID. UpdateLIR (CST LIR 3.2) sends every permitted attribute on the same Transaction ID: on assignment all customer attributes are replaced; on unassign (status 1) no customer, organization or contact data is sent. Fields CST forbids changing are never sent in the record: Transaction ID is only the key, Service Provider ID stays at request level, and IP Subnet, ASN and IP Version are left out.
+
+Unassigned blocks CST already holds are never merged into larger free blocks (merging would need DeleteLIR); new free blocks are formed around them, and only free space CST does not hold yet is sent with SendLIR. Old pending release batches (UpdateLIR + DeleteLIR from earlier versions) are marked NOT_REQUIRED when a migration job includes the UpdateLIR of that record, so their DeleteLIR is never sent.
+
+DeleteLIR is still used by a **partial reassignment** (a different CIDR inside or around a CST record), as the CST LIR partial reassignment workflow requires.
+
+**Pending jobs planned under the old rule** are patched automatically when the API starts (idempotent): for every DeleteLIR that has not succeeded and belongs to a termination - an old per-release batch (UpdateLIR + DeleteLIR) or an "Assignment release" chain in a migration job - and whose record no active assignment overlaps, the DeleteLIR and the steps chained after it (re-sending the freed space as a new record) are marked NOT_REQUIRED ("termination keeps the CST record Unassigned"). The UpdateLIR to Unassigned stays queued, and the local free block is linked to the kept record and its Transaction ID. Partial reassignments and root-pool deletes are not touched. The patch is logged in the audit trail as "CST Pending Jobs Patched (termination keeps record)".
+
 ### 11.4.1 Overlapping CST Records (Partial Reassignment)
 
 CST rejects a SendLIR whose CIDR overlaps a record it already holds ("This IP CIDR overlaps with an existing allocation"). Two cases occur:
 
 - Split: a block was sent as one Unassigned record (e.g. `87.101.190.112/28`) and an assignment is later made inside it (e.g. `87.101.190.120/29`).
-- Merge: free space grows (e.g. after a release) into a block that contains smaller Unassigned records already in CST.
 - Local split: an assignment already in CST (e.g. a `/27`) is cut down locally (e.g. to a `/28`). CST still holds the old CIDR, so the assignment is treated as unsent and its old record joins the group.
 
 Every path that sends new subnets to CST applies the same rule, so the result does not depend on how the subnet was created: **Create Migration Job** (review and manual migration, which also covers bulk loads), Assignment Management, pool partition and initial bootstrap. There is no separate split action. Before sending, the overlapping CST records and every unsent local subnet sharing their space are grouped, and per group:
@@ -443,7 +452,7 @@ A group is blocked, and nothing is changed in CST, when a record still belongs t
 With CST auto-execute off (controlled sync), assignments and releases do not create batches of their own. They are saved locally and wait in **Create Migration Job > Review Pending CST Transactions**, where each composite transaction is ONE row that expands into its steps:
 
 - **Partial reassignment**: (UpdateLIR to Unassigned if assigned), DeleteLIR, SendLIR reassigned and remaining portions.
-- **Assignment release**: UpdateLIR to Unassigned (if assigned), DeleteLIR; when the freed space exists as its own local block, a SendLIR reports it again as Unassigned with a new Transaction ID.
+- **Assignment release** (only for a CST record with no local subnet): UpdateLIR to Unassigned, record kept. A normal release shows as an UPDATE row (see 11.3.1).
 
 Selected rows become one migration batch; each composite is a chain inside it, run in order when pending jobs are pushed. Old per-assignment release batches that never reached CST are marked NOT_REQUIRED ("Replaced by migration batch ...") when their record is included. With auto-execute on, assignments and releases still go to CST immediately.
 
@@ -663,7 +672,7 @@ This keeps business assignment data fresh before business hours and reduces load
 | `GET` | `/assignments` | List assignments |
 | `POST` | `/assignments` | Create assignment |
 | `POST` | `/assignments/bulk` | Bulk assignment import |
-| `POST` | `/assignments/bulk-release` | Bulk release by CIDR or assignmentId (`dry_run: true` previews without changes). Per CST LIR rules: UpdateLIR to Unassigned, then DeleteLIR, which retires the Transaction ID permanently; the subnet is removed locally (archived to `ip_resource_history`). Use with `/assignments/bulk` for two-step reassignment; the new assignment gets a new Transaction ID. |
+| `POST` | `/assignments/bulk-release` | Bulk release (termination) by CIDR or assignmentId (`dry_run: true` previews without changes). Records held in CST get UpdateLIR to Unassigned only; record and Transaction ID kept, no DeleteLIR (see 11.3.1). The subnet stays as an unassigned block. |
 | `PATCH` | `/assignments/{assignment_id}/status` | Suspend/resume/retire assignment |
 | `DELETE` | `/assignments/{assignment_id}` | Release assignment |
 
