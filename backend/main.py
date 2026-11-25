@@ -3052,12 +3052,16 @@ def cst_payload_for_resource(resource: ResourceRecord, operation: str, transacti
         # reassignment replaces all customer details and an unassign (status 1) carries no customer data.
         # Fields CST forbids changing are never sent: Transaction ID is only the key, Service Provider ID
         # stays at request level, and IP Subnet, ASN and IP Version are left out.
-        full_record = cst_payload_for_resource(resource, "SEND", transaction_id, correlation_id)["data"][0]
-        record = {
-            **{key: value for key, value in full_record.items() if key not in CST_UPDATE_PROHIBITED_FIELDS},
-            **record,
-            "transactionId": transaction_id,
-        }
+        if status_id == 1:
+            # Unassign: only the record key and the new status; no other attribute is required.
+            record = {"transactionId": transaction_id, "assignmentStatusId": 1}
+        else:
+            full_record = cst_payload_for_resource(resource, "SEND", transaction_id, correlation_id)["data"][0]
+            record = {
+                **{key: value for key, value in full_record.items() if key not in CST_UPDATE_PROHIBITED_FIELDS},
+                **record,
+                "transactionId": transaction_id,
+            }
         return {
             "serviceProviderId": cst_int_value(service_provider_id, cst_int_value(DEFAULT_SERVICE_PROVIDER_ID, 1)),
             "data": [record],

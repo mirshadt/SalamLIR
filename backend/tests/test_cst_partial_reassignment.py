@@ -423,7 +423,7 @@ class CstPartialReassignmentTest(unittest.TestCase):
         prohibited = {"serviceProviderId", "ipSubnet", "asn", "ipVersionId"}  # CST LIR 3.2: cannot be changed
         unassign_request = self.last_payload(tx, "UPDATE")
         unassign = unassign_request["data"][0]
-        self.assertEqual((unassign["transactionId"], unassign["assignmentStatusId"]), (tx, 1))
+        self.assertEqual(unassign, {"transactionId": tx, "assignmentStatusId": 1}, "unassign sends only the key and status")
         self.assertFalse(prohibited & set(unassign), "prohibited fields are not sent")
         self.assertIn("serviceProviderId", unassign_request, "provider stays at request level")
         self.assertFalse({"organizationName", "organizationId", "contact", "customerTypeId"} & set(unassign), "no customer data left on unassign")
