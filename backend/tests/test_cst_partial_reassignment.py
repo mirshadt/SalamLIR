@@ -420,14 +420,18 @@ class CstPartialReassignmentTest(unittest.TestCase):
         first = self.individual_assignment("87.101.190.64/27", 32, "Old Customer")
         tx = next(t for op, cidr, t, _status in self.calls if op == "SEND" and cidr == "87.101.190.64/27")
         app.unassign(first.id)
-        unassign = self.last_payload(tx, "UPDATE")["data"][0]
-        self.assertEqual((unassign["transactionId"], unassign["ipSubnet"], unassign["assignmentStatusId"]), (tx, "87.101.190.64/27", 1))
-        self.assertTrue({"asn", "ipVersionId"} <= set(unassign))
+        prohibited = {"serviceProviderId", "ipSubnet", "asn", "ipVersionId"}  # CST LIR 3.2: cannot be changed
+        unassign_request = self.last_payload(tx, "UPDATE")
+        unassign = unassign_request["data"][0]
+        self.assertEqual((unassign["transactionId"], unassign["assignmentStatusId"]), (tx, 1))
+        self.assertFalse(prohibited & set(unassign), "prohibited fields are not sent")
+        self.assertIn("serviceProviderId", unassign_request, "provider stays at request level")
         self.assertFalse({"organizationName", "organizationId", "contact", "customerTypeId"} & set(unassign), "no customer data left on unassign")
         self.individual_assignment("87.101.190.64/27", 32, "New Customer")
         assign = self.last_payload(tx, "UPDATE")["data"][0]
-        self.assertEqual((assign["transactionId"], assign["ipSubnet"], assign["assignmentStatusId"], assign["organizationName"]), (tx, "87.101.190.64/27", 3, "New Customer"))
-        self.assertTrue({"organizationId", "customerTypeId", "contact", "assignmentDate", "asn", "ipVersionId"} <= set(assign))
+        self.assertEqual((assign["transactionId"], assign["assignmentStatusId"], assign["organizationName"]), (tx, 3, "New Customer"))
+        self.assertFalse(prohibited & set(assign))
+        self.assertTrue({"organizationId", "customerTypeId", "regionId", "cityId", "contact", "assignmentDate", "updateDate", "serviceDescription"} <= set(assign))
 
     def migration_job_or_none(self):
         with app.connect() as connection:

@@ -2921,6 +2921,10 @@ def cst_payload_full_name(resource: ResourceRecord, require_default: bool = Fals
         return value
     return CST_FALLBACK_FULL_NAME if require_default else ""
 
+# CST LIR 3.2 UpdateLIR: fields that cannot be changed (a request that touches them is rejected).
+CST_UPDATE_PROHIBITED_FIELDS = frozenset({"serviceProviderId", "ipSubnet", "asn", "ipVersionId"})
+
+
 def cst_payload_for_resource(resource: ResourceRecord, operation: str, transaction_id: str, correlation_id: str) -> dict:
     service_provider_id = str(resource.service_provider_id or DEFAULT_SERVICE_PROVIDER_ID)
     if operation == "SEND":
@@ -3043,11 +3047,16 @@ def cst_payload_for_resource(resource: ResourceRecord, operation: str, transacti
             record["serviceDescription"] = cst_payload_service_description(resource, status_id)
         if str(resource.description or "").strip():
             record["description"] = str(resource.description).strip()
-        # CST accepts UpdateLIR on the same Transaction ID with every attribute, so send the complete
-        # record (as SendLIR would, incl. ipSubnet/asn/ipVersionId): a reassignment replaces all customer
-        # attributes, and an unassign (status 1) sends the record without any customer data.
+        # CST UpdateLIR (3.2): send every permitted attribute of the record (as SendLIR would) so a
+        # reassignment replaces all customer details and an unassign (status 1) carries no customer data.
+        # Fields CST forbids changing are never sent: Transaction ID is only the key, Service Provider ID
+        # stays at request level, and IP Subnet, ASN and IP Version are left out.
         full_record = cst_payload_for_resource(resource, "SEND", transaction_id, correlation_id)["data"][0]
-        record = {**full_record, **record, "transactionId": transaction_id}
+        record = {
+            **{key: value for key, value in full_record.items() if key not in CST_UPDATE_PROHIBITED_FIELDS},
+            **record,
+            "transactionId": transaction_id,
+        }
         return {
             "serviceProviderId": cst_int_value(service_provider_id, cst_int_value(DEFAULT_SERVICE_PROVIDER_ID, 1)),
             "data": [record],
