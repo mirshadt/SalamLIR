@@ -427,6 +427,7 @@ class CstPartialReassignmentTest(unittest.TestCase):
         self.assertFalse(prohibited & set(unassign), "prohibited fields are not sent")
         self.assertIn("serviceProviderId", unassign_request, "provider stays at request level")
         self.assertFalse({"organizationName", "organizationId", "contact", "customerTypeId"} & set(unassign), "no customer data left on unassign")
+        self.assertNotIn("Old Customer", json.dumps(unassign_request), "no previous customer name in description fields")
         self.individual_assignment("87.101.190.64/27", 32, "New Customer")
         assign = self.last_payload(tx, "UPDATE")["data"][0]
         self.assertEqual((assign["transactionId"], assign["assignmentStatusId"], assign["organizationName"]), (tx, 3, "New Customer"))

@@ -2716,7 +2716,8 @@ def cst_unassigned_update_resource(resource: ResourceRecord) -> ResourceRecord:
         "email": "",
         "assignment_date": "",
         "service_description": "",
-        "description": resource.description or f"{resource.cidr} unassigned locally",
+        # Neutral text: an unassigned CST record must not carry the previous customer's name or notes.
+        "description": f"{resource.cidr} unassigned",
         "action_flag": "U",
     })
 
@@ -10723,13 +10724,14 @@ def cst_release_failure_detail(jobs: list[CstSyncJob]) -> str:
 def released_free_block(resource: ResourceRecord, assignment: Assignment, cst_sync_status: str) -> ResourceRecord:
     """The terminated assignment's subnet as an unassigned block: same resource UUID, CIDR and Transaction ID."""
     timestamp = now_iso()
-    released_by = assignment.customer_name or assignment.internal_application_name or assignment.assignment_name or assignment.id
+    # Who released it is kept locally (Deleted Assignments Report, history); the block itself, which is
+    # what CST receives, carries no customer data.
     return cst_unassigned_update_resource(resource).model_copy(update={
         "version_uuid": new_version_uuid(),
         "service_id": "",
         "access_technology_id": "",
         "access_technology": "",
-        "description": f"Released from {released_by} on {timestamp[:10]}",
+        "description": f"{resource.cidr} unassigned since {timestamp[:10]}",
         "cst_sync_status": cst_sync_status,
         "cst_sync_ready": True,
         "cst_validation_status": "READY",
