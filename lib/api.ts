@@ -1175,7 +1175,24 @@ export type DeletedAssignmentRecord = {
   deleted_at: string;
   deleted_by: string;
   assignment_json: string;
+  local_state: string;
+  local_state_detail: string;
+  cst_record_status: string;
 };
+
+export type DeletedAssignmentRestoreResult = {
+  dry_run: boolean;
+  restored: number;
+  already_restored: number;
+  not_restorable: Record<string, number>;
+  pending_unassign: number;
+  message: string;
+};
+
+export async function restoreDeletedAssignmentBlocks(dryRun: boolean) {
+  const { data } = await api.post<DeletedAssignmentRestoreResult>("/reports/deleted-assignments/restore", null, { params: { dry_run: dryRun }, timeout: 10 * 60 * 1000 });
+  return data;
+}
 
 export async function getDeletedAssignmentsReport() {
   const { data } = await api.get<DeletedAssignmentRecord[]>("/reports/deleted-assignments", { timeout: 5 * 60 * 1000 });

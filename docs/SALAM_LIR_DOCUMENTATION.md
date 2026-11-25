@@ -179,6 +179,19 @@ Mapping: `Order Number` becomes `serviceId`; `Status` "Reserved" is loaded as as
 
 Deletions from before the table existed are rebuilt from the audit trail at startup; each assignment appears once. Filter by date and per column; export CSV or XLSX.
 
+**Local / CST State** (computed for each row, matched to the CST transaction ledger by CIDR):
+
+| State | Meaning |
+| --- | --- |
+| Restored (unassigned, same Transaction ID) | The subnet exists locally as an unassigned block linked to the kept CST record. The detail says whether an UpdateLIR to Unassigned still waits in Create Migration Job (CST still shows it assigned). |
+| Assigned again (same Transaction ID) | A new assignment reuses exactly this CIDR and the CST record (UpdateLIR). |
+| Can be restored | CST still holds the record, but locally the subnet was merged back into the free pool without its Transaction ID. |
+| Overlaps a current assignment | A current assignment uses part of this space; the partial reassignment rule handles it. |
+| CST record deleted (Transaction ID retired) | DeleteLIR ran; the old Transaction ID is never reused. |
+| Not held in CST / Outside managed pools | Nothing to restore. |
+
+**Restore CST-held blocks** (API: `POST /reports/deleted-assignments/restore?dry_run=true|false`) first shows a preview, then on confirmation re-creates every "Can be restored" subnet locally as an unassigned free block with the same resource UUID and Transaction ID as the CST record. Bigger free blocks that swallowed it are split around it. It also fills the Transaction ID of older report rows. CST is not called. Restored subnets that CST still shows as assigned get their UpdateLIR to Unassigned from Create Migration Job. Running it again changes nothing.
+
 ### 8.3 Administration
 
 Administration contains:

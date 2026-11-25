@@ -579,6 +579,54 @@ class CstPartialReassignmentTest(unittest.TestCase):
         self.calls.clear()
         return tx, record
 
+    def old_release_with_report_row(self, cidr: str, size: int):
+        """Old release: report row without Transaction ID, subnet merged back into the free pool."""
+        assignment = self.individual_assignment(cidr, size, "Leaving Customer")
+        tx = next(t for op, c, t, _status in self.calls if op == "SEND" and c == cidr)
+        with app.connect() as connection:
+            app.record_deleted_assignment(connection, assignment, "Released", source="Assignment Management")
+            resource = app.find_resource_by_source(connection, "assignment", assignment.id)
+            connection.execute("DELETE FROM assignments WHERE id = ?", (assignment.id,))
+            connection.execute("DELETE FROM assignment_details WHERE resource_uuid = ?", (resource.resource_uuid,))
+            connection.execute("DELETE FROM ip_resources WHERE resource_uuid = ?", (resource.resource_uuid,))
+            connection.execute("UPDATE cst_transaction_ledger SET resource_uuid = 'gone' WHERE transaction_id = ?", (tx,))
+            free = app.cst_resource_from_network(ip_network("87.101.190.0/25"), app.stable_uuid("merged-free", cidr), app.BULK_UNASSIGNED_FRAGMENT_SOURCE, "old", "free").model_copy(update={"root_pool_uuid": self.root.resource_uuid})
+            app.upsert_resource_record(connection, free)  # old merge of the released space into a bigger free block
+        self.calls.clear()
+        return tx
+
+    def test_restore_recreates_deleted_subnet_with_same_transaction_id(self):
+        tx = self.old_release_with_report_row("87.101.190.64/27", 32)
+        row = next(row for row in self.deleted() if row.cidr == "87.101.190.64/27")
+        self.assertEqual((row.local_state, row.cst_transaction_id, row.cst_record_status), (app.DELETED_STATE_RESTORABLE, tx, "Business"))
+        preview = app.restore_deleted_assignment_blocks(dry_run=True)
+        self.assertEqual((preview.dry_run, preview.restored), (True, 1))
+        with app.connect() as connection:
+            self.assertIsNone(app.find_resource_by_cidr(connection, "87.101.190.64/27"), "preview changes nothing")
+        result = app.restore_deleted_assignment_blocks(dry_run=False)
+        self.assertEqual((result.restored, result.pending_unassign), (1, 1), result.message)
+        with app.connect() as connection:
+            block = app.find_resource_by_cidr(connection, "87.101.190.64/27")
+            self.assertEqual(block.source_entity_type, app.BULK_UNASSIGNED_FRAGMENT_SOURCE)
+            self.assertEqual(block.resource_uuid, self.ledger(tx)["resource_uuid"])
+            stored = connection.execute("SELECT cst_transaction_id FROM deleted_assignments WHERE cidr = ?", ("87.101.190.64/27",)).fetchone()[0]
+        self.assertEqual(stored, tx, "report row now carries the old Transaction ID")
+        row = next(row for row in self.deleted() if row.cidr == "87.101.190.64/27")
+        self.assertEqual(row.local_state, app.DELETED_STATE_RESTORED)
+        self.assertIn("waits in Create Migration Job", row.local_state_detail)
+        self.assertEqual(app.restore_deleted_assignment_blocks(dry_run=False).already_restored, 1, "idempotent")
+        self.assertEqual(self.calls, [], "restore never calls CST")
+
+    def test_restore_skips_retired_and_reused_records(self):
+        retired = self.individual_assignment("87.101.190.64/27", 32, "Gone Customer")
+        with app.connect() as connection:
+            tx = next(t for op, c, t, _status in self.calls if op == "SEND" and c == "87.101.190.64/27")
+            connection.execute("UPDATE cst_transaction_ledger SET retired_at = '2026-01-01T00:00:00Z' WHERE transaction_id = ?", (tx,))
+        app.unassign(retired.id)
+        row = next(row for row in self.deleted() if row.cidr == "87.101.190.64/27")
+        self.assertEqual(row.local_state, app.DELETED_STATE_RETIRED)
+        self.assertEqual(app.restore_deleted_assignment_blocks(dry_run=True).restored, 0)
+
     def statuses(self, batch_id: str):
         return [(job.operation, job.status) for job in self.batch_jobs(batch_id)]
 

@@ -70,6 +70,7 @@ import {
   getCstBatches,
   getCstBatchJobs,
   getDeletedAssignmentsReport,
+  restoreDeletedAssignmentBlocks,
   type DeletedAssignmentRecord,
   getCstConfig,
   getCstJobs,
@@ -4738,6 +4739,24 @@ function Reporting({
   const [deletedDateFrom, setDeletedDateFrom] = useState("");
   const [deletedDateTo, setDeletedDateTo] = useState("");
   const [openDeletedId, setOpenDeletedId] = useState("");
+  const [restoreBusy, setRestoreBusy] = useState(false);
+  const [restoreMessage, setRestoreMessage] = useState("");
+  const restoreDeletedBlocks = async () => {
+    setRestoreBusy(true);
+    try {
+      const preview = await restoreDeletedAssignmentBlocks(true);
+      setRestoreMessage(preview.message);
+      if (!preview.restored) return;
+      if (!window.confirm(`${preview.message}\n\nRe-create these subnets locally as unassigned blocks with their original CST Transaction IDs? CST is not called.`)) return;
+      const result = await restoreDeletedAssignmentBlocks(false);
+      setRestoreMessage(result.message);
+      await deletedAssignmentsQuery.refetch();
+    } catch (error) {
+      setRestoreMessage(`Restore failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setRestoreBusy(false);
+    }
+  };
   const deletedAssignmentsQuery = useQuery({ queryKey: ["deleted-assignments-report"], queryFn: getDeletedAssignmentsReport, staleTime: 30000 });
   const deletedRows = deletedAssignmentsQuery.data ?? [];
   const filteredDeletedRows = deletedRows.filter((row) => (
@@ -5114,13 +5133,17 @@ function Reporting({
             <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
               <div>
                 <CardTitle>Deleted Assignments Report</CardTitle>
-                <CardDescription>Audit of every assignment that was deleted: released (single or bulk), reservation expired, removed from RIPE, replaced by a partial reassignment, or removed as a duplicate. Click a row for the full record as it was before deletion.</CardDescription>
+                <CardDescription>Audit of every assignment that was deleted: released (single or bulk), reservation expired, removed from RIPE, replaced by a partial reassignment, or removed as a duplicate. Click a row for the full record as it was before deletion. Local / CST State shows whether CST still holds the subnet; Restore CST-held blocks re-creates those subnets locally as unassigned blocks with the same Transaction ID.</CardDescription>
               </div>
               <div className="flex flex-wrap gap-2">
                 <Button variant="outline" onClick={() => setActiveReport(null)}>Back to Reports</Button>
                 <Button variant="outline" onClick={() => void deletedAssignmentsQuery.refetch()} disabled={deletedAssignmentsQuery.isFetching}>
                   {deletedAssignmentsQuery.isFetching ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCcw className="h-4 w-4" />}
                   Refresh
+                </Button>
+                <Button variant="outline" onClick={() => void restoreDeletedBlocks()} disabled={restoreBusy} title="Re-create deleted subnets that CST still holds as local unassigned blocks with the same Transaction ID">
+                  {restoreBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <RefreshCcw className="h-4 w-4" />}
+                  Restore CST-held blocks
                 </Button>
                 <Button variant="outline" onClick={() => downloadBlob(`deleted-assignments-${today()}.csv`, "text/csv;charset=utf-8", buildSimpleCsv(DELETED_ASSIGNMENT_COLUMNS.map((column) => column.header), filteredDeletedRows.map((row) => DELETED_ASSIGNMENT_COLUMNS.map((column) => row[column.key] ?? ""))))} disabled={!filteredDeletedRows.length}>
                   <FileDown className="h-4 w-4" />
@@ -5137,6 +5160,7 @@ function Reporting({
             </div>
           </CardHeader>
           <CardContent className="grid gap-3">
+            {restoreMessage ? <div className="rounded-md border bg-muted/30 px-3 py-2 text-sm">{restoreMessage}</div> : null}
             <div className="flex flex-wrap items-end gap-3">
               <label className="grid gap-1">
                 <span className="text-xs font-semibold text-muted-foreground">Deleted from</span>
@@ -7755,6 +7779,9 @@ const DELETED_ASSIGNMENT_COLUMNS: Array<{ key: keyof DeletedAssignmentRecord; he
   { key: "reason", header: "Reason" },
   { key: "cst_action", header: "CST Action" },
   { key: "cst_transaction_id", header: "CST Transaction ID" },
+  { key: "local_state", header: "Local / CST State" },
+  { key: "cst_record_status", header: "CST Record Status" },
+  { key: "local_state_detail", header: "State Detail" },
   { key: "deleted_by", header: "Deleted By" }
 ];
 
