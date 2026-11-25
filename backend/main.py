@@ -2716,7 +2716,8 @@ def cst_unassigned_update_resource(resource: ResourceRecord) -> ResourceRecord:
         "email": "",
         "assignment_date": "",
         "service_description": "",
-        "description": resource.description or f"{resource.cidr} unassigned locally",
+        # Neutral text: an unassigned CST record must not carry the previous customer's name or notes.
+        "description": f"{resource.cidr} unassigned",
         "action_flag": "U",
     })
 
@@ -3051,12 +3052,16 @@ def cst_payload_for_resource(resource: ResourceRecord, operation: str, transacti
         # reassignment replaces all customer details and an unassign (status 1) carries no customer data.
         # Fields CST forbids changing are never sent: Transaction ID is only the key, Service Provider ID
         # stays at request level, and IP Subnet, ASN and IP Version are left out.
-        full_record = cst_payload_for_resource(resource, "SEND", transaction_id, correlation_id)["data"][0]
-        record = {
-            **{key: value for key, value in full_record.items() if key not in CST_UPDATE_PROHIBITED_FIELDS},
-            **record,
-            "transactionId": transaction_id,
-        }
+        if status_id == 1:
+            # Unassign: only the record key and the new status; no other attribute is required.
+            record = {"transactionId": transaction_id, "assignmentStatusId": 1}
+        else:
+            full_record = cst_payload_for_resource(resource, "SEND", transaction_id, correlation_id)["data"][0]
+            record = {
+                **{key: value for key, value in full_record.items() if key not in CST_UPDATE_PROHIBITED_FIELDS},
+                **record,
+                "transactionId": transaction_id,
+            }
         return {
             "serviceProviderId": cst_int_value(service_provider_id, cst_int_value(DEFAULT_SERVICE_PROVIDER_ID, 1)),
             "data": [record],
@@ -5355,6 +5360,9 @@ class DeletedAssignmentRecord(BaseModel):
     deleted_at: str
     deleted_by: str = "ipam-admin"
     assignment_json: str = ""
+    local_state: str = ""          # computed: restore state of the subnet against CST (see deleted_assignment_states)
+    local_state_detail: str = ""
+    cst_record_status: str = ""    # computed: what CST holds for the record (Assigned / Unassigned)
 
 
 DELETED_ASSIGNMENTS_SCHEMA = """
@@ -10723,13 +10731,14 @@ def cst_release_failure_detail(jobs: list[CstSyncJob]) -> str:
 def released_free_block(resource: ResourceRecord, assignment: Assignment, cst_sync_status: str) -> ResourceRecord:
     """The terminated assignment's subnet as an unassigned block: same resource UUID, CIDR and Transaction ID."""
     timestamp = now_iso()
-    released_by = assignment.customer_name or assignment.internal_application_name or assignment.assignment_name or assignment.id
+    # Who released it is kept locally (Deleted Assignments Report, history); the block itself, which is
+    # what CST receives, carries no customer data.
     return cst_unassigned_update_resource(resource).model_copy(update={
         "version_uuid": new_version_uuid(),
         "service_id": "",
         "access_technology_id": "",
         "access_technology": "",
-        "description": f"Released from {released_by} on {timestamp[:10]}",
+        "description": f"{resource.cidr} unassigned since {timestamp[:10]}",
         "cst_sync_status": cst_sync_status,
         "cst_sync_ready": True,
         "cst_validation_status": "READY",
@@ -10932,6 +10941,124 @@ def bulk_release_assignments(payload: BulkCsvRequest, background_tasks: Backgrou
     return batch
 
 
+DELETED_STATE_RESTORED = "Restored (unassigned, same Transaction ID)"
+DELETED_STATE_REUSED = "Assigned again (same Transaction ID)"
+DELETED_STATE_RESTORABLE = "Can be restored"
+DELETED_STATE_OVERLAP = "Overlaps a current assignment"
+DELETED_STATE_RETIRED = "CST record deleted (Transaction ID retired)"
+DELETED_STATE_NOT_IN_CST = "Not held in CST"
+DELETED_STATE_OUTSIDE = "Outside managed pools"
+
+
+def deleted_assignment_states(connection: sqlite3.Connection, records: list[DeletedAssignmentRecord]) -> list[DeletedAssignmentRecord]:
+    """How each deleted assignment's subnet stands against CST, for consistency with CST LIR.
+
+    The CST record of a deleted assignment is found by CIDR in the transaction ledger. When CST still
+    holds it, the local subnet should exist with the same Transaction ID: as an unassigned block
+    (termination keeps the record) or reused by a new assignment of the same CIDR.
+    """
+    active_by_cidr: dict[str, sqlite3.Row] = {}
+    for _start, _end, row in cst_active_ledger_intervals(connection):
+        active_by_cidr.setdefault(str(normalize_network(str(row["cidr"]))), row)
+    assignments = [assignment for assignment in (assignment_from_row(row) for row in connection.execute("SELECT * FROM assignments").fetchall()) if assignment_active_for_conflict(assignment)]
+    roots = [normalize_network(root.cidr) for root in top_level_public_pool_resources(connection)]
+    result: list[DeletedAssignmentRecord] = []
+    for record in records:
+        item = record.model_copy()
+        try:
+            network = normalize_network(record.cidr)
+        except HTTPException:
+            result.append(item)
+            continue
+        row = active_by_cidr.get(str(network))
+        if row is None:
+            retired = connection.execute("SELECT transaction_id FROM cst_transaction_ledger WHERE cidr = ? AND retired_at != '' ORDER BY retired_at DESC LIMIT 1", (str(network),)).fetchone()
+            item.local_state = DELETED_STATE_RETIRED if retired else DELETED_STATE_NOT_IN_CST
+            item.local_state_detail = f"Transaction ID {retired['transaction_id']} was deleted in CST and cannot be reused" if retired else "No CST record to restore"
+            result.append(item)
+            continue
+        status_id = cst_recorded_assignment_status(connection, str(row["transaction_id"]))
+        item.cst_record_status = assignment_status_id_name(status_id) if status_id else "Unknown"
+        item.cst_transaction_id = item.cst_transaction_id or str(row["transaction_id"])
+        local = connection.execute("SELECT * FROM ip_resources WHERE resource_uuid = ?", (str(row["resource_uuid"]),)).fetchone()
+        if local is not None and normalize_network(str(local["cidr"])) == network:
+            local_resource = resource_from_row(local)
+            if local_resource.source_entity_type == "assignment":
+                item.local_state = DELETED_STATE_REUSED
+                item.local_state_detail = f"Now assigned to {local_resource.customer_name or local_resource.organization_name}"
+            else:
+                item.local_state = DELETED_STATE_RESTORED
+                pending = cst_resource_pending_update(connection, local_resource) is not None
+                item.local_state_detail = "CST still shows it assigned: UpdateLIR to Unassigned waits in Create Migration Job" if pending else "In sync with CST"
+        elif any(network.overlaps(network_of(assignment)) for assignment in assignments):
+            overlapping = next(assignment for assignment in assignments if network.overlaps(network_of(assignment)))
+            item.local_state = DELETED_STATE_OVERLAP
+            item.local_state_detail = f"{overlapping.cidr} ({overlapping.customer_name}) uses this space: handled by the partial reassignment rule"
+        elif not any(network.subnet_of(root) and network != root for root in roots):
+            item.local_state = DELETED_STATE_OUTSIDE
+            item.local_state_detail = "No public pool covers it; it cannot be re-created as a free block"
+        else:
+            item.local_state = DELETED_STATE_RESTORABLE
+            item.local_state_detail = f"Restore re-creates it as an unassigned block with Transaction ID {row['transaction_id']}"
+        result.append(item)
+    return result
+
+
+class DeletedAssignmentRestoreResult(BaseModel):
+    dry_run: bool
+    restored: int = 0
+    already_restored: int = 0
+    not_restorable: dict[str, int] = Field(default_factory=dict)
+    pending_unassign: int = 0
+    message: str = ""
+
+
+@app.post("/reports/deleted-assignments/restore", response_model=DeletedAssignmentRestoreResult)
+def restore_deleted_assignment_blocks(dry_run: bool = True) -> DeletedAssignmentRestoreResult:
+    """Re-create, as unassigned blocks with the SAME Transaction ID, the subnets of deleted assignments
+    that CST still holds, so the local LIR and CST LIR agree. Records CST already deleted (retired
+    Transaction IDs) are never reused."""
+    with connect() as connection:
+        records = [deleted_assignment_from_row(row) for row in connection.execute("SELECT * FROM deleted_assignments ORDER BY deleted_at DESC").fetchall()]
+        before = {record.id: record.local_state for record in deleted_assignment_states(connection, records)}
+        result = DeletedAssignmentRestoreResult(dry_run=dry_run)
+        if not dry_run:
+            materialize_bulk_unassigned_fragments(connection)  # adopts every CST-held free block with its Transaction ID
+            for record in deleted_assignment_states(connection, records):
+                if record.cst_transaction_id and not records_by_id(records)[record.id].cst_transaction_id:
+                    connection.execute("UPDATE deleted_assignments SET cst_transaction_id = ? WHERE id = ?", (record.cst_transaction_id, record.id))
+        after = deleted_assignment_states(connection, records)
+        for record in after:
+            if record.local_state == DELETED_STATE_RESTORED:
+                if before.get(record.id) == DELETED_STATE_RESTORED:
+                    result.already_restored += 1
+                else:
+                    result.restored += 1
+                if "waits in Create Migration Job" in record.local_state_detail:
+                    result.pending_unassign += 1
+            elif record.local_state == DELETED_STATE_RESTORABLE:
+                result.restored += 1 if dry_run else 0
+                if not dry_run:
+                    key = "could not be re-created (check the pool layout)"
+                    result.not_restorable[key] = result.not_restorable.get(key, 0) + 1
+            elif record.local_state:
+                result.not_restorable[record.local_state] = result.not_restorable.get(record.local_state, 0) + 1
+        verb = "Would restore" if dry_run else "Restored"
+        result.message = (
+            f"{verb} {result.restored} subnet(s) as unassigned blocks with their original Transaction ID; "
+            f"{result.already_restored} already restored; "
+            + (f"{result.pending_unassign} still assigned in CST (UpdateLIR to Unassigned waits in Create Migration Job); " if result.pending_unassign else "")
+            + ("not restorable: " + ", ".join(f"{count} {state}" for state, count in sorted(result.not_restorable.items())) if result.not_restorable else "nothing else to do")
+        )
+        if not dry_run:
+            record_audit(connection, "Deleted Assignments Restored To CST State", "deleted_assignments", "restore", "", result.model_dump_json())
+    return result
+
+
+def records_by_id(records: list[DeletedAssignmentRecord]) -> dict[str, DeletedAssignmentRecord]:
+    return {record.id: record for record in records}
+
+
 @app.get("/reports/deleted-assignments", response_model=list[DeletedAssignmentRecord])
 def deleted_assignments_report(date_from: str = "", date_to: str = "", search: str = "") -> list[DeletedAssignmentRecord]:
     """Every deleted assignment (released, expired, removed, replaced, duplicate), newest first."""
@@ -10952,7 +11079,7 @@ def deleted_assignments_report(date_from: str = "", date_to: str = "", search: s
             f"SELECT * FROM deleted_assignments WHERE {' AND '.join(filters)} ORDER BY deleted_at DESC, cidr",
             params,
         ).fetchall()
-    return [deleted_assignment_from_row(row) for row in rows]
+        return deleted_assignment_states(connection, [deleted_assignment_from_row(row) for row in rows])
 
 
 @app.get("/audit", response_model=list[AuditEvent])
